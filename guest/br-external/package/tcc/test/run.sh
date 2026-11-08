@@ -14,7 +14,7 @@ peak() {
 	"$@" &
 	p=$! m=0
 	# until it exits (a zombie's status has no VmHWM line)
-	while v=$(sed -n 's/^VmHWM: *\([0-9]*\).*/\1/p' "/proc/$p/status" 2>/dev/null) &&
+	while v=$(sed -n 's/^VmHWM:[^0-9]*\([0-9]*\).*/\1/p' "/proc/$p/status" 2>/dev/null) &&
 		[ -n "$v" ]; do
 		m=$v
 		usleep 100000
