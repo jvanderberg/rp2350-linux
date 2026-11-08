@@ -1,0 +1,2726 @@
+From cbd9aa0f4dfa595a1eb6f46f31ddaf88b6e028a3 Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 00:35:22 -0600
+Subject: [PATCH] Add a riscv32 target (rv32ima, ilp32, soft float)
+
+riscv32-gen.c is a code generator for rv32ima with the ilp32 ABI: long
+long in register pairs, float and double in integer registers with the
+libgcc soft-float helpers, long double as the ABI's 128-bit quad in
+memory (computed in double precision). No compressed instructions are
+emitted. The linker and assembler share the riscv64 files; RISC-V on
+32 bits uses RELA relocations. lib/atomic-rv32.S and atomic-rv32-8.c
+replace atomic.S, whose riscv code is rv64c.
+---
+ Makefile            |    5 +-
+ configure           |    8 +-
+ conftest.c          |    4 +-
+ include/float.h     |    2 +-
+ lib/Makefile        |    2 +
+ lib/atomic-rv32-8.c |   53 ++
+ lib/atomic-rv32.S   |  151 ++++++
+ lib/stdatomic.c     |    2 +-
+ libtcc.c            |    6 +
+ riscv32-gen.c       | 1138 +++++++++++++++++++++++++++++++++++++++++++
+ riscv64-asm.c       |  109 +++--
+ riscv64-link.c      |   72 ++-
+ tcc.c               |    2 +
+ tcc.h               |   49 +-
+ tccasm.c            |   10 +-
+ tccdbg.c            |   14 +-
+ tccelf.c            |   41 +-
+ tccgen.c            |   78 ++-
+ tccrun.c            |    2 +-
+ tcctok.h            |   48 +-
+ 20 files changed, 1682 insertions(+), 114 deletions(-)
+ create mode 100644 lib/atomic-rv32-8.c
+ create mode 100644 lib/atomic-rv32.S
+ create mode 100644 riscv32-gen.c
+
+diff --git a/Makefile b/Makefile
+index 62078ea3..e71e4323 100644
+--- a/Makefile
++++ b/Makefile
+@@ -117,6 +117,7 @@ DEF-arm64-NetBSD   = $(DEF-arm64) -DTARGETOS_NetBSD
+ DEF-arm64-OpenBSD  = $(DEF-arm64) -DTARGETOS_OpenBSD
+ DEF-arm64-win32    = $(DEF-arm64) -DTCC_TARGET_PE
+ DEF-riscv64        = -DTCC_TARGET_RISCV64
++DEF-riscv32        = -DTCC_TARGET_RISCV32
+ DEF-c67            = -DTCC_TARGET_C67 -w # disable warnigs
+ DEF-x86_64-FreeBSD = $(DEF-x86_64) -DTARGETOS_FreeBSD
+ DEF-x86_64-NetBSD  = $(DEF-x86_64) -DTARGETOS_NetBSD
+@@ -134,7 +135,7 @@ all: $(PROGS) $(TCCLIBS) $(TCCDOCS)
+ 
+ # cross compiler targets to build
+ TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm64-win32 arm-wince c67
+-TCC_X += riscv64 arm64-osx
++TCC_X += riscv64 riscv32 arm64-osx
+ # TCC_X += arm-fpa arm-fpa-ld arm-vfp arm-eabi
+ 
+ # cross libtcc1.a targets to build
+@@ -172,6 +173,7 @@ TRIPLET-x86_64 = x86_64-linux-gnu
+ TRIPLET-arm = arm-linux-gnueabihf
+ TRIPLET-arm64 = aarch64-linux-gnu
+ TRIPLET-riscv64 = riscv64-linux-gnu
++TRIPLET-riscv32 = riscv32-linux-gnu
+ ifneq ($(TRIPLET-$T),)
+ # assume support files in "/usr/<triplet>"
+ ROOT-$T = /usr/$(TRIPLET-$T)
+@@ -217,6 +219,7 @@ arm64-osx_FILES = $(arm64_FILES) tccmacho.c
+ arm64-win32_FILES = $(arm64_FILES) tccpe.c
+ c67_FILES = $(CORE_FILES) c67-gen.c c67-link.c tcccoff.c
+ riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c riscv64-asm.c
++riscv32_FILES = $(CORE_FILES) riscv32-gen.c riscv64-link.c riscv64-asm.c
+ 
+ TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
+ 
+diff --git a/configure b/configure
+index c63c7403..cbe4a1bd 100755
+--- a/configure
++++ b/configure
+@@ -351,6 +351,9 @@ case "$cpu" in
+   riscv64)
+     cpu="riscv64"
+   ;;
++  riscv32)
++    cpu="riscv32"
++  ;;
+   *)
+     echo "Unsupported CPU"
+     exit 1
+@@ -644,7 +647,8 @@ cat >$TMPH <<EOF
+ #define GCC_MINOR $gcc_minor
+ 
+ #if !(TCC_TARGET_I386 || TCC_TARGET_X86_64 || TCC_TARGET_ARM\
+- || TCC_TARGET_ARM64 || TCC_TARGET_RISCV64 || TCC_TARGET_C67)
++ || TCC_TARGET_ARM64 || TCC_TARGET_RISCV64 || TCC_TARGET_RISCV32 \
++ || TCC_TARGET_C67)
+ EOF
+ 
+ predefs=1
+@@ -661,6 +665,7 @@ for v in $cpu $confvars ; do
+     CONFIG_x86_64=yes)      print_num TCC_TARGET_X86_64 1 ;;
+     CONFIG_arm64=yes)       print_num TCC_TARGET_ARM64 1 ;;
+     CONFIG_riscv64=yes)     print_num TCC_TARGET_RISCV64 1 ;;
++    CONFIG_riscv32=yes)     print_num TCC_TARGET_RISCV32 1 ;;
+     CONFIG_arm=yes)         print_num TCC_TARGET_ARM 1
+                             print_num CONFIG_TCC_CPUVER "$cpuver" ;;
+     CONFIG_arm_eabihf=yes)  print_num TCC_ARM_EABI 1
+@@ -691,6 +696,7 @@ for v in $cpu $confvars ; do
+     CONFIG_musl=yes)        print_num CONFIG_TCC_MUSL 1
+       case "$cpu" in
+         arm64)      default tcc_elfinterp "/lib/ld-musl-aarch64.so.1";;
++        riscv32)    default tcc_elfinterp "/lib/ld-musl-riscv32-sf.so.1";;
+         *)          default tcc_elfinterp "/lib/ld-musl-${cpu}.so.1";;
+       esac
+       ;;
+diff --git a/conftest.c b/conftest.c
+index a4450d51..1372454a 100644
+--- a/conftest.c
++++ b/conftest.c
+@@ -14,7 +14,7 @@ const char *platform_macros[] = {
+     "__arm__",              "TCC_TARGET_ARM",
+     "__ARM_EABI__",         "TCC_ARM_EABI",
+     "__aarch64__",          "TCC_TARGET_ARM64",
+-    "__riscv",              "TCC_TARGET_RISCV64",
++    "__riscv",              "TCC_TARGET_RISCV",
+     "__APPLE__",            "TCC_TARGET_MACHO",
+     "__FreeBSD__",          "TARGETOS_FreeBSD",
+     "__FreeBSD_kernel__",   "TARGETOS_FreeBSD_kernel",
+@@ -189,6 +189,8 @@ int _CRT_glob = 0;
+ # define TRIPLET_ARCH "aarch64"
+ #elif defined(__riscv) && defined(__LP64__)
+ # define TRIPLET_ARCH "riscv64"
++#elif defined(__riscv) && __riscv_xlen == 32
++# define TRIPLET_ARCH "riscv32"
+ #else
+ # define TRIPLET_ARCH "unknown"
+ #endif
+diff --git a/include/float.h b/include/float.h
+index 4caa4236..1c20b990 100644
+--- a/include/float.h
++++ b/include/float.h
+@@ -40,7 +40,7 @@
+ #define LDBL_MAX_10_EXP 4932
+ #define DECIMAL_DIG 21
+ 
+-#elif defined __aarch64__ || defined __riscv
++#elif defined __aarch64__ || (defined __riscv && __riscv_xlen == 64)
+ /*
+  * Use values from:
+  * gcc -dM -E -xc /dev/null | grep LDBL | sed -e "s/__//g"
+diff --git a/lib/Makefile b/lib/Makefile
+index 3b166a86..229a200d 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -40,6 +40,7 @@ X86_64_O = libtcc1.o $(COMMON_O)
+ ARM_O = libtcc1.o armeabi.o armflush.o $(COMMON_O)
+ ARM64_O = lib-arm64.o $(COMMON_O)
+ RISCV64_O = lib-arm64.o $(COMMON_O)
++RISCV32_O = $(filter-out atomic.o,$(COMMON_O)) atomic-rv32.o atomic-rv32-8.o
+ COMMON_O = stdatomic.o atomic.o builtin.o alloca.o alloca-bt.o
+ WIN_O = crt1.o crt1w.o wincrt1.o wincrt1w.o dllcrt1.o dllmain.o winex.o
+ LIN_O = dsohandle.o
+@@ -74,6 +75,7 @@ OBJ-arm-eabi = $(OBJ-arm)
+ OBJ-arm-eabihf = $(OBJ-arm)
+ OBJ-arm-wince = $(ARM_O) $(WIN_O)
+ OBJ-riscv64 = $(RISCV64_O) armflush.o $(LIN_O)
++OBJ-riscv32 = $(RISCV32_O) $(LIN_O)
+ 
+ OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))
+ OBJ-libtcc1 = $(addprefix $(X),$(filter-out $(OBJ-extra),$(OBJ-$T)))
+diff --git a/lib/atomic-rv32-8.c b/lib/atomic-rv32-8.c
+new file mode 100644
+index 00000000..48ca304a
+--- /dev/null
++++ b/lib/atomic-rv32-8.c
+@@ -0,0 +1,53 @@
++/* 8 byte __atomic_* helpers for riscv32, which has no 64-bit LR/SC:
++   they take a spinlock, like GCC's libatomic does. */
++#define bool _Bool
++typedef unsigned long long uint64_t;
++
++bool __atomic_compare_exchange_4(volatile void *p, void *expected,
++                                 unsigned desired, bool weak, int s, int f);
++void __atomic_store_4(volatile void *p, unsigned v, int order);
++
++static unsigned lock8;
++
++static void lock(void)
++{
++    unsigned zero;
++    do
++        zero = 0;
++    while (!__atomic_compare_exchange_4(&lock8, &zero, 1, 0, 5, 5));
++}
++
++static void unlock(void)
++{
++    __atomic_store_4(&lock8, 0, 5);
++}
++
++uint64_t __atomic_load_8(volatile void *p, int order)
++{
++    uint64_t v;
++    lock();
++    v = *(volatile uint64_t *)p;
++    unlock();
++    return v;
++}
++
++void __atomic_store_8(volatile void *p, uint64_t v, int order)
++{
++    lock();
++    *(volatile uint64_t *)p = v;
++    unlock();
++}
++
++bool __atomic_compare_exchange_8(volatile void *p, void *expected,
++                                 uint64_t desired, bool weak, int s, int f)
++{
++    bool ok;
++    lock();
++    ok = *(volatile uint64_t *)p == *(uint64_t *)expected;
++    if (ok)
++        *(volatile uint64_t *)p = desired;
++    else
++        *(uint64_t *)expected = *(volatile uint64_t *)p;
++    unlock();
++    return ok;
++}
+diff --git a/lib/atomic-rv32.S b/lib/atomic-rv32.S
+new file mode 100644
+index 00000000..c5d915d9
+--- /dev/null
++++ b/lib/atomic-rv32.S
+@@ -0,0 +1,151 @@
++/* __atomic_* helpers for riscv32 (rv32ima: no compressed instructions,
++   which atomic.S's riscv code has, and no 64-bit LR/SC).
++   1, 2 and 4 byte objects; the 8 byte ones are in atomic-rv32-8.c.
++
++   bool __atomic_compare_exchange_N(void *p, T *expected, T desired,
++                                    bool weak, int success, int failure)
++   T __atomic_load_N(void *p, int order)
++   void __atomic_store_N(void *p, T value, int order)
++   bool __atomic_test_and_set_N(void *p, int order)  (on the first byte)
++
++   Every operation is sequentially consistent. */
++
++        .text
++
++        .global __atomic_load_1
++__atomic_load_1:
++        fence   rw, rw
++        lbu     a0, 0(a0)
++        fence   rw, rw
++        ret
++
++        .global __atomic_load_2
++__atomic_load_2:
++        fence   rw, rw
++        lhu     a0, 0(a0)
++        fence   rw, rw
++        ret
++
++        .global __atomic_load_4
++__atomic_load_4:
++        fence   rw, rw
++        lw      a0, 0(a0)
++        fence   rw, rw
++        ret
++
++        .global __atomic_store_1
++__atomic_store_1:
++        fence   rw, w
++        sb      a1, 0(a0)
++        fence   rw, rw
++        ret
++
++        .global __atomic_store_2
++__atomic_store_2:
++        fence   rw, w
++        sh      a1, 0(a0)
++        fence   rw, rw
++        ret
++
++        .global __atomic_store_4
++__atomic_store_4:
++        fence   rw, w
++        sw      a1, 0(a0)
++        fence   rw, rw
++        ret
++
++        .global __atomic_compare_exchange_4
++__atomic_compare_exchange_4:
++        lw      a4, 0(a1)
++1:      lr.w.aqrl a5, (a0)
++        bne     a5, a4, 2f
++        sc.w.aqrl a6, a2, (a0)
++        bnez    a6, 1b
++        li      a0, 1
++        ret
++2:      sw      a5, 0(a1)
++        li      a0, 0
++        ret
++
++/* 1 and 2 bytes: LR/SC on the aligned word that holds them.
++   a0 word address, t3 shift, t4 mask, a4 expected, a2 desired (shifted),
++   t5 0 for one byte, 1 for two */
++        .global __atomic_compare_exchange_1
++__atomic_compare_exchange_1:
++        lbu     a4, 0(a1)
++        andi    a2, a2, 0xff
++        li      t4, 0xff
++        li      t5, 0
++        j       3f
++        .global __atomic_compare_exchange_2
++__atomic_compare_exchange_2:
++        lhu     a4, 0(a1)
++        lui     t4, 0x10
++        addi    t4, t4, -1
++        and     a2, a2, t4
++        li      t5, 1
++3:      andi    t3, a0, 3
++        slli    t3, t3, 3
++        andi    a0, a0, -4
++        sll     t4, t4, t3
++        sll     a4, a4, t3
++        sll     a2, a2, t3
++1:      lr.w.aqrl a5, (a0)
++        and     a6, a5, t4
++        bne     a6, a4, 2f
++        xor     a6, a5, a6
++        or      a6, a6, a2
++        sc.w.aqrl a7, a6, (a0)
++        bnez    a7, 1b
++        li      a0, 1
++        ret
++2:      srl     a6, a6, t3
++        bnez    t5, 4f          /* two bytes */
++        sb      a6, 0(a1)
++        li      a0, 0
++        ret
++4:      sh      a6, 0(a1)
++        li      a0, 0
++        ret
++
++/* set the byte at a0 to 1, return whether it was set */
++        .global __atomic_test_and_set_1
++        .global __atomic_test_and_set_2
++        .global __atomic_test_and_set_4
++        .global __atomic_test_and_set_8
++        .global atomic_flag_test_and_set
++        .global atomic_flag_test_and_set_explicit
++__atomic_test_and_set_1:
++__atomic_test_and_set_2:
++__atomic_test_and_set_4:
++__atomic_test_and_set_8:
++atomic_flag_test_and_set:
++atomic_flag_test_and_set_explicit:
++        andi    t3, a0, 3
++        slli    t3, t3, 3
++        andi    a0, a0, -4
++        li      a1, 1
++        sll     a1, a1, t3
++        amoor.w.aqrl a2, a1, (a0)
++        srl     a2, a2, t3
++        andi    a0, a2, 0xff
++        snez    a0, a0
++        ret
++
++        .global atomic_flag_clear
++        .global atomic_flag_clear_explicit
++atomic_flag_clear:
++atomic_flag_clear_explicit:
++        fence   rw, w
++        sb      zero, 0(a0)
++        fence   rw, rw
++        ret
++
++        .global atomic_thread_fence
++atomic_thread_fence:
++        fence   rw, rw
++        ret
++
++        .global atomic_signal_fence
++atomic_signal_fence:
++        ret
+diff --git a/lib/stdatomic.c b/lib/stdatomic.c
+index fe03623d..cd4fa4d4 100644
+--- a/lib/stdatomic.c
++++ b/lib/stdatomic.c
+@@ -89,7 +89,7 @@ bool ATOMIC(is_lock_free) (unsigned long size, const volatile void *ptr)
+     case 1: ret = true; break;
+     case 2: ret = true; break;
+     case 4: ret = true; break;
+-#if defined __x86_64__ || defined __aarch64__ || defined __riscv
++#if defined __x86_64__ || defined __aarch64__ || (defined __riscv && __riscv_xlen == 64)
+     case 8: ret = true; break;
+ #else
+     case 8: ret = false; break;
+diff --git a/libtcc.c b/libtcc.c
+index 44ea25fa..8c9df8ac 100644
+--- a/libtcc.c
++++ b/libtcc.c
+@@ -53,6 +53,10 @@
+ #include "riscv64-gen.c"
+ #include "riscv64-link.c"
+ #include "riscv64-asm.c"
++#elif defined(TCC_TARGET_RISCV32)
++#include "riscv32-gen.c"
++#include "riscv64-link.c"
++#include "riscv64-asm.c"
+ #else
+ #error unknown target
+ #endif
+@@ -1785,6 +1789,8 @@ static const char dumpmachine_str[] =
+     "aarch64"
+ #elif defined TCC_TARGET_RISCV64
+     "riscv64"
++#elif defined TCC_TARGET_RISCV32
++    "riscv32"
+ #endif
+     "-"
+ #ifdef TCC_TARGET_PE
+diff --git a/riscv32-gen.c b/riscv32-gen.c
+new file mode 100644
+index 00000000..ebe1eb46
+--- /dev/null
++++ b/riscv32-gen.c
+@@ -0,0 +1,1138 @@
++/*
++ *  RISC-V rv32ima code generator for TCC
++ *
++ *  ilp32 soft-float ABI: there is no FPU and no compressed instructions.
++ *  float values live in one integer register, double and long long values
++ *  in a pair of them (long double too: see gen_ldouble_load), and
++ *  every floating point operation is a call to a libgcc helper
++ *  (__adddf3 & co).  Long long arithmetic is split into 32-bit operations
++ *  by the generic code in tccgen.c.
++ *
++ *  Based on riscv64-gen.c.
++ */
++
++#ifdef TARGET_DEFS_ONLY
++
++// Number of registers available to allocator:
++#define NB_REGS 10 // x10-x17 aka a0-a7, ra, sp
++#define CONFIG_TCC_ASM
++
++#define TREG_R(x) (x) // x = 0..7
++
++// Register classes sorted from more general to more precise:
++#define RC_INT (1 << 0)
++#define RC_FLOAT (1 << 1) // no register has it: fp values use RC_INT
++#define RC_R(x) (1 << (2 + (x))) // x = 0..7
++
++#define RC_IRET (RC_R(0)) // int return register class
++#define RC_IRE2 (RC_R(1)) // int 2nd return register class
++#define RC_FRET RC_IRET   // soft-float: fp values come back in a0(/a1)
++
++#define REG_IRET (TREG_R(0)) // int return register number
++#define REG_IRE2 (TREG_R(1)) // int 2nd return register number
++#define REG_FRET REG_IRET
++
++#define PTR_SIZE 4
++
++/* long double is the ABI's 128-bit quad in memory and at calls (by
++   reference), but has double precision: in registers it is a double */
++#define LDOUBLE_SIZE 16
++#define LDOUBLE_ALIGN 16
++
++#define MAX_ALIGN 16
++
++#define CHAR_IS_UNSIGNED
++
++/* define if return values need to be extended explicitely
++   at caller side (for interfacing with non-TCC compilers) */
++#define PROMOTE_RET
++
++#else
++#define USING_GLOBALS
++#include "tcc.h"
++#include <assert.h>
++
++#define UPPER(x)	(((unsigned)(x) + 0x800u) & 0xfffff000)
++#define LOW_OVERFLOW(x)	UPPER(x)
++#define SIGN11(x)	((((x) & 0xfff) ^ 0x800) - 0x800)
++
++ST_DATA const char * const target_machine_defs =
++    "__riscv\0"
++    "__riscv_xlen 32\0"
++    "__riscv_div\0"
++    "__riscv_mul\0"
++    "__riscv_muldiv\0"
++    "__riscv_atomic\0"
++    "__riscv_float_abi_soft\0"
++    ;
++
++#define XLEN 4
++
++#define TREG_RA 8
++#define TREG_SP 9
++
++ST_DATA const int reg_classes[NB_REGS] = {
++  RC_INT | RC_R(0),
++  RC_INT | RC_R(1),
++  RC_INT | RC_R(2),
++  RC_INT | RC_R(3),
++  RC_INT | RC_R(4),
++  RC_INT | RC_R(5),
++  RC_INT | RC_R(6),
++  RC_INT | RC_R(7),
++  0, // ra
++  0, // sp
++};
++
++static int ireg(int r)
++{
++    if (r == TREG_RA)
++      return 1; // ra
++    if (r == TREG_SP)
++      return 2; // sp
++    assert(r >= 0 && r < 8);
++    return r + 10;  // tccrX --> aX == x(10+X)
++}
++
++/* two-word scalars: long long and (long) double */
++static int is_two_words(int t)
++{
++    t &= VT_BTYPE;
++    return t == VT_LLONG || t == VT_DOUBLE || t == VT_LDOUBLE;
++}
++
++ST_FUNC void o(unsigned int c)
++{
++    int ind1 = ind + 4;
++    if (nocode_wanted)
++        return;
++    if (ind1 > cur_text_section->data_allocated)
++        section_realloc(cur_text_section, ind1);
++    write32le(cur_text_section->data + ind, c);
++    ind = ind1;
++}
++
++static void EIu(uint32_t opcode, uint32_t func3,
++               uint32_t rd, uint32_t rs1, uint32_t imm)
++{
++    o(opcode | (func3 << 12) | (rd << 7) | (rs1 << 15) | (imm << 20));
++}
++
++static void ER(uint32_t opcode, uint32_t func3,
++               uint32_t rd, uint32_t rs1, uint32_t rs2, uint32_t func7)
++{
++    o(opcode | func3 << 12 | rd << 7 | rs1 << 15 | rs2 << 20 | func7 << 25);
++}
++
++static void EI(uint32_t opcode, uint32_t func3,
++               uint32_t rd, uint32_t rs1, uint32_t imm)
++{
++    assert(! LOW_OVERFLOW(imm));
++    EIu(opcode, func3, rd, rs1, imm);
++}
++
++static void ES(uint32_t opcode, uint32_t func3,
++               uint32_t rs1, uint32_t rs2, uint32_t imm)
++{
++    assert(! LOW_OVERFLOW(imm));
++    o(opcode | (func3 << 12) | ((imm & 0x1f) << 7) | (rs1 << 15)
++      | (rs2 << 20) | ((imm >> 5) << 25));
++}
++
++/* rd = sp/s0 + imm, for any 32-bit imm (uses t0 when it is large) */
++static void addi_large(int rd, int rs, int imm)
++{
++    if (LOW_OVERFLOW(imm)) {
++        o(0x37 | (5 << 7) | UPPER(imm)); // lui t0, upper(imm)
++        EI(0x13, 0, 5, 5, SIGN11(imm));  // addi t0, t0, lo(imm)
++        ER(0x33, 0, rd, rs, 5, 0);       // add rd, rs, t0
++    } else
++        EI(0x13, 0, rd, rs, imm);        // addi rd, rs, imm
++}
++
++// Patch all branches in list pointed to by t to branch to a:
++ST_FUNC void gsym_addr(int t_, int a_)
++{
++    uint32_t t = t_;
++    uint32_t a = a_;
++    while (t) {
++        unsigned char *ptr = cur_text_section->data + t;
++        uint32_t next = read32le(ptr);
++        uint32_t r = a - t, imm;
++        if ((r + (1 << 21)) & ~((1U << 22) - 2))
++          tcc_error("out-of-range branch chain");
++        imm = (((r >> 12) &  0xff) << 12)
++            | (((r >> 11) &     1) << 20)
++            | (((r >>  1) & 0x3ff) << 21)
++            | (((r >> 20) &     1) << 31);
++        write32le(ptr, r == 4 ? 0x33 : 0x6f | imm); // nop || j imm
++        t = next;
++    }
++}
++
++/* Make the base register for an access to *sv (a symbol or a local);
++   returns it and the 12-bit offset left for the access in *new_fc.
++   The instruction emitted right after this one must be the access
++   (it carries the %pcrel_lo relocation). */
++static int load_symofs(int r, SValue *sv, int forstore, int *new_fc)
++{
++    int rr, doload = 0, large_addend = 0;
++    int fc = sv->c.i, v = sv->r & VT_VALMASK;
++    if (sv->r & VT_SYM) {
++        Sym label = {0};
++        assert(v == VT_CONST);
++        if (sv->sym->type.t & VT_TLS) {
++            /* TLS Local Exec model: lui + addi + add tp */
++            rr = r >= 0 ? ireg(r) : 5;
++            greloca(cur_text_section, sv->sym, ind,
++                    R_RISCV_TPREL_HI20, sv->c.i);
++            o(0x37 | (rr << 7));  // lui RR, 0 %tprel_hi(sym)
++            greloca(cur_text_section, sv->sym, ind,
++                    R_RISCV_TPREL_LO12_I, sv->c.i);
++            EI(0x13, 0, rr, rr, 0); // addi RR, RR, 0 %tprel_lo(sym)
++            ER(0x33, 0, rr, rr, 4, 0); // add RR, RR, tp
++            *new_fc = 0;
++            return rr;
++        }
++        if (sv->sym->type.t & VT_STATIC) { // XXX do this per linker relax
++            greloca(cur_text_section, sv->sym, ind,
++                    R_RISCV_PCREL_HI20, sv->c.i);
++            *new_fc = 0;
++        } else {
++            if (LOW_OVERFLOW(fc))
++              large_addend = 1;
++            greloca(cur_text_section, sv->sym, ind,
++                    R_RISCV_GOT_HI20, 0);
++            doload = 1;
++        }
++        label.type.t = VT_VOID | VT_STATIC;
++        if (!nocode_wanted)
++            put_extern_sym(&label, cur_text_section, ind, 0);
++        rr = r >= 0 ? ireg(r) : 5;
++        o(0x17 | (rr << 7));   // auipc RR, 0 %pcrel_hi(sym)+addend
++        greloca(cur_text_section, &label, ind,
++                doload || !forstore
++                  ? R_RISCV_PCREL_LO12_I : R_RISCV_PCREL_LO12_S, 0);
++        if (doload) {
++            EI(0x03, 2, rr, rr, 0); // lw RR, 0(RR)
++            if (large_addend) {
++                o(0x37 | (6 << 7) | UPPER(fc)); //lui t1, high(fc)
++                ER(0x33, 0, rr, rr, 6, 0); // add RR, RR, t1
++                *new_fc = SIGN11(fc);
++            }
++        }
++    } else if (v == VT_LOCAL || v == VT_LLOCAL) {
++        rr = 8; // s0
++        if (LOW_OVERFLOW(fc)) {
++            rr = r >= 0 ? ireg(r) : 5; // t0
++            o(0x37 | (rr << 7) | UPPER(fc)); //lui RR, upper(fc)
++            ER(0x33, 0, rr, rr, 8, 0); // add RR, RR, s0
++            *new_fc = SIGN11(fc);
++        }
++    } else
++      tcc_error("uhh");
++    return rr;
++}
++
++ST_FUNC void load(int r, SValue *sv)
++{
++    int fr = sv->r;
++    int v = fr & VT_VALMASK;
++    int rr = ireg(r);
++    int fc = sv->c.i;
++    int bt = sv->type.t & VT_BTYPE;
++    int align, size;
++    if (fr & VT_LVAL) {
++        int func3, br;
++        size = type_size(&sv->type, &align);
++        /* pointers are one word; two-word values are loaded one
++           word at a time by the generic code */
++        if (bt == VT_PTR || bt == VT_FUNC || size > 4)
++          size = 4;
++        func3 = size == 1 ? 0 : size == 2 ? 1 : 2;
++        if (size < 4 && (sv->type.t & VT_UNSIGNED))
++          func3 |= 4;
++        if (v == VT_LOCAL || (fr & VT_SYM)) {
++            br = load_symofs(r, sv, 0, &fc);
++        } else if (v < VT_CONST) {
++            br = ireg(v);
++            fc = 0; // XXX store ofs in LVAL(reg)
++        } else if (v == VT_LLOCAL) {
++            br = load_symofs(r, sv, 0, &fc);
++            EI(0x03, 2, rr, br, fc); // lw RR, fc(BR)
++            br = rr;
++            fc = 0;
++        } else if (v == VT_CONST) {
++            o(0x37 | (rr << 7) | UPPER(fc)); //lui RR, upper(fc)
++            fc = SIGN11(fc);
++            br = rr;
++        } else {
++            tcc_error("unimp: load(non-local lval)");
++        }
++        EI(0x03, func3, rr, br, fc); // l[bh][u]/lw RR, fc(BR)
++    } else if (v == VT_CONST) {
++        int rb = 0;
++        if (is_float(sv->type.t) && bt == VT_FLOAT) {
++            /* float constant: its bit pattern */
++            union { float f; uint32_t u; } x;
++            x.f = sv->c.f;
++            fc = x.u;
++        }
++        if (fr & VT_SYM) {
++            rb = load_symofs(r, sv, 0, &fc);
++            EI(0x13, 0, rr, rb, fc); // addi RR, RB, lo(fc) (%pcrel_lo)
++            return;
++        }
++        if (LOW_OVERFLOW(fc)) {
++            o(0x37 | (rr << 7) | UPPER(fc)), rb = rr; //lui RR, upper(fc)
++            if (SIGN11(fc))
++              EI(0x13, 0, rr, rb, SIGN11(fc)); // addi RR, RR, lo(fc)
++        } else
++            EI(0x13, 0, rr, 0, fc); // addi RR, x0, fc == li RR, fc
++    } else if (v == VT_LOCAL) {
++        int br = load_symofs(r, sv, 0, &fc);
++        EI(0x13, 0, rr, br, fc); // addi R, s0, FC
++    } else if (v < VT_CONST) { /* reg-reg */
++        //assert(!fc); XXX support offseted regs
++        if (rr != ireg(v))
++          EI(0x13, 0, rr, ireg(v), 0); // addi RR, V, 0 == mv RR, V
++    } else if (v == VT_CMP) {
++        int op = vtop->cmp_op;
++        int a = vtop->cmp_r & 0xff;
++        int b = (vtop->cmp_r >> 8) & 0xff;
++        int inv = 0;
++        switch (op) {
++            case TOK_ULT:
++            case TOK_UGE:
++            case TOK_ULE:
++            case TOK_UGT:
++            case TOK_LT:
++            case TOK_GE:
++            case TOK_LE:
++            case TOK_GT:
++                if (op & 1) { // remove [U]GE,GT
++                    inv = 1;
++                    op--;
++                }
++                if ((op & 7) == 6) { // [U]LE
++                    int t = a; a = b; b = t;
++                    inv ^= 1;
++                }
++                ER(0x33, (op > TOK_UGT) ? 2 : 3, rr, a, b, 0); // slt[u] d, a, b
++                if (inv)
++                  EI(0x13, 4, rr, rr, 1); // xori d, d, 1
++                break;
++            case TOK_NE:
++            case TOK_EQ:
++                if (rr != a || b)
++                  ER(0x33, 0, rr, a, b, 0x20); // sub d, a, b
++                if (op == TOK_NE)
++                  ER(0x33, 3, rr, 0, rr, 0); // sltu d, x0, d == snez d,d
++                else
++                  EI(0x13, 3, rr, rr, 1); // sltiu d, d, 1 == seqz d,d
++                break;
++        }
++    } else if ((v & ~1) == VT_JMP) {
++        int t = v & 1;
++        EI(0x13, 0, rr, 0, t);      // addi RR, x0, t
++        gjmp_addr(ind + 8);
++        gsym(fc);
++        EI(0x13, 0, rr, 0, t ^ 1);  // addi RR, x0, !t
++    } else
++      tcc_error("unimp: load(non-const)");
++}
++
++ST_FUNC void store(int r, SValue *sv)
++{
++    int fr = sv->r & VT_VALMASK;
++    int rr = ireg(r), ptrreg;
++    int fc = sv->c.i;
++    int bt = sv->type.t & VT_BTYPE;
++    int align, size = type_size(&sv->type, &align);
++    if (bt == VT_STRUCT)
++      tcc_error("unimp: store(struct)");
++    /* two-word values are stored one word at a time by the generic code */
++    if (bt == VT_PTR || bt == VT_FUNC || size > 4)
++      size = 4;
++    assert(sv->r & VT_LVAL);
++    if (fr == VT_LOCAL || (sv->r & VT_SYM)) {
++        ptrreg = load_symofs(-1, sv, 1, &fc);
++    } else if (fr < VT_CONST) {
++        ptrreg = ireg(fr);
++        fc = 0; // XXX support offsets regs
++    } else if (fr == VT_CONST) {
++        ptrreg = 5; // t0
++        o(0x37 | (ptrreg << 7) | UPPER(fc)); //lui t0, upper(fc)
++        fc = SIGN11(fc);
++    } else
++      tcc_error("implement me: %s(!local)", __FUNCTION__);
++    ES(0x23, size == 1 ? 0 : size == 2 ? 1 : 2, // s[bhw]
++       ptrreg, rr, fc);                         // RR, fc(base)
++}
++
++static void gcall_or_jmp(int docall)
++{
++    int tr = docall ? 1 : 5; // ra or t0
++    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST &&
++        ((vtop->r & VT_SYM) && vtop->c.i == (int)vtop->c.i)) {
++        /* constant symbolic case -> simple relocation */
++        greloca(cur_text_section, vtop->sym, ind,
++                R_RISCV_CALL_PLT, (int)vtop->c.i);
++        o(0x17 | (tr << 7));   // auipc TR, 0 %call(func)
++        EI(0x67, 0, tr, tr, 0);// jalr  TR, r(TR)
++    } else if (vtop->r < VT_CONST) {
++        int r = ireg(vtop->r);
++        EI(0x67, 0, tr, r, 0);      // jalr TR, 0(R)
++    } else {
++        int r = TREG_RA;
++        load(r, vtop);
++        r = ireg(r);
++        EI(0x67, 0, tr, r, 0);      // jalr TR, 0(R)
++    }
++}
++
++/* type to load the word at 'ofs' of a small struct of 'size' bytes */
++static int struct_word_type(int size, int ofs)
++{
++    size -= ofs;
++    return size == 1 ? VT_BYTE | VT_UNSIGNED
++         : size == 2 ? VT_SHORT | VT_UNSIGNED
++         : VT_INT;
++}
++
++/* Arguments, ilp32 integer calling convention:
++   - scalars and structs of up to 2*XLEN bytes go in one or two of a0-a7;
++     a two-word value that finds only a7 free has its high word on the
++     stack, and variadic 8-byte aligned ones start at an even register;
++   - larger structs are copied and passed by reference;
++   - the rest goes on the stack, each aligned to max(XLEN, alignment).
++   info[i] bits: 0-3 register, 4 high word on stack, 5 on stack,
++   6 by reference (bits 7.. temp offset), 7-11 second register + 1. */
++ST_FUNC void gfunc_call(int nb_args)
++{
++    int i, align, size, areg;
++    int *info = tcc_malloc((nb_args + 1) * sizeof (int));
++    int stack_adj = 0, tempspace = 0, stack_add, ofs, splitofs = 0;
++    int old = (vtop[-nb_args].type.ref->f.func_type == FUNC_OLD);
++    SValue *sv;
++    Sym *sa;
++
++    areg = 0;
++    sa = vtop[-nb_args].type.ref->next;
++    for (i = 0; i < nb_args; i++) {
++        int nregs, byref = 0, tempofs;
++        sv = &vtop[1 + i - nb_args];
++        sv->type.t &= ~VT_ARRAY; // XXX this should be done in tccgen.c
++        size = type_size(&sv->type, &align);
++        if (size > 2 * XLEN) {
++            if (align < XLEN)
++              align = XLEN;
++            tempspace = (tempspace + align - 1) & -align;
++            tempofs = tempspace;
++            tempspace += size;
++            size = align = XLEN;
++            byref = 64 | (tempofs << 7);
++        }
++        nregs = (size + XLEN - 1) / XLEN;
++        if (!old && !sa && align == 2*XLEN && size == 2*XLEN)
++          areg = (areg + 1) & ~1;
++        if (size == 0)
++            info[i] = 0;
++        else if (areg >= 8) {
++            info[i] = 32;
++            if (align < XLEN)
++              align = XLEN;
++            stack_adj = (stack_adj + align - 1) & -align;
++            stack_adj += (size + XLEN - 1) & -XLEN;
++        } else {
++            info[i] = areg++;
++            if (nregs == 2) {
++                if (areg < 8)
++                  info[i] |= (1 + areg++) << 7;
++                else {
++                    info[i] |= 16;
++                    stack_adj += XLEN;
++                }
++            }
++        }
++        info[i] |= byref;
++        if (sa)
++          sa = sa->next;
++    }
++    stack_adj = (stack_adj + 15) & -16;
++    tempspace = (tempspace + 15) & -16;
++    stack_add = stack_adj + tempspace;
++
++    if (stack_add) {
++        addi_large(2, 2, -stack_add); // sp -= stack_add
++        for (i = ofs = 0; i < nb_args; i++) {
++            if (info[i] & (64 | 32)) {
++                vrotb(nb_args - i);
++                size = type_size(&vtop->type, &align);
++                if (info[i] & 64) {
++                    vset(&char_pointer_type, TREG_SP, 0);
++                    vpushi(stack_adj + (info[i] >> 7));
++                    gen_op('+');
++                    vpushv(vtop); // this replaces the old argument
++                    vrott(3);
++                    indir();
++                    vtop->type = vtop[-1].type;
++                    vswap();
++                    vstore();
++                    vpop();
++                    size = align = XLEN;
++                }
++                if (info[i] & 32) {
++                    if (align < XLEN)
++                      align = XLEN;
++                    /* Once we support offseted regs we can do this:
++                       vset(&vtop->type, TREG_SP | VT_LVAL, ofs);
++                       to construct the lvalue for the outgoing stack slot,
++                       until then we have to jump through hoops.  */
++                    vset(&char_pointer_type, TREG_SP, 0);
++                    ofs = (ofs + align - 1) & -align;
++                    vpushi(ofs);
++                    gen_op('+');
++                    indir();
++                    vtop->type = vtop[-1].type;
++                    vswap();
++                    vstore();
++                    vtop->r = vtop->r2 = VT_CONST; // this arg is done
++                    ofs += (size + XLEN - 1) & -XLEN;
++                }
++                vrott(nb_args - i);
++            } else if (info[i] & 16) {
++                assert(!splitofs);
++                splitofs = ofs;
++                ofs += XLEN;
++            }
++        }
++    }
++    for (i = 0; i < nb_args; i++) {
++        int ii = info[nb_args - 1 - i], r = ii, r2 = r;
++        if (!(r & 32)) {
++            CType origtype;
++            int loadt, pair;
++            r &= 15;
++            r2 = r2 & 64 ? 0 : (r2 >> 7) & 31;
++            vrotb(i+1);
++            origtype = vtop->type;
++            size = type_size(&vtop->type, &align);
++            if (size == 0)
++                goto done;
++            loadt = vtop->type.t & (VT_BTYPE | VT_UNSIGNED);
++            pair = is_two_words(loadt);
++            if ((loadt & VT_BTYPE) == VT_STRUCT)
++                loadt = struct_word_type(size, 0);
++            if (ii & 16) {
++                assert(!r2);
++                r2 = 1 + TREG_RA;
++            }
++            if (r2 && !pair) {
++                test_lvalue();
++                vpushv(vtop);
++            }
++            vtop->type.t = loadt;
++            gv(RC_R(r));
++            vtop->type = origtype;
++
++            if (r2 && !pair) {
++                /* second word of a struct */
++                r2--;
++                vswap();
++                gaddrof();
++                vtop->type = char_pointer_type;
++                vpushi(XLEN);
++                gen_op('+');
++                indir();
++                vtop->type.t = struct_word_type(size, XLEN);
++                save_reg_upstack(r2, 1);
++                load(r2, vtop);
++                vtop--;
++                vtop->r2 = r2;
++            } else if (r2 && !(ii & 16) && vtop->r2 != r2 - 1) {
++                /* XXX we'd like to have 'gv' move directly into
++                   the right class instead of us fixing it up.  */
++                r2--;
++                save_reg_upstack(r2, 1);
++                EI(0x13, 0, ireg(r2), ireg(vtop->r2), 0); // mv Ra+1, RR2
++                vtop->r2 = r2;
++            }
++            if (ii & 16) {
++                ES(0x23, 2, 2, ireg(vtop->r2), splitofs); // sw RR2, ofs(sp)
++                vtop->r2 = VT_CONST;
++            }
++done:
++            vrott(i+1);
++        }
++    }
++    vrotb(nb_args + 1);
++    save_regs(nb_args + 1);
++    gcall_or_jmp(1);
++    vtop -= nb_args + 1;
++    if (stack_add)
++        addi_large(2, 2, stack_add); // sp += stack_add
++    tcc_free(info);
++}
++
++static int func_sub_sp_offset, num_va_regs, func_va_list_ofs;
++
++/* Frame: s0 is the stack pointer at entry (minus the varargs register
++   save area, which sits right below the stack arguments), ra is at
++   s0-4, the caller's s0 at s0-8, locals below. */
++ST_FUNC void gfunc_prolog(Sym *func_sym)
++{
++    CType *func_type = &func_sym->type;
++    int i, addr, align, size;
++    int param_addr = 0;
++    int areg;
++    Sym *sym;
++    CType *type;
++
++    sym = func_type->ref;
++    loc = -2 * XLEN; // for ra and s0
++    func_sub_sp_offset = ind;
++    ind += 5 * 4;
++
++    areg = 0;
++    addr = 0;
++    /* if the function returns by reference, then add an
++       implicit pointer parameter */
++    size = type_size(&func_vt, &align);
++    if (size > 2 * XLEN) {
++        loc -= XLEN;
++        func_vc = loc;
++        ES(0x23, 2, 8, 10 + areg++, loc); // sw a0, loc(s0)
++    }
++    /* define parameters */
++    while ((sym = sym->next) != NULL) {
++        int byref = 0;
++        int nregs;
++        type = &sym->type;
++        size = type_size(type, &align);
++        if (size > 2 * XLEN) {
++            type = &char_pointer_type;
++            size = align = byref = XLEN;
++        }
++        nregs = (size + XLEN - 1) / XLEN;
++        if (areg >= 8) {
++            if (align < XLEN)
++              align = XLEN;
++            addr = (addr + align - 1) & -align;
++            param_addr = addr;
++            addr += (size + XLEN - 1) & -XLEN;
++        } else {
++            loc -= nregs * XLEN;
++            if (align > XLEN)
++              loc &= -align;
++            param_addr = loc;
++            for (i = 0; i < nregs; i++) {
++                if (areg >= 8) {
++                    /* high word of a split two-word value */
++                    assert(i == 1 && nregs == 2);
++                    EI(0x03, 2, 5, 8, addr); // lw t0, addr(s0)
++                    addr += XLEN;
++                    ES(0x23, 2, 8, 5, loc + i*XLEN); // sw t0, loc(s0)
++                } else {
++                    ES(0x23, 2, 8, 10 + areg++, loc + i*XLEN); // sw aX, loc(s0)
++                }
++            }
++        }
++        gfunc_set_param(sym, param_addr, byref);
++    }
++    func_va_list_ofs = addr;
++    num_va_regs = 0;
++    if (func_var) {
++        for (; areg < 8; areg++) {
++            num_va_regs++;
++            ES(0x23, 2, 8, 10 + areg, -XLEN + num_va_regs * XLEN); // sw aX, loc(s0)
++        }
++    }
++}
++
++ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret,
++                       int *ret_align, int *regsize)
++{
++    int align, size = type_size(vt, &align);
++    *ret_align = 1;
++    *regsize = XLEN;
++    if (size > 2 * XLEN)
++      return 0;
++    ret->t = VT_INT;
++    ret->ref = NULL;
++    return (size + XLEN - 1) / XLEN;
++}
++
++ST_FUNC void gfunc_epilog(void)
++{
++    int v, saved_ind, d, large_ofs_ind;
++    int va = num_va_regs * XLEN;
++
++    loc = (loc - va);
++    d = v = (-loc + 15) & -16;
++
++    EI(0x13, 0, 2, 8, va); // addi sp, s0, va
++    EI(0x03, 2, 1, 8, -XLEN); // lw ra, -4(s0)
++    EI(0x03, 2, 8, 8, -2*XLEN); // lw s0, -8(s0)
++    EI(0x67, 0, 0, 1, 0); // jalr x0, 0(x1), aka ret
++
++    large_ofs_ind = ind;
++    if (v >= (1 << 11)) {
++        /* first allocate room for ra, s0 and the varargs, then the rest */
++        d = (2*XLEN + va + 15) & -16;
++        EI(0x13, 0, 8, 2, d - va);      // addi s0, sp, d - va
++        o(0x37 | (5 << 7) | UPPER(v-d)); //lui t0, upper(v-d)
++        EI(0x13, 0, 5, 5, SIGN11(v-d)); // addi t0, t0, lo(v-d)
++        ER(0x33, 0, 2, 2, 5, 0x20); // sub sp, sp, t0
++        gjmp_addr(func_sub_sp_offset + 5*4);
++    }
++    saved_ind = ind;
++
++    ind = func_sub_sp_offset;
++    EI(0x13, 0, 2, 2, -d);     // addi sp, sp, -d
++    ES(0x23, 2, 2, 1, d - XLEN - va);  // sw ra, d-4-va(sp)
++    ES(0x23, 2, 2, 8, d - 2*XLEN - va); // sw s0, d-8-va(sp)
++    if (v < (1 << 11))
++      EI(0x13, 0, 8, 2, d - va);      // addi s0, sp, d - va
++    else
++      gjmp_addr(large_ofs_ind);
++    if ((ind - func_sub_sp_offset) != 5*4)
++      EI(0x13, 0, 0, 0, 0);      // addi x0, x0, 0 == nop
++    ind = saved_ind;
++}
++
++ST_FUNC void gen_va_start(void)
++{
++    vtop--;
++    vset(&char_pointer_type, VT_LOCAL, func_va_list_ofs);
++}
++
++ST_FUNC void gen_fill_nops(int bytes)
++{
++    if ((bytes & 3))
++      tcc_error("alignment of code section not multiple of 4");
++    while (bytes > 0) {
++        EI(0x13, 0, 0, 0, 0);      // addi x0, x0, 0 == nop
++        bytes -= 4;
++    }
++}
++
++// Generate forward branch to label:
++ST_FUNC int gjmp(int t)
++{
++    if (nocode_wanted)
++      return t;
++    o(t);
++    return ind - 4;
++}
++
++// Generate branch to known address:
++ST_FUNC void gjmp_addr(int a)
++{
++    uint32_t r = a - ind, imm;
++    if ((r + (1 << 21)) & ~((1U << 22) - 2)) {
++        o(0x17 | (5 << 7) | UPPER(r)); // auipc t0, up(r)
++        r = SIGN11(r);
++        EI(0x67, 0, 0, 5, r);      // jalr x0, r(t0)
++    } else {
++        imm = (((r >> 12) &  0xff) << 12)
++            | (((r >> 11) &     1) << 20)
++            | (((r >>  1) & 0x3ff) << 21)
++            | (((r >> 20) &     1) << 31);
++        o(0x6f | imm); // jal x0, imm ==  j imm
++    }
++}
++
++ST_FUNC int gjmp_cond(int op, int t)
++{
++    int tmp;
++    int a = vtop->cmp_r & 0xff;
++    int b = (vtop->cmp_r >> 8) & 0xff;
++    switch (op) {
++        case TOK_ULT: op = 6; break;
++        case TOK_UGE: op = 7; break;
++        case TOK_ULE: op = 7; tmp = a; a = b; b = tmp; break;
++        case TOK_UGT: op = 6; tmp = a; a = b; b = tmp; break;
++        case TOK_LT:  op = 4; break;
++        case TOK_GE:  op = 5; break;
++        case TOK_LE:  op = 5; tmp = a; a = b; b = tmp; break;
++        case TOK_GT:  op = 4; tmp = a; a = b; b = tmp; break;
++        case TOK_NE:  op = 1; break;
++        case TOK_EQ:  op = 0; break;
++    }
++    o(0x63 | (op ^ 1) << 12 | a << 15 | b << 20 | 8 << 7); // bOP a,b,+4
++    return gjmp(t);
++}
++
++ST_FUNC int gjmp_append(int n, int t)
++{
++    void *p;
++    /* insert jump list n into t */
++    if (n) {
++        uint32_t n1 = n, n2;
++        while ((n2 = read32le(p = cur_text_section->data + n1)))
++            n1 = n2;
++        write32le(p, t);
++        t = n;
++    }
++    return t;
++}
++
++/* The carry (or borrow) between the two halves of a long long add (sub)
++   lives in t2 from TOK_ADDC1 (SUBC1) to TOK_ADDC2 (SUBC2): no code in
++   between uses it. */
++#define REG_CARRY 7
++
++ST_FUNC void gen_opi(int op)
++{
++    int a, b, d;
++    int func3 = 0;
++    if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
++        int fc = vtop->c.i;
++        if (!LOW_OVERFLOW(fc)) {
++            vswap();
++            gv(RC_INT);
++            a = ireg(vtop[0].r);
++            --vtop;
++            d = get_reg(RC_INT);
++            ++vtop;
++            vswap();
++            switch (op) {
++                case '-':
++                    if (fc <= -(1 << 11))
++                      break;
++                    fc = -fc;
++                case '+':
++                    func3 = 0; // addi d, a, fc
++                do_cop:
++                    EI(0x13, func3, ireg(d), a, fc);
++                    --vtop;
++                    if (op >= TOK_ULT && op <= TOK_GT) {
++                      vset_VT_CMP(TOK_NE);
++                      vtop->cmp_r = ireg(d) | 0 << 8;
++                    } else
++                      vtop[0].r = d;
++                    return;
++                case TOK_LE:
++                    if (fc >= (1 << 11) - 1)
++                      break;
++                    ++fc;
++                case TOK_LT:  func3 = 2; goto do_cop; // slti d, a, fc
++                case TOK_ULE:
++                    if (fc >= (1 << 11) - 1 || fc == -1)
++                      break;
++                    ++fc;
++                case TOK_ULT: func3 = 3; goto do_cop; // sltiu d, a, fc
++                case '^':     func3 = 4; goto do_cop; // xori d, a, fc
++                case '|':     func3 = 6; goto do_cop; // ori  d, a, fc
++                case '&':     func3 = 7; goto do_cop; // andi d, a, fc
++                case TOK_SHL: func3 = 1; fc &= 31; goto do_cop; // slli d, a, fc
++                case TOK_SHR: func3 = 5; fc &= 31; goto do_cop; // srli d, a, fc
++                case TOK_SAR: func3 = 5; fc = 1024 | (fc & 31); goto do_cop;
++
++                case TOK_UGE: /* -> TOK_ULT */
++                case TOK_UGT: /* -> TOK_ULE */
++                case TOK_GE:  /* -> TOK_LT */
++                case TOK_GT:  /* -> TOK_LE */
++                    gen_opi(op - 1);
++                    vtop->cmp_op ^= 1;
++                    return;
++
++                case TOK_NE:
++                case TOK_EQ:
++                    if (fc)
++                      gen_opi('-'), a = ireg(vtop++->r);
++                    --vtop;
++                    vset_VT_CMP(op);
++                    vtop->cmp_r = a | 0 << 8;
++                    return;
++            }
++        }
++    }
++    gv2(RC_INT, RC_INT);
++    a = ireg(vtop[-1].r);
++    b = ireg(vtop[0].r);
++    if (op == TOK_UMULL) {
++        /* 32x32 -> 64: low word into a's register, high word into a new one */
++        int h = get_reg(RC_INT);
++        ER(0x33, 3, ireg(h), a, b, 1); // mulhu h, a, b
++        ER(0x33, 0, a, a, b, 1);       // mul a, a, b
++        vtop--;
++        vtop->r2 = h;
++        return;
++    }
++    vtop -= 2;
++    d = get_reg(RC_INT);
++    vtop++;
++    vtop[0].r = d;
++    d = ireg(d);
++    switch (op) {
++    default:
++        if (op >= TOK_ULT && op <= TOK_GT) {
++            vset_VT_CMP(op);
++            vtop->cmp_r = a | b << 8;
++            break;
++        }
++        tcc_error("implement me: %s(%s)", __FUNCTION__, get_tok_str(op, NULL));
++        break;
++
++    case '+':
++        ER(0x33, 0, d, a, b, 0); // add d, a, b
++        break;
++    case TOK_ADDC1:
++        ER(0x33, 0, d, a, b, 0); // add d, a, b
++        ER(0x33, 3, REG_CARRY, d, d == a ? b : a, 0); // sltu t2, d, (a|b)
++        break;
++    case TOK_ADDC2:
++        ER(0x33, 0, d, a, b, 0); // add d, a, b
++        ER(0x33, 0, d, d, REG_CARRY, 0); // add d, d, t2
++        break;
++    case '-':
++        ER(0x33, 0, d, a, b, 0x20); // sub d, a, b
++        break;
++    case TOK_SUBC1:
++        ER(0x33, 3, REG_CARRY, a, b, 0); // sltu t2, a, b
++        ER(0x33, 0, d, a, b, 0x20); // sub d, a, b
++        break;
++    case TOK_SUBC2:
++        ER(0x33, 0, d, a, b, 0x20); // sub d, a, b
++        ER(0x33, 0, d, d, REG_CARRY, 0x20); // sub d, d, t2
++        break;
++    case TOK_SAR:
++        ER(0x33, 5, d, a, b, 0x20); // sra d, a, b
++        break;
++    case TOK_SHR:
++        ER(0x33, 5, d, a, b, 0); // srl d, a, b
++        break;
++    case TOK_SHL:
++        ER(0x33, 1, d, a, b, 0); // sll d, a, b
++        break;
++    case '*':
++        ER(0x33, 0, d, a, b, 1); // mul d, a, b
++        break;
++    case '/':
++    case TOK_PDIV:
++        ER(0x33, 4, d, a, b, 1); // div d, a, b
++        break;
++    case '&':
++        ER(0x33, 7, d, a, b, 0); // and d, a, b
++        break;
++    case '^':
++        ER(0x33, 4, d, a, b, 0); // xor d, a, b
++        break;
++    case '|':
++        ER(0x33, 6, d, a, b, 0); // or d, a, b
++        break;
++    case '%':
++        ER(0x33, 6, d, a, b, 1); // rem d, a, b
++        break;
++    case TOK_UMOD:
++        ER(0x33, 7, d, a, b, 1); // remu d, a, b
++        break;
++    case TOK_UDIV:
++        ER(0x33, 5, d, a, b, 1); // divu d, a, b
++        break;
++    }
++}
++
++/* call the libgcc soft-float helper 'func' on the top 'nargs' values and
++   leave its result, of type 't', on the stack */
++static void gen_fp_call(int func, int nargs, int t)
++{
++    int i;
++    /* the double helpers serve long double too: pass its register form */
++    for (i = 0; i < nargs; i++) {
++        vrotb(nargs);
++        if ((vtop->type.t & VT_BTYPE) == VT_LDOUBLE) {
++            gv(RC_INT);
++            vtop->type.t = VT_DOUBLE;
++        }
++    }
++    vpush_helper_func(func);
++    vrott(nargs + 1);
++    gfunc_call(nargs);
++    vpushi(0);
++    vtop->type.t = t;
++    vtop->r = REG_IRET;
++    vtop->r2 = is_two_words(t) ? REG_IRE2 : VT_CONST;
++}
++
++ST_FUNC void gen_opf(int op)
++{
++    int t = vtop->type.t & (VT_BTYPE | VT_LONG);
++    int dbl = (t & VT_BTYPE) != VT_FLOAT;
++    int func;
++
++    if (op == TOK_NEG) {
++        /* flip the sign bit of the (high) word */
++        int r;
++        gv(RC_INT);
++        r = ireg(dbl ? vtop->r2 : vtop->r);
++        o(0x37 | (5 << 7) | 0x80000000); // lui t0, 0x80000
++        ER(0x33, 4, r, r, 5, 0); // xor r, r, t0
++        return;
++    }
++    switch (op) {
++    case '+': func = dbl ? TOK___adddf3 : TOK___addsf3; break;
++    case '-': func = dbl ? TOK___subdf3 : TOK___subsf3; break;
++    case '*': func = dbl ? TOK___muldf3 : TOK___mulsf3; break;
++    case '/': func = dbl ? TOK___divdf3 : TOK___divsf3; break;
++    /* a OP b is __OPdf2(a, b) OP 0, NaNs included */
++    case TOK_EQ: func = dbl ? TOK___eqdf2 : TOK___eqsf2; break;
++    case TOK_NE: func = dbl ? TOK___nedf2 : TOK___nesf2; break;
++    case TOK_LT: func = dbl ? TOK___ltdf2 : TOK___ltsf2; break;
++    case TOK_LE: func = dbl ? TOK___ledf2 : TOK___lesf2; break;
++    case TOK_GT: func = dbl ? TOK___gtdf2 : TOK___gtsf2; break;
++    case TOK_GE: func = dbl ? TOK___gedf2 : TOK___gesf2; break;
++    default:
++        tcc_error("implement me: %s(%s)", __FUNCTION__, get_tok_str(op, NULL));
++        return;
++    }
++    if (op >= TOK_ULT && op <= TOK_GT) {
++        gen_fp_call(func, 2, VT_INT);
++        vpushi(0);
++        gen_opi(op);
++    } else
++        gen_fp_call(func, 2, t);
++}
++
++ST_FUNC void gen_cvt_itof(int t)
++{
++    int st = vtop->type.t & (VT_BTYPE | VT_UNSIGNED);
++    int u = st & VT_UNSIGNED;
++    int l = (st & VT_BTYPE) == VT_LLONG;
++    int dbl = (t & VT_BTYPE) != VT_FLOAT;
++    int func = l ?
++      (u ? (dbl ? TOK___floatundidf : TOK___floatundisf)
++         : (dbl ? TOK___floatdidf : TOK___floatdisf)) :
++      (u ? (dbl ? TOK___floatunsidf : TOK___floatunsisf)
++         : (dbl ? TOK___floatsidf : TOK___floatsisf));
++    gen_fp_call(func, 1, t);
++}
++
++ST_FUNC void gen_cvt_ftoi(int t)
++{
++    int dbl = (vtop->type.t & VT_BTYPE) != VT_FLOAT;
++    int l = (t & VT_BTYPE) == VT_LLONG;
++    int u = t & VT_UNSIGNED;
++    int func = l ?
++      (u ? (dbl ? TOK___fixunsdfdi : TOK___fixunssfdi)
++         : (dbl ? TOK___fixdfdi : TOK___fixsfdi)) :
++      (u ? (dbl ? TOK___fixunsdfsi : TOK___fixunssfsi)
++         : (dbl ? TOK___fixdfsi : TOK___fixsfsi));
++    gen_fp_call(func, 1, t);
++}
++
++ST_FUNC void gen_cvt_ftof(int dt)
++{
++    int st = vtop->type.t & VT_BTYPE;
++    if (st == VT_LDOUBLE)
++      st = VT_DOUBLE;
++    if ((dt & VT_BTYPE) == VT_LDOUBLE)
++      dt = (dt & ~VT_BTYPE) | VT_DOUBLE;
++    if (st == (dt & VT_BTYPE)) {
++        /* double <-> long double: the same in registers */
++        gv(RC_INT);
++        vtop->type.t = dt;
++        return;
++    }
++    gen_fp_call(st == VT_FLOAT ? TOK___extendsfdf2 : TOK___truncdfsf2, 1, dt);
++}
++
++/* lvalue long double (a quad) on the stack -> its value in a0/a1 as a
++   double, through __trunctfdf2 (which takes the quad by reference) */
++ST_FUNC void gen_ldouble_load(void)
++{
++    gaddrof();
++    vtop->type = char_pointer_type;
++    vpush_helper_func(TOK___trunctfdf2);
++    vswap();
++    gfunc_call(1);
++    vpushi(0);
++    vtop->type.t = VT_LDOUBLE;
++    vtop->r = REG_IRET;
++    vtop->r2 = REG_IRE2;
++}
++
++/* vstore() of a long double: stack: lvalue, value -> value; the quad is
++   made by __extenddftf2, which returns it through a hidden pointer (a0) */
++ST_FUNC void gen_ldouble_store(void)
++{
++    gv(RC_INT);
++    vpushv(vtop - 1);
++    gaddrof();
++    vtop->type = char_pointer_type;
++    vpushv(vtop - 1);
++    vtop->type.t = VT_DOUBLE;
++    vpush_helper_func(TOK___extenddftf2);
++    vrott(3);
++    gfunc_call(2);
++    vswap();
++    vtop--;
++}
++
++/* increment tcov counter */
++ST_FUNC void gen_increment_tcov (SValue *sv)
++{
++    int r1, r2;
++    Sym label = {0};
++    label.type.t = VT_VOID | VT_STATIC;
++
++    vpushv(sv);
++    vtop->r = r1 = get_reg(RC_INT);
++    r2 = get_reg(RC_INT);
++    r1 = ireg(r1);
++    r2 = ireg(r2);
++    greloca(cur_text_section, sv->sym, ind, R_RISCV_PCREL_HI20, 0);
++    put_extern_sym(&label, cur_text_section, ind, 0);
++    o(0x17 | (r1 << 7)); // auipc RR, 0 %pcrel_hi(sym)
++    greloca(cur_text_section, &label, ind, R_RISCV_PCREL_LO12_I, 0);
++    EI(0x03, 2, r2, r1, 0); // lw r2, x[r1]
++    EI(0x13, 0, r2, r2, 1); // addi r2, r2, #1
++    greloca(cur_text_section, sv->sym, ind, R_RISCV_PCREL_HI20, 0);
++    label.c = 0; /* force new local ELF symbol */
++    put_extern_sym(&label, cur_text_section, ind, 0);
++    o(0x17 | (r1 << 7)); // auipc RR, 0 %pcrel_hi(sym)
++    greloca(cur_text_section, &label, ind, R_RISCV_PCREL_LO12_S, 0);
++    ES(0x23, 2, r1, r2, 0); // sw r2, [r1]
++    vpop();
++}
++
++ST_FUNC void ggoto(void)
++{
++    gcall_or_jmp(0);
++    vtop--;
++}
++
++ST_FUNC void gen_vla_sp_save(int addr)
++{
++    if (LOW_OVERFLOW(addr)) {
++        o(0x37 | (5 << 7) | UPPER(addr)); //lui t0,upper(addr)
++        ER(0x33, 0, 5, 5, 8, 0); // add t0, t0, s0
++        ES(0x23, 2, 5, 2, SIGN11(addr)); // sw sp, fc(t0)
++    }
++    else
++        ES(0x23, 2, 8, 2, addr); // sw sp, fc(s0)
++}
++
++ST_FUNC void gen_vla_sp_restore(int addr)
++{
++    if (LOW_OVERFLOW(addr)) {
++        o(0x37 | (5 << 7) | UPPER(addr)); //lui t0,upper(addr)
++        ER(0x33, 0, 5, 5, 8, 0); // add t0, t0, s0
++        EI(0x03, 2, 2, 5, SIGN11(addr)); // lw sp, fc(t0)
++    }
++    else
++        EI(0x03, 2, 2, 8, addr); // lw sp, fc(s0)
++}
++
++ST_FUNC void gen_vla_alloc(CType *type, int align)
++{
++    int rr = ireg(gv(RC_INT));
++    EI(0x13, 0, rr, rr, 15);   // addi RR, RR, 15
++    EI(0x13, 7, rr, rr, -16);  // andi, RR, RR, -16
++    ER(0x33, 0, 2, 2, rr, 0x20); // sub sp, sp, rr
++    vpop();
++}
++
++#endif
+diff --git a/riscv64-asm.c b/riscv64-asm.c
+index b35615fc..7fd605db 100644
+--- a/riscv64-asm.c
++++ b/riscv64-asm.c
+@@ -126,7 +126,11 @@ ST_FUNC void gen_le32 (int i)
+ 
+ ST_FUNC void gen_expr32(ExprValue *pe)
+ {
+-    gen_le32(pe->v);
++    if (pe->sym) {
++        greloca(cur_text_section, pe->sym, ind, R_RISCV_32, pe->v);
++        gen_le32(0);
++    } else
++        gen_le32(pe->v);
+ }
+ 
+ static void asm_emit_opcode(uint32_t opcode) {
+@@ -634,6 +638,22 @@ static void asm_binary_opcode(TCCState* s1, int token)
+         if(ops[1].type != OP_IM32 && ops[1].type != OP_IM12S){
+             tcc_error("'%s': Expected first source operand that is an immediate value between 0 and 0xFFFFFFFFFFFFFFFF", get_tok_str(token, NULL));
+         }
++#if PTR_SIZE == 4
++        lo = (int32_t)ops[1].e.v;
++        if (lo == (lo << 20 >> 20)) {
++            /* addi rd, zero, imm */
++            imm.e.v = lo;
++            asm_emit_i(token, 3 | (4 << 2), &ops[0], &zero, &imm);
++        } else {
++            /* lui rd, %hi(imm); addi rd, rd, %lo(imm) */
++            imm.e.v = ((uint32_t)lo + 0x800) >> 12;
++            asm_emit_u(token, (0xD << 2) | 3, &ops[0], &imm);
++            imm.e.v = lo << 20 >> 20;
++            if (imm.e.v)
++                asm_emit_i(token, 3 | (4 << 2), &ops[0], &ops[0], &imm);
++        }
++        return;
++#endif
+         lo = ops[1].e.v;
+         hi = (int64_t)ops[1].e.v >> 32;
+         if(lo < 0){
+@@ -1360,55 +1380,55 @@ static void asm_atomic_opcode(TCCState *s1, int token)
+ 
+     switch(token){
+         case TOK_ASM_lr_w:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 0);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+             break;
+         case TOK_ASM_lr_w_aq:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 0);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+             break;
+         case TOK_ASM_lr_w_rl:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 1);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+             break;
+         case TOK_ASM_lr_w_aqrl:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 1);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+             break;
+ 
+         case TOK_ASM_lr_d:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 0);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+             break;
+         case TOK_ASM_lr_d_aq:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 0);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+             break;
+         case TOK_ASM_lr_d_rl:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 1);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+             break;
+         case TOK_ASM_lr_d_aqrl:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 1, 1);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x2<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+             break;
+ 
+         case TOK_ASM_sc_w:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+             break;
+         case TOK_ASM_sc_w_aq:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 0);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+             break;
+         case TOK_ASM_sc_w_rl:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 1);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+             break;
+         case TOK_ASM_sc_w_aqrl:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 1);
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+             break;
+ 
+         case TOK_ASM_sc_d:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 0);
+             break;
+         case TOK_ASM_sc_d_aq:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 0);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 0);
+             break;
+         case TOK_ASM_sc_d_rl:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 1);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 0, 1);
+             break;
+         case TOK_ASM_sc_d_aqrl:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 1, 1);
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x3<<27, &ops[0], &ops[1], &ops[2], 1, 1);
+             break;
+ 
+         /* AMO instructions (base, aq=0 rl=0) */
+@@ -1425,9 +1445,9 @@ static void asm_atomic_opcode(TCCState *s1, int token)
+         case TOK_ASM_amoand_d:
+             asm_emit_a(token, 0x2F | 0x3<<12 | 0xC<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
+         case TOK_ASM_amoor_w:
+-            asm_emit_a(token, 0x2F | 0x2<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
++            asm_emit_a(token, 0x2F | 0x2<<12 | 0x8<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
+         case TOK_ASM_amoor_d:
+-            asm_emit_a(token, 0x2F | 0x3<<12 | 0x18<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
++            asm_emit_a(token, 0x2F | 0x3<<12 | 0x8<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
+         case TOK_ASM_amoxor_w:
+             asm_emit_a(token, 0x2F | 0x2<<12 | 0x4<<27, &ops[0], &ops[1], &ops[2], 0, 0); break;
+         case TOK_ASM_amoxor_d:
+@@ -1620,24 +1640,10 @@ static void asm_emit_b(int token, uint32_t opcode, const Operand *rs1, const Ope
+     if (rs2->type != OP_REG) {
+         tcc_error("'%s': Expected destination operand that is a register", get_tok_str(token, NULL));
+     }
+-    if (imm->type == OP_IM32 && imm->e.sym) {
+-        /* far branch: expand to inverted short branch + auipc + jalr */
+-        int b_ofs = ind;
+-        uint32_t inv_func3 = ((opcode >> 12) & 7) ^ 1;
+-        uint32_t inv_opcode = (opcode & ~(7 << 12)) | (inv_func3 << 12);
+-        /* b<inverse> .+8 */
+-        asm_emit_opcode(inv_opcode | ENCODE_RS1(rs1->reg)
+-                        | ENCODE_RS2(rs2->reg) | (1 << 8));
+-        /* auipc t0, 0 */
+-        greloca(cur_text_section, imm->e.sym, ind, R_RISCV_CALL, 0);
+-        asm_emit_opcode(0x17 | ENCODE_RD(5));
+-        /* jalr x0, 0(t0) */
+-        write32le(cur_text_section->data + b_ofs,
+-                  read32le(cur_text_section->data + b_ofs)
+-                  | (((ind - b_ofs) >> 1) & 0xf) << 8
+-                  | (((ind - b_ofs) >> 5) & 0x3f) << 25
+-                  | (((ind - b_ofs) >> 11) & 1) << 7
+-                  | (((ind - b_ofs) >> 12) & 1) << 31);
++    if (imm->e.sym) {
++        /* branch to a label: the linker fills in the offset (+-4 KiB) */
++        greloca(cur_text_section, imm->e.sym, ind, R_RISCV_BRANCH, imm->e.v);
++        asm_emit_opcode(opcode | ENCODE_RS1(rs1->reg) | ENCODE_RS2(rs2->reg));
+         return;
+     }
+     if (imm->type != OP_IM12S) {
+@@ -2170,8 +2176,7 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
+         reg = r & VT_VALMASK;
+         if (reg >= VT_CONST)
+             tcc_internal_error("");
+-        if ((sv->type.t & VT_BTYPE) == VT_FLOAT ||
+-            (sv->type.t & VT_BTYPE) == VT_DOUBLE) {
++        if (REG_IS_FLOAT(reg)) {
+             /* floating point register */
+             reg = TOK_ASM_f0 + REG_VALUE(reg);
+         } else {
+@@ -2184,8 +2189,7 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
+         reg = r & VT_VALMASK;
+         if (reg >= VT_CONST)
+             tcc_internal_error("");
+-        if ((sv->type.t & VT_BTYPE) == VT_FLOAT ||
+-            (sv->type.t & VT_BTYPE) == VT_DOUBLE) {
++        if (REG_IS_FLOAT(reg)) {
+             /* floating point register */
+             reg = TOK_ASM_f0 + REG_VALUE(reg);
+         } else {
+@@ -2245,8 +2249,8 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
+                     gen_le32( 0x27 | (3 << 12) |
+                             ENCODE_RS2(reg) | ENCODE_RS1(2) );
+                 } else {
+-                    /* sd reg, offset(sp) */
+-                    gen_le32((0x8 << 2) | 3 | (3 << 12) |
++                    /* sd reg, offset(sp) (sw on rv32) */
++                    gen_le32((0x8 << 2) | 3 | ((PTR_SIZE == 8 ? 3 : 2) << 12) |
+                             ENCODE_RS2(reg) | ENCODE_RS1(2) );
+                 }
+             }
+@@ -2267,8 +2271,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
+                     load(tcc_ireg(op->reg), &sv);
+                 } else if (i >= nb_outputs || op->is_rw) {
+                     /* load value in register */
+-                    if ((op->vt->type.t & VT_BTYPE) == VT_FLOAT ||
+-                        (op->vt->type.t & VT_BTYPE) == VT_DOUBLE) {
++                    if (REG_IS_FLOAT(op->reg)) {
+                         load(tcc_freg(op->reg), op->vt);
+                     } else {
+                         load(tcc_ireg(op->reg), op->vt);
+@@ -2296,8 +2299,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
+                         store(tcc_ireg(op->reg), &sv);
+                     }
+                 } else {
+-                    if ((op->vt->type.t & VT_BTYPE) == VT_FLOAT ||
+-                        (op->vt->type.t & VT_BTYPE) == VT_DOUBLE) {
++                    if (REG_IS_FLOAT(op->reg)) {
+                         store(tcc_freg(op->reg), op->vt);
+                     } else {
+                         store(tcc_ireg(op->reg), op->vt);
+@@ -2316,8 +2318,8 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
+                     gen_le32(7 | (3 << 12) |
+                             ENCODE_RD(reg) | ENCODE_RS1(2) | 0);
+                 } else {
+-                    /* ld reg, offset(sp) */
+-                    gen_le32(3 | (3 << 12) |
++                    /* ld reg, offset(sp) (lw on rv32) */
++                    gen_le32(3 | ((PTR_SIZE == 8 ? 3 : 2) << 12) |
+                             ENCODE_RD(reg) | ENCODE_RS1(2) | 0);
+                 }
+                 /* addi sp, sp, offset */
+@@ -2520,7 +2522,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
+             /* From a0 to a7 */
+             if ((reg = op->reg) >= 0)
+                 goto reg_found;
+-            else for (reg = 10; reg <= 18; reg++) {
++            else for (reg = 10; reg <= 17; reg++) {
+                 if (!is_reg_allocated(reg))
+                     goto reg_found;
+             }
+@@ -2532,6 +2534,9 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
+             regs_allocated[reg] |= reg_mask;
+             break;
+         case 'f': // floating pont register
++#ifdef TCC_TARGET_RISCV32
++            tcc_error("no floating point registers (soft-float target)");
++#endif
+             /* floating point register */
+             /* From fa0 to fa7 */
+             if ((reg = op->reg) >= 0)
+@@ -2559,7 +2564,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
+             if (j < nb_outputs || c == 'm') {
+                 if ((op->vt->r & VT_VALMASK) == VT_LLOCAL) {
+                     /* any general register: from a0 to a7 */
+-                    for (reg = 10; reg <= 18; reg++) {
++                    for (reg = 10; reg <= 17; reg++) {
+                         if (!(regs_allocated[reg] & REG_IN_MASK))
+                             goto reg_found1;
+                     }
+@@ -2599,7 +2604,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
+                 }
+             } else {
+                 /* From a0 to a7 */
+-                for (reg = 10; reg <= 18; reg++) {
++                for (reg = 10; reg <= 17; reg++) {
+                     if (!(regs_allocated[reg] & REG_OUT_MASK))
+                         goto reg_found2;
+                 }
+diff --git a/riscv64-link.c b/riscv64-link.c
+index 48ae785c..a3bccacc 100644
+--- a/riscv64-link.c
++++ b/riscv64-link.c
+@@ -3,9 +3,14 @@
+ #define EM_TCC_TARGET EM_RISCV
+ 
+ #define R_DATA_32  R_RISCV_32
++#if PTR_SIZE == 8
+ #define R_DATA_PTR R_RISCV_64
+-#define R_JMP_SLOT R_RISCV_JUMP_SLOT
+ #define R_GLOB_DAT R_RISCV_64
++#else
++#define R_DATA_PTR R_RISCV_32
++#define R_GLOB_DAT R_RISCV_32
++#endif
++#define R_JMP_SLOT R_RISCV_JUMP_SLOT
+ #define R_COPY     R_RISCV_COPY
+ #define R_RELATIVE R_RISCV_RELATIVE
+ 
+@@ -22,6 +27,21 @@
+ //#define DEBUG_RELOC
+ #include "tcc.h"
+ 
++/* rv32 and rv64 PLT code differs only in its loads and the GOT entry size */
++#if PTR_SIZE == 8
++# define RV_LOAD 0x3003 /* ld */
++# define read_ptr read64le
++# define write_ptr write64le
++# define add_ptr add64le
++#else
++# define RV_LOAD 0x2003 /* lw */
++# define read_ptr read32le
++# define write_ptr write32le
++# define add_ptr add32le
++#endif
++/* sign-extend an address difference (addr_t is unsigned 32-bit on rv32) */
++#define SEXT(x) (PTR_SIZE == 4 ? (int64_t)(int32_t)(x) : (int64_t)(x))
++
+ /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
+    relocations, returns -1. */
+ ST_FUNC int code_reloc (int reloc_type)
+@@ -146,13 +166,13 @@ ST_FUNC void relocate_plt(TCCState *s1)
+             tcc_error_noabort("Failed relocating PLT (off=0x%lx, got=0x%lx, plt=0x%lx)", (long)off, (long)got, (long)plt);
+         write32le(p, 0x397 | (off << 12)); // auipc t2, %pcrel_hi(got)
+         write32le(p + 4, 0x41c30333); // sub t1, t1, t3
+-        write32le(p + 8, 0x0003be03   // ld t3, %pcrel_lo(got)(t2)
++        write32le(p + 8, (RV_LOAD | 0x38e00) // ld t3, %pcrel_lo(got)(t2)
+                          | (((got - plt) & 0xfff) << 20));
+         write32le(p + 12, 0xfd430313); // addi t1, t1, -(32+12)
+         write32le(p + 16, 0x00038293   // addi t0, t2, %pcrel_lo(got)
+                           | (((got - plt) & 0xfff) << 20));
+-        write32le(p + 20, 0x00135313); // srli t1, t1, log2(16/PTRSIZE)
+-        write32le(p + 24, 0x0082b283); // ld t0, PTRSIZE(t0)
++        write32le(p + 20, 0x00035313 | (PTR_SIZE == 8 ? 1 : 2) << 20); // srli t1, t1, log2(16/PTRSIZE)
++        write32le(p + 24, (RV_LOAD | 0x28280) | PTR_SIZE << 20); // ld t0, PTRSIZE(t0)
+         write32le(p + 28, 0x000e0067); // jr t3
+         p += 32;
+         while (p < p_end) {
+@@ -162,7 +182,7 @@ ST_FUNC void relocate_plt(TCCState *s1)
+             if ((off + ((uint32_t)1 << 20)) >> 21)
+                 tcc_error_noabort("Failed relocating PLT (off=0x%lx, addr=0x%lx, pc=0x%lx)", (long)off, (long)addr, (long)pc);
+             write32le(p, 0xe17 | (off << 12)); // auipc t3, %pcrel_hi(func@got)
+-            write32le(p + 4, 0x000e3e03 // ld t3, %pcrel_lo(func@got)(t3)
++            write32le(p + 4, (RV_LOAD | 0xe0e00) // ld t3, %pcrel_lo(func@got)(t3)
+                              | (((addr - pc) & 0xfff) << 20));
+             write32le(p + 8, 0x000e0367); // jalr t1, t3
+             write32le(p + 12, 0x00000013); // nop
+@@ -174,7 +194,7 @@ ST_FUNC void relocate_plt(TCCState *s1)
+         ElfW_Rel *rel;
+         p = s1->got->data;
+         for_each_elem(s1->plt->reloc, 0, rel, ElfW_Rel) {
+-            write64le(p + rel->r_offset, s1->plt->sh_addr);
++            write_ptr(p + rel->r_offset, s1->plt->sh_addr);
+ 	}
+     }
+ }
+@@ -214,7 +234,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+         return;
+ 
+     case R_RISCV_BRANCH:
+-        off64 = val - addr;
++        off64 = SEXT(val - addr);
+         if ((off64 + (1 << 12)) & ~(uint64_t)0x1ffe)
+           tcc_error_noabort("R_RISCV_BRANCH relocation failed"
+                     " (val=%lx, addr=%lx)", (long)val, (long)addr);
+@@ -226,7 +246,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+                        | ((off32 & 0x400) >> 3));
+         return;
+     case R_RISCV_JAL:
+-        off64 = val - addr;
++        off64 = SEXT(val - addr);
+         if ((off64 + (1 << 21)) & ~(((uint64_t)1 << 22) - 2))
+           tcc_error_noabort("R_RISCV_JAL relocation failed"
+                     " (val=%lx, addr=%lx)", (long)val, (long)addr);
+@@ -248,7 +268,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+ #ifdef DEBUG_RELOC
+         printf("PCREL_HI20: val=%lx addr=%lx\n", (long)val, (long)addr);
+ #endif
+-        off64 = (int64_t)(val - addr + 0x800) >> 12;
++        off64 = SEXT(val - addr + 0x800) >> 12;
+         if ((off64 + ((uint64_t)1 << 20)) >> 21)
+           tcc_error_noabort("R_RISCV_PCREL_HI20 relocation failed: off=%lx cond=%lx sym=%s",
+                     (long)off64, (long)((int64_t)(off64 + ((uint64_t)1 << 20)) >> 21),
+@@ -259,7 +279,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+         return;
+     case R_RISCV_GOT_HI20:
+         val = s1->got->sh_addr + get_sym_attr(s1, sym_index, 0)->got_offset;
+-        off64 = (int64_t)(val - addr + 0x800) >> 12;
++        off64 = SEXT(val - addr + 0x800) >> 12;
+         if ((off64 + ((uint64_t)1 << 20)) >> 21)
+           tcc_error_noabort("R_RISCV_GOT_HI20 relocation failed");
+         write32le(ptr, (read32le(ptr) & 0xfff)
+@@ -285,7 +305,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+         return;
+ 
+     case R_RISCV_RVC_BRANCH:
+-        off64 = (val - addr);
++        off64 = SEXT(val - addr);
+         if ((off64 + (1 << 8)) & ~(uint64_t)0x1fe)
+           tcc_error_noabort("R_RISCV_RVC_BRANCH relocation failed"
+                     " (val=%lx, addr=%lx)", (long)val, (long)addr);
+@@ -298,7 +318,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+                        | (((off32 >> 8) & 1) << 12));
+         return;
+     case R_RISCV_RVC_JUMP:
+-        off64 = (val - addr);
++        off64 = SEXT(val - addr);
+         if ((off64 + (1 << 11)) & ~(uint64_t)0xffe)
+           tcc_error_noabort("R_RISCV_RVC_BRANCH relocation failed"
+                     " (val=%lx, addr=%lx)", (long)val, (long)addr);
+@@ -314,6 +334,31 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+                        | (((off32 >> 11) & 1) << 12));
+         return;
+ 
++#if PTR_SIZE == 4
++    case R_RISCV_32:
++        if (s1->output_type & TCC_OUTPUT_DYN) {
++            esym_index = get_sym_attr(s1, sym_index, 0)->dyn_index;
++            qrel->r_offset = rel->r_offset;
++            if (esym_index) {
++                qrel->r_info = ELFW(R_INFO)(esym_index, R_RISCV_32);
++                qrel->r_addend = rel->r_addend;
++                qrel++;
++                break;
++            } else {
++                qrel->r_info = ELFW(R_INFO)(0, R_RISCV_RELATIVE);
++                qrel->r_addend = read32le(ptr) + val;
++                qrel++;
++            }
++        }
++        add32le(ptr, val);
++        return;
++    case R_RISCV_JUMP_SLOT:
++        add32le(ptr, val);
++        return;
++    case R_RISCV_64:
++        add64le(ptr, val);
++        return;
++#else
+     case R_RISCV_32:
+         if (s1->output_type & TCC_OUTPUT_DYN) {
+             /* XXX: this logic may depend on TCC's codegen
+@@ -344,6 +389,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+     case R_RISCV_JUMP_SLOT:
+         add64le(ptr, val);
+         return;
++#endif
+     case R_RISCV_ADD64:
+         write64le(ptr, read64le(ptr) + val);
+         return;
+@@ -407,7 +453,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+ 
+     case R_RISCV_TPREL_HI20:
+     case R_RISCV_TPREL_LO12_I: {
+-        int64_t tp_offset = val - s1->tls_start;
++        int64_t tp_offset = SEXT(val - s1->tls_start);
+         if (type == R_RISCV_TPREL_HI20) {
+             off64 = (int64_t)(tp_offset + 0x800) >> 12;
+             if ((off64 + ((uint64_t)1 << 20)) >> 21)
+diff --git a/tcc.c b/tcc.c
+index c2274fb2..5a904014 100644
+--- a/tcc.c
++++ b/tcc.c
+@@ -192,6 +192,8 @@ static const char version[] =
+         "AArch64"
+ #elif defined TCC_TARGET_RISCV64
+         "riscv64"
++#elif defined TCC_TARGET_RISCV32
++        "riscv32"
+ #endif
+ #ifdef TCC_TARGET_PE
+         " Windows"
+diff --git a/tcc.h b/tcc.h
+index 864a4e32..0e2598fb 100644
+--- a/tcc.h
++++ b/tcc.h
+@@ -158,11 +158,13 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ /* #define TCC_TARGET_ARM64  *//* ARMv8 code generator */
+ /* #define TCC_TARGET_C67    *//* TMS320C67xx code generator */
+ /* #define TCC_TARGET_RISCV64 *//* risc-v code generator */
++/* #define TCC_TARGET_RISCV32 *//* risc-v rv32ima ilp32 (soft-float) code generator */
+ 
+ /* default target is I386 */
+ #if !defined(TCC_TARGET_I386) && !defined(TCC_TARGET_ARM) && \
+     !defined(TCC_TARGET_ARM64) && !defined(TCC_TARGET_C67) && \
+-    !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_RISCV64)
++    !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_RISCV64) && \
++    !defined(TCC_TARGET_RISCV32)
+ # if defined __x86_64__
+ #  define TCC_TARGET_X86_64
+ # elif defined __arm__
+@@ -172,6 +174,8 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ #  define TCC_ARM_HARDFLOAT
+ # elif defined __aarch64__
+ #  define TCC_TARGET_ARM64
++# elif defined __riscv && __riscv_xlen == 32
++#  define TCC_TARGET_RISCV32
+ # elif defined __riscv
+ #  define TCC_TARGET_RISCV64
+ # else
+@@ -185,6 +189,10 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ # endif
+ #endif
+ 
++#if defined TCC_TARGET_RISCV64 || defined TCC_TARGET_RISCV32
++# define TCC_TARGET_RISCV 1 /* code shared by both RISC-V targets */
++#endif
++
+ /* only native compiler supports -run */
+ #if defined _WIN32 == defined TCC_TARGET_PE \
+     && defined __APPLE__ == defined TCC_TARGET_MACHO
+@@ -198,6 +206,8 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ #  define TCC_IS_NATIVE
+ # elif defined __riscv && defined __LP64__ && defined TCC_TARGET_RISCV64
+ #  define TCC_IS_NATIVE
++# elif defined __riscv && __riscv_xlen == 32 && defined TCC_TARGET_RISCV32
++#  define TCC_IS_NATIVE
+ # endif
+ #endif
+ 
+@@ -207,7 +217,8 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ # define CONFIG_TCC_BACKTRACE 1 /* enable builtin stack backtraces */
+ #endif
+ 
+-#if defined CONFIG_TCC_BCHECK && CONFIG_TCC_BCHECK==0
++#if (defined CONFIG_TCC_BCHECK && CONFIG_TCC_BCHECK==0) \
++    || defined TCC_TARGET_RISCV32 /* no bound checking on rv32 */
+ #  undef CONFIG_TCC_BCHECK
+ #else
+ #  define CONFIG_TCC_BCHECK 1 /* enable bound checking code */
+@@ -310,6 +321,8 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ #  define CONFIG_TCC_ELFINTERP "/lib64/ld-linux-x86-64.so.2"
+ # elif defined(TCC_TARGET_RISCV64)
+ #  define CONFIG_TCC_ELFINTERP "/lib/ld-linux-riscv64-lp64d.so.1"
++# elif defined(TCC_TARGET_RISCV32)
++#  define CONFIG_TCC_ELFINTERP "/lib/ld-linux-riscv32-ilp32.so.1"
+ # elif defined(TCC_TARGET_ARM)
+ #  define CONFIG_TCC_ELFINTERP "/lib/ld-linux.so.3"
+ #  define CONFIG_TCC_ELFINTERP_ARMHF "/lib/ld-linux-armhf.so.3"
+@@ -387,6 +400,10 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ # include "riscv64-gen.c"
+ # include "riscv64-link.c"
+ # include "riscv64-asm.c"
++#elif defined(TCC_TARGET_RISCV32)
++# include "riscv32-gen.c"
++# include "riscv64-link.c"
++# include "riscv64-asm.c"
+ #else
+ #error unknown target
+ #endif
+@@ -405,9 +422,15 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ # define ELFCLASSW ELFCLASS32
+ # define ElfW(type) Elf##32##_##type
+ # define ELFW(type) ELF##32##_##type
+-# define ElfW_Rel ElfW(Rel)
+-# define SHT_RELX SHT_REL
+-# define REL_SECTION_FMT ".rel%s"
++# ifdef TCC_TARGET_RISCV32 /* RISC-V uses RELA on rv32 too */
++#  define ElfW_Rel ElfW(Rela)
++#  define SHT_RELX SHT_RELA
++#  define REL_SECTION_FMT ".rela%s"
++# else
++#  define ElfW_Rel ElfW(Rel)
++#  define SHT_RELX SHT_REL
++#  define REL_SECTION_FMT ".rel%s"
++# endif
+ #endif
+ /* target address type */
+ #define addr_t ElfW(Addr)
+@@ -936,7 +959,7 @@ struct TCCState {
+ 
+     addr_t tls_start, tls_end;
+ 
+-#ifdef TCC_TARGET_RISCV64
++#if defined TCC_TARGET_RISCV64 || defined TCC_TARGET_RISCV32
+     struct pcrel_hi { addr_t addr, val; } **pcrel_hi_entries;
+     int nb_pcrel_hi_entries;
+ #endif
+@@ -1038,6 +1061,10 @@ struct filespec {
+                                 constant expression */
+ #define VT_MUSTBOUND 0x4000  /* bound checking must be done before
+                                 dereferencing value */
++#ifdef TCC_TARGET_RISCV32
++# define VT_RAWLD    0x2000  /* long double spilled in its register
++                                format (a double), not as a quad */
++#endif
+ #define VT_BOUNDED   0x8000  /* value is bounded. The address of the
+                                 bounding function call point is in vc */
+ /* types */
+@@ -1462,7 +1489,7 @@ ST_FUNC ElfSym *elfsym(Sym *);
+ ST_FUNC void update_storage(Sym *sym);
+ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long size, int can_add_underscore);
+ ST_FUNC void put_extern_sym(Sym *sym, Section *section, addr_t value, unsigned long size);
+-#if PTR_SIZE == 4
++#if PTR_SIZE == 4 && SHT_RELX != SHT_RELA
+ ST_FUNC void greloc(Section *s, Sym *sym, unsigned long offset, int type);
+ #endif
+ ST_FUNC void greloca(Section *s, Sym *sym, unsigned long offset, int type, addr_t addend);
+@@ -1731,6 +1758,14 @@ ST_FUNC void gen_increment_tcov (SValue *sv);
+ ST_FUNC void gen_clear_cache(void);
+ #endif
+ 
++/* ------------ riscv32-gen.c ------------ */
++#ifdef TCC_TARGET_RISCV32
++ST_FUNC void gen_va_start(void);
++ST_FUNC void gen_increment_tcov (SValue *sv);
++ST_FUNC void gen_ldouble_load(void);
++ST_FUNC void gen_ldouble_store(void);
++#endif
++
+ /* ------------ c67-gen.c ------------ */
+ #ifdef TCC_TARGET_C67
+ #endif
+diff --git a/tccasm.c b/tccasm.c
+index eb24e3a0..3613e3ef 100644
+--- a/tccasm.c
++++ b/tccasm.c
+@@ -982,7 +982,7 @@ static void asm_parse_directive(TCCState *s1, int global)
+         next();
+         break;
+ #endif
+-#ifdef TCC_TARGET_RISCV64
++#ifdef TCC_TARGET_RISCV
+     case TOK_ASMDIR_option:
+         next();
+         switch(tok){
+@@ -1029,7 +1029,7 @@ static void asm_parse_directive(TCCState *s1, int global)
+ #if defined(TCC_TARGET_ARM64)
+ 	    if (!strcmp(reloc_name, "R_AARCH64_CALL26"))
+ 	        reloc_type = R_AARCH64_CALL26;
+-#elif defined(TCC_TARGET_RISCV64)
++#elif defined(TCC_TARGET_RISCV)
+ 	    if (!strcmp(reloc_name, "R_RISCV_CALL") || !strcmp(reloc_name, "R_RISCV_CALL_PLT"))
+ 	        reloc_type = R_RISCV_CALL;
+ 	    else if (!strcmp(reloc_name, "R_RISCV_BRANCH"))
+@@ -1151,7 +1151,7 @@ static void tcc_assemble_inline(TCCState *s1, const char *str, int len, int glob
+ {
+     const int *saved_macro_ptr = macro_ptr;
+     int dotid = set_idnum('.', IS_ID);
+-#if !defined(TCC_TARGET_RISCV64) && !defined(TCC_TARGET_X86_64)
++#if !defined(TCC_TARGET_RISCV) && !defined(TCC_TARGET_X86_64)
+     int dolid = set_idnum('$', 0);
+ #endif
+ 
+@@ -1161,7 +1161,7 @@ static void tcc_assemble_inline(TCCState *s1, const char *str, int len, int glob
+     tcc_assemble_internal(s1, 0, global);
+     tcc_close();
+ 
+-#if !defined(TCC_TARGET_RISCV64) && !defined(TCC_TARGET_X86_64)
++#if !defined(TCC_TARGET_RISCV) && !defined(TCC_TARGET_X86_64)
+     set_idnum('$', dolid);
+ #endif
+     set_idnum('.', dotid);
+@@ -1230,7 +1230,7 @@ static void subst_asm_operands(ASMOperand *operands, int nb_operands,
+ #ifdef TCC_TARGET_ARM64
+                 *str == 'x' || *str == 's' || *str == 'd' || *str == 'Z' ||
+ #endif
+-#ifdef TCC_TARGET_RISCV64
++#ifdef TCC_TARGET_RISCV
+ 		*str == 'z' ||
+ #endif
+ 		/* P in GCC would add "@PLT" to symbol refs in PIC mode,
+diff --git a/tccdbg.c b/tccdbg.c
+index b0e94092..8bfd35dc 100644
+--- a/tccdbg.c
++++ b/tccdbg.c
+@@ -860,7 +860,7 @@ ST_FUNC void tcc_eh_frame_start(TCCState *s1)
+     dwarf_data1(eh_frame_section, DW_CFA_def_cfa);
+     dwarf_uleb128(eh_frame_section, 31); // x31 (sp)
+     dwarf_uleb128(eh_frame_section, 0); // ofs 0
+-#elif defined TCC_TARGET_RISCV64
++#elif defined TCC_TARGET_RISCV
+     eh_frame_section->data[s1->eh_start + 8] = 3; // version = 3
+     dwarf_uleb128(eh_frame_section, 1); // code_alignment_factor
+     dwarf_sleb128(eh_frame_section, -4); // data_alignment_factor
+@@ -897,7 +897,7 @@ static void tcc_debug_frame_end(TCCState *s1, int size)
+     dwarf_reloc(eh_frame_section, eh_section_sym, R_ARM_REL32);
+ #elif defined TCC_TARGET_ARM64
+     dwarf_reloc(eh_frame_section, eh_section_sym, R_AARCH64_PREL32);
+-#elif defined TCC_TARGET_RISCV64
++#elif defined TCC_TARGET_RISCV
+     dwarf_reloc(eh_frame_section, eh_section_sym, R_RISCV_32_PCREL);
+ #endif
+     dwarf_data4(eh_frame_section, func_ind); // PC Begin
+@@ -962,15 +962,15 @@ static void tcc_debug_frame_end(TCCState *s1, int size)
+     dwarf_data1(eh_frame_section, DW_CFA_restore + 29); // x29 (fp)
+     dwarf_data1(eh_frame_section, DW_CFA_def_cfa_offset);
+     dwarf_uleb128(eh_frame_section, 0);
+-#elif defined TCC_TARGET_RISCV64
++#elif defined TCC_TARGET_RISCV
+     dwarf_data1(eh_frame_section, DW_CFA_advance_loc + 4);
+     dwarf_data1(eh_frame_section, DW_CFA_def_cfa_offset);
+     dwarf_uleb128(eh_frame_section, 16); // ofs 16
+     dwarf_data1(eh_frame_section, DW_CFA_advance_loc + 8);
+     dwarf_data1(eh_frame_section, DW_CFA_offset + 1); // r1 (ra, lr)
+-    dwarf_uleb128(eh_frame_section, 2); // cfa-8
++    dwarf_uleb128(eh_frame_section, PTR_SIZE / 4); // cfa-XLEN
+     dwarf_data1(eh_frame_section, DW_CFA_offset + 8); // r8 (s0, fp)
+-    dwarf_uleb128(eh_frame_section, 4); // cfa-16
++    dwarf_uleb128(eh_frame_section, PTR_SIZE / 2); // cfa-2*XLEN
+     dwarf_data1(eh_frame_section, DW_CFA_advance_loc + 8);
+     dwarf_data1(eh_frame_section, DW_CFA_def_cfa);
+     dwarf_uleb128(eh_frame_section, 8); // r8 (s0, fp)
+@@ -2405,7 +2405,7 @@ ST_FUNC void tcc_debug_funcend(TCCState *s1, int size)
+         dwarf_data1(dwarf_info_section, DW_OP_reg13); // sp
+ #elif defined TCC_TARGET_ARM64
+         dwarf_data1(dwarf_info_section, DW_OP_reg29); // reg 29
+-#elif defined TCC_TARGET_RISCV64
++#elif defined TCC_TARGET_RISCV
+         dwarf_data1(dwarf_info_section, DW_OP_reg8); // r8(s0)
+ #else
+         dwarf_data1(dwarf_info_section, DW_OP_call_frame_cfa);
+@@ -2582,7 +2582,7 @@ ST_FUNC void tcc_tcov_block_begin(TCCState *s1)
+         sv.sym = &label;
+ #if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || \
+     defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64 || \
+-    defined TCC_TARGET_RISCV64
++    defined TCC_TARGET_RISCV
+         gen_increment_tcov (&sv);
+ #else
+         vpushv(&sv);
+diff --git a/tccelf.c b/tccelf.c
+index 9e2d1364..04189711 100644
+--- a/tccelf.c
++++ b/tccelf.c
+@@ -1189,7 +1189,7 @@ static void relocate_section(TCCState *s1, Section *s, Section *sr)
+     }
+ #endif
+ 
+-#ifdef TCC_TARGET_RISCV64
++#ifdef TCC_TARGET_RISCV
+     dynarray_reset(&s1->pcrel_hi_entries, &s1->nb_pcrel_hi_entries);
+ #endif
+ }
+@@ -1232,7 +1232,7 @@ static int prepare_dynamic_rel(TCCState *s1, Section *sr)
+     int count = 0;
+ #if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64) || \
+     defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM64) || \
+-    defined(TCC_TARGET_RISCV64)
++    defined(TCC_TARGET_RISCV)
+     ElfW_Rel *rel;
+     for_each_elem(sr, 0, rel, ElfW_Rel) {
+         int sym_index = ELFW(R_SYM)(rel->r_info);
+@@ -1256,7 +1256,7 @@ static int prepare_dynamic_rel(TCCState *s1, Section *sr)
+ #elif defined(TCC_TARGET_ARM64)
+         case R_AARCH64_ABS32:
+         case R_AARCH64_ABS64:
+-#elif defined(TCC_TARGET_RISCV64)
++#elif defined(TCC_TARGET_RISCV)
+         case R_RISCV_32:
+         case R_RISCV_64:
+ #endif
+@@ -1877,6 +1877,10 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
+             tcc_add_support(s1, TCC_LIBTCC1);
+             tcc_add_library(s1, "c");
+         }
++#ifdef TCC_TARGET_RISCV32
++        /* soft-float and long long helpers (__adddf3, __divdi3, ...) */
++        tcc_add_dll(s1, "libgcc.a", AFF_PRINT_ERROR);
++#endif
+ #ifndef TCC_TARGET_MACHO
+         if (s1->output_type != TCC_OUTPUT_MEMORY)
+             tccelf_add_crtend(s1);
+@@ -1934,7 +1938,7 @@ static void tcc_add_linker_symbols(TCCState *s1)
+     set_global_sym(s1, "__executable_start", NULL, ELF_START_ADDR);
+ #endif
+ 
+-#ifdef TCC_TARGET_RISCV64
++#ifdef TCC_TARGET_RISCV
+     /* XXX should be .sdata+0x800, not .data+0x800 */
+     set_global_sym(s1, "__global_pointer$", data_section, 0x800);
+ #endif
+@@ -2584,7 +2588,7 @@ static void fill_dynamic(TCCState *s1, struct dyn_inf *dyninf)
+     put_dt(dynamic, DT_SYMTAB, s1->dynsym->sh_addr);
+     put_dt(dynamic, DT_STRSZ, dyninf->dynstr->data_offset);
+     put_dt(dynamic, DT_SYMENT, sizeof(ElfW(Sym)));
+-#if PTR_SIZE == 8
++#if SHT_RELX == SHT_RELA
+     put_dt(dynamic, DT_RELA, dyninf->rel_addr);
+     put_dt(dynamic, DT_RELASZ, dyninf->rel_size);
+     put_dt(dynamic, DT_RELAENT, sizeof(ElfW_Rel));
+@@ -2716,6 +2720,8 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) *phdr)
+ #elif defined TCC_TARGET_RISCV64
+     /* XXX should be configurable */
+     ehdr.e_flags = EF_RISCV_FLOAT_ABI_DOUBLE;
++#elif defined TCC_TARGET_RISCV32
++    ehdr.e_flags = EF_RISCV_FLOAT_ABI_SOFT; /* ilp32, no RVC */
+ #endif
+ 
+     if (file_type == TCC_OUTPUT_OBJ) {
+@@ -2923,6 +2929,25 @@ static void create_arm_attribute_section(TCCState *s1)
+ }
+ #endif
+ 
++#ifdef TCC_TARGET_RISCV32
++static void create_riscv_attribute_section(TCCState *s1)
++{
++    /* Tag_File { Tag_RISCV_arch "rv32ima" } */
++    static const char arch[] = "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0";
++    unsigned file_len = 1 + 4 + 1 + sizeof arch;
++    unsigned total_len = 4 + 6 + file_len;
++    Section *attr = new_section(s1, ".riscv.attributes", SHT_RISCV_ATTRIBUTES, 0);
++    unsigned char *ptr = section_ptr_add(attr, 1 + total_len);
++    attr->sh_addralign = 1;
++    *ptr++ = 'A';
++    write32le(ptr, total_len), ptr += 4;
++    memcpy(ptr, "riscv", 6), ptr += 6;
++    *ptr++ = 1; /* Tag_File */
++    write32le(ptr, file_len), ptr += 4;
++    *ptr++ = 5; /* Tag_RISCV_arch */
++    memcpy(ptr, arch, sizeof arch);
++}
++#endif
+ #ifdef TCC_TARGET_RISCV64
+ static void create_riscv_attribute_section(TCCState *s1)
+ {
+@@ -3024,7 +3049,7 @@ static int elf_output_file(TCCState *s1, const char *filename)
+     create_arm_attribute_section (s1);
+ #endif
+ 
+-#ifdef TCC_TARGET_RISCV64
++#ifdef TCC_TARGET_RISCV
+     create_riscv_attribute_section(s1);
+ #endif
+ 
+@@ -3444,7 +3469,7 @@ invalid:
+             ptr = s->data + offset;
+             full_read(fd, ptr, size);
+         }
+-#if defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64
++#if defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV
+         /* align code sections to instruction lenght */
+         /* This is needed if we compile a c file after this */
+         if (s->sh_flags & SHF_EXECINSTR)
+@@ -3551,7 +3576,7 @@ invalid:
+                 if (!sym_index && !sm_table[sh->sh_info].link_once
+ #ifdef TCC_TARGET_ARM
+                     && type != R_ARM_V4BX
+-#elif defined TCC_TARGET_RISCV64
++#elif defined TCC_TARGET_RISCV
+                     && type != R_RISCV_ALIGN
+                     && type != R_RISCV_RELAX
+ #endif
+diff --git a/tccgen.c b/tccgen.c
+index d9721a52..6ced3747 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -243,6 +243,8 @@ static int R_RET(int t)
+ #elif defined TCC_TARGET_RISCV64
+     if ((t & VT_BTYPE) == VT_LDOUBLE)
+         return REG_IRET;
++#elif defined TCC_TARGET_RISCV32
++    return REG_IRET; /* soft-float: fp values live in integer registers */
+ #endif
+     return REG_FRET;
+ }
+@@ -254,6 +256,10 @@ static int R2_RET(int t)
+ #if PTR_SIZE == 4
+     if (t == VT_LLONG)
+         return REG_IRE2;
++#ifdef TCC_TARGET_RISCV32
++    if (t == VT_DOUBLE || t == VT_LDOUBLE)
++        return REG_IRE2;
++#endif
+ #elif defined TCC_TARGET_X86_64
+     if (t == VT_QLONG)
+         return REG_IRE2;
+@@ -294,6 +300,8 @@ static int RC_TYPE(int t)
+ #elif defined TCC_TARGET_RISCV64
+     if ((t & VT_BTYPE) == VT_LDOUBLE)
+         return RC_INT;
++#elif defined TCC_TARGET_RISCV32
++    return RC_INT;
+ #endif
+     return RC_FLOAT;
+ }
+@@ -617,7 +625,7 @@ ST_FUNC void greloca(Section *s, Sym *sym, unsigned long offset, int type,
+     put_elf_reloca(symtab_section, s, offset, type, c, addend);
+ }
+ 
+-#if PTR_SIZE == 4
++#if PTR_SIZE == 4 && SHT_RELX != SHT_RELA
+ ST_FUNC void greloc(Section *s, Sym *sym, unsigned long offset, int type)
+ {
+     greloca(s, sym, offset, type, 0);
+@@ -1452,6 +1460,10 @@ ST_FUNC void save_reg_upstack(int r, int n)
+                 p->r = (p->r & ~(VT_VALMASK | VT_BOUNDED)) | VT_LLOCAL;
+             } else {
+                 p->r = VT_LVAL | VT_LOCAL;
++#ifdef TCC_TARGET_RISCV32
++                if (bt == VT_LDOUBLE)
++                    p->r |= VT_RAWLD;
++#endif
+                 p->type.t &= ~VT_ARRAY; /* cannot combine VT_LVAL with VT_ARRAY */
+             }
+             p->sym = NULL;
+@@ -1908,6 +1920,11 @@ ST_FUNC int gv(int rc)
+         bt = vtop->type.t & VT_BTYPE;
+         if (bt == VT_VOID || bt == VT_STRUCT) /* should not happen */
+             return vtop->r;
++#ifdef TCC_TARGET_RISCV32
++        /* long double: a quad in memory, a double in registers */
++        if (bt == VT_LDOUBLE && (vtop->r & (VT_LVAL | VT_RAWLD)) == VT_LVAL)
++            gen_ldouble_load();
++#endif
+ 
+ #ifdef TCC_TARGET_RISCV64
+         /* XXX mega hack */
+@@ -2301,6 +2318,14 @@ static void gen_opl(int op)
+             op1 = TOK_UGE;
+         a = 0;
+         b = 0;
++#ifdef TCC_TARGET_RISCV32
++        /* no condition flags: the non equal test compares the high
++           words again */
++        if (op != TOK_NE && op != TOK_EQ) {
++            vpushv(vtop - 1);
++            vpushv(vtop - 1);
++        }
++#endif
+         gen_op(op1);
+         if (op == TOK_NE) {
+             b = gvtst(0, 0);
+@@ -2308,8 +2333,12 @@ static void gen_opl(int op)
+             a = gvtst(1, 0);
+             if (op != TOK_EQ) {
+                 /* generate non equal test */
++#ifdef TCC_TARGET_RISCV32
++                gen_op(TOK_NE);
++#else
+                 vpushi(0);
+                 vset_VT_CMP(TOK_NE);
++#endif
+                 b = gvtst(0, 0);
+             }
+         }
+@@ -2506,7 +2535,8 @@ static void gen_opic(int op)
+     }
+ }
+ 
+-#if defined TCC_TARGET_X86_64 || defined TCC_TARGET_I386 || defined TCC_TARGET_ARM64
++#if defined TCC_TARGET_X86_64 || defined TCC_TARGET_I386 || defined TCC_TARGET_ARM64 \
++    || defined TCC_TARGET_RISCV32
+ # define gen_negf gen_opf
+ #elif defined TCC_TARGET_ARM
+ void gen_negf(int op)
+@@ -3185,7 +3215,7 @@ op_err:
+         gv(RC_TYPE(vtop->type.t));
+ }
+ 
+-#if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 || defined TCC_TARGET_ARM
++#if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV || defined TCC_TARGET_ARM
+ #define gen_cvt_itof1 gen_cvt_itof
+ #else
+ /* generic itof for unsigned long long case */
+@@ -3212,7 +3242,7 @@ static void gen_cvt_itof1(int t)
+ }
+ #endif
+ 
+-#if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64
++#if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV
+ #define gen_cvt_ftoi1 gen_cvt_ftoi
+ #else
+ /* generic ftoi for unsigned long long case */
+@@ -3368,7 +3398,7 @@ error:
+         /* cannot generate code for global or static initializers */
+         if (nocode_wanted & DATA_ONLY_WANTED) {
+             if (df)
+-                vtop->r = get_reg(RC_FLOAT); /* don't confuse backends */
++                vtop->r = get_reg(RC_TYPE(dbt)); /* don't confuse backends */
+             goto done;
+         }
+ 
+@@ -3736,8 +3766,11 @@ ST_FUNC void vstore(void)
+         /* if structure, only generate pointer */
+         /* structure assignment : generate memcpy */
+         size = type_size(&vtop->type, &align);
++        /* source: keep it on the stack too until the copy is done, so
++           that a temporary it may live in is not reused by a spill */
++        vpushv(vtop);
+         /* destination, keep on stack() as result */
+-        vpushv(vtop - 1);
++        vpushv(vtop - 2);
+ #ifdef CONFIG_TCC_BCHECK
+         if (vtop->r & VT_MUSTBOUND)
+             gbound(); /* check would be wrong after gaddrof() */
+@@ -3777,6 +3810,7 @@ ST_FUNC void vstore(void)
+             vrott(4);
+             gfunc_call(3);
+         }
++        vpop(); /* the source */
+ 
+     } else if (ft & VT_BITFIELD) {
+         /* bitfield store handling */
+@@ -3845,6 +3879,12 @@ ST_FUNC void vstore(void)
+             } else {
+                 gen_cast(&vtop[-1].type);
+             }
++#ifdef TCC_TARGET_RISCV32
++            if (dbt == VT_LDOUBLE) {
++                gen_ldouble_store();
++                return;
++            }
++#endif
+ 
+ #ifdef CONFIG_TCC_BCHECK
+             /* bound check case */
+@@ -5936,7 +5976,7 @@ ST_FUNC void unary(void)
+             mk_pointer(&type);
+             vset(&type, VT_LOCAL, 0);       /* local frame */
+             while (level--) {
+-#ifdef TCC_TARGET_RISCV64
++#ifdef TCC_TARGET_RISCV
+                 vpushi(2*PTR_SIZE);
+                 gen_op('-');
+ #endif
+@@ -5948,7 +5988,7 @@ ST_FUNC void unary(void)
+ #ifdef TCC_TARGET_ARM
+                 vpushi(2*PTR_SIZE);
+                 gen_op('+');
+-#elif defined TCC_TARGET_RISCV64
++#elif defined TCC_TARGET_RISCV
+                 vpushi(PTR_SIZE);
+                 gen_op('-');
+ #else
+@@ -5960,7 +6000,7 @@ ST_FUNC void unary(void)
+             }
+         }
+         break;
+-#ifdef TCC_TARGET_RISCV64
++#ifdef TCC_TARGET_RISCV
+     case TOK_builtin_va_start:
+         parse_builtin_params(0, "ee");
+         r = vtop->r & VT_VALMASK;
+@@ -6290,7 +6330,11 @@ special_math_val:
+             nb_args = regsize = 0;
+             ret.r2 = VT_CONST;
+             /* compute first implicit argument if a structure is returned */
+-            if ((s->type.t & VT_BTYPE) == VT_STRUCT) {
++            if ((s->type.t & VT_BTYPE) == VT_STRUCT
++#ifdef TCC_TARGET_RISCV32
++                || (s->type.t & VT_BTYPE) == VT_LDOUBLE
++#endif
++                ) {
+                 variadic = (s->f.func_type == FUNC_ELLIPSIS);
+                 ret_nregs = gfunc_sret(&s->type, variadic, &ret.type,
+                                        &ret_align, &regsize);
+@@ -6869,7 +6913,11 @@ ST_FUNC int expr_const(void)
+ #ifndef TCC_TARGET_ARM64
+ static void gfunc_return(CType *func_type)
+ {
+-    if ((func_type->t & VT_BTYPE) == VT_STRUCT) {
++    if ((func_type->t & VT_BTYPE) == VT_STRUCT
++#ifdef TCC_TARGET_RISCV32
++        || (func_type->t & VT_BTYPE) == VT_LDOUBLE
++#endif
++        ) {
+         CType type, ret_type;
+         int ret_align, ret_nregs, regsize;
+         ret_nregs = gfunc_sret(func_type, func_var, &ret_type,
+@@ -7999,7 +8047,7 @@ static void init_putv(init_params *p, CType *type, unsigned long c)
+ 				   c + rel->r_offset - esym->st_value,
+ 				   ELFW(R_TYPE)(rel->r_info),
+ 				   ELFW(R_SYM)(rel->r_info),
+-#if PTR_SIZE == 8
++#if SHT_RELX == SHT_RELA
+ 				   rel->r_addend
+ #else
+ 				   0
+@@ -8063,8 +8111,14 @@ static void init_putv(init_params *p, CType *type, unsigned long c)
+                 break;
+             case VT_PTR:
+             case VT_INT:
++#if SHT_RELX == SHT_RELA
++	        if (vtop->r & VT_SYM)
++	          greloca(sec, vtop->sym, c, R_DATA_PTR, val);
++	        else
++#else
+ 	        if (vtop->r & VT_SYM)
+ 	          greloc(sec, vtop->sym, c, R_DATA_PTR);
++#endif
+ 	        write32le(ptr, val);
+ 	        break;
+ #endif
+diff --git a/tccrun.c b/tccrun.c
+index 1003ea5d..164b436e 100644
+--- a/tccrun.c
++++ b/tccrun.c
+@@ -492,7 +492,7 @@ static int protect_pages(void *ptr, unsigned long length, int mode)
+ #endif
+ /* XXX: BSD sometimes dump core with bad system call */
+ #if (defined TCC_TARGET_ARM && !TARGETOS_BSD) \
+-    || defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64
++    || defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV
+     if (mode == 0 || mode == 3) {
+ #ifdef _WIN32
+         FlushInstructionCache(GetCurrentProcess(), ptr, length);
+diff --git a/tcctok.h b/tcctok.h
+index d8e7b445..7e7183ff 100644
+--- a/tcctok.h
++++ b/tcctok.h
+@@ -180,7 +180,7 @@
+ #elif defined TCC_TARGET_ARM64
+      DEF(TOK_builtin_va_start, "__builtin_va_start")
+      DEF(TOK_builtin_va_arg, "__builtin_va_arg")
+-#elif defined TCC_TARGET_RISCV64
++#elif defined TCC_TARGET_RISCV
+      DEF(TOK_builtin_va_start, "__builtin_va_start")
+ #endif
+ 
+@@ -207,7 +207,7 @@
+      DEF(TOK_pack, "pack")
+ #if !defined(TCC_TARGET_I386) && !defined(TCC_TARGET_X86_64) && \
+     !defined(TCC_TARGET_ARM) && !defined(TCC_TARGET_ARM64) && \
+-    !defined(TCC_TARGET_RISCV64)
++    !defined(TCC_TARGET_RISCV)
+      /* already defined for assembler */
+      DEF(TOK_ASM_push, "push")
+      DEF(TOK_ASM_pop, "pop")
+@@ -284,6 +284,46 @@
+ # endif
+ #endif
+ 
++#if defined TCC_TARGET_RISCV32
++     /* soft-float helpers (libgcc) */
++     DEF(TOK___addsf3, "__addsf3")
++     DEF(TOK___subsf3, "__subsf3")
++     DEF(TOK___mulsf3, "__mulsf3")
++     DEF(TOK___divsf3, "__divsf3")
++     DEF(TOK___eqsf2, "__eqsf2")
++     DEF(TOK___nesf2, "__nesf2")
++     DEF(TOK___ltsf2, "__ltsf2")
++     DEF(TOK___lesf2, "__lesf2")
++     DEF(TOK___gtsf2, "__gtsf2")
++     DEF(TOK___gesf2, "__gesf2")
++     DEF(TOK___adddf3, "__adddf3")
++     DEF(TOK___subdf3, "__subdf3")
++     DEF(TOK___muldf3, "__muldf3")
++     DEF(TOK___divdf3, "__divdf3")
++     DEF(TOK___eqdf2, "__eqdf2")
++     DEF(TOK___nedf2, "__nedf2")
++     DEF(TOK___ltdf2, "__ltdf2")
++     DEF(TOK___ledf2, "__ledf2")
++     DEF(TOK___gtdf2, "__gtdf2")
++     DEF(TOK___gedf2, "__gedf2")
++     DEF(TOK___extendsfdf2, "__extendsfdf2")
++     DEF(TOK___truncdfsf2, "__truncdfsf2")
++     DEF(TOK___extenddftf2, "__extenddftf2")
++     DEF(TOK___trunctfdf2, "__trunctfdf2")
++     DEF(TOK___fixsfsi, "__fixsfsi")
++     DEF(TOK___fixdfsi, "__fixdfsi")
++     DEF(TOK___fixunssfsi, "__fixunssfsi")
++     DEF(TOK___fixunsdfsi, "__fixunsdfsi")
++     DEF(TOK___fixsfdi, "__fixsfdi")
++     DEF(TOK___fixdfdi, "__fixdfdi")
++     DEF(TOK___floatsisf, "__floatsisf")
++     DEF(TOK___floatsidf, "__floatsidf")
++     DEF(TOK___floatunsisf, "__floatunsisf")
++     DEF(TOK___floatunsidf, "__floatunsidf")
++     DEF(TOK___floatdisf, "__floatdisf")
++     DEF(TOK___floatdidf, "__floatdidf")
++#endif
++
+ #if defined TCC_TARGET_C67
+      DEF(TOK__divi, "_divi")
+      DEF(TOK__divu, "_divu")
+@@ -415,7 +455,7 @@
+ #else
+  DEF_ASMDIR(code64)
+ #endif
+-#if defined(TCC_TARGET_RISCV64)
++#if defined(TCC_TARGET_RISCV)
+  DEF_ASMDIR(option)
+ #endif
+  DEF_ASMDIR(short)
+@@ -437,6 +477,6 @@
+ #include "arm64-tok.h"
+ #endif
+ 
+-#if defined TCC_TARGET_RISCV64
++#if defined TCC_TARGET_RISCV
+ #include "riscv64-tok.h"
+ #endif
+-- 
+2.38.1
+
