@@ -35,6 +35,8 @@ load_text "$T/text.bin"
 load_blob "$T/blob.bin"
 [ $INITRAMFS = 1 ] || load_disk "$DISK"
 picotool load -v -x -t elf "$ELF"
+# when the firmware started: scripts/perf-gate.sh times boot to login: from it
+python3 -c 'import time; print(time.time())' > "$LOCK_HOME/last-launch"
 for _ in $(seq 1 20); do [ -n "$(shell_port)" ] && break; sleep 0.5; done
 PORT=$(shell_port)
 [ -n "$PORT" ] || { echo "pico-shell.sh: console port did not appear"; exit 1; }

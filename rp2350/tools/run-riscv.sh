@@ -9,6 +9,7 @@ E=$1
 TIMEOUT=${2:-120}
 STOP=${3:-'\] done|HOST TRAP|panicked'}
 P=${PROBE_RS:-$HOME/git/toolchains/probe-rs-master/bin/probe-rs}
+"$(dirname "$0")/board-lock" check "${BOARD_LOCK_OWNER:-nobody}" || exit 1
 OUT=$(mktemp)
 CMD=run; [ "${ATTACH:-0}" = 1 ] && CMD=attach
 "$P" "$CMD" --chip RP235x_riscv --protocol swd --no-location --no-timestamps "$E" > "$OUT" 2>&1 &

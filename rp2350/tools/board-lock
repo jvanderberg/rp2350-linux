@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Shared lock for the one RP2350 board (and the one guest-build Docker
+# volume), so several checkouts / agents can take turns. State lives outside
+# every checkout, in $RP2350_LOCK_HOME (default ~/.cache/rp2350-board).
+#
+#   board-lock run OWNER [-r RES] [-w WAIT_MIN] [-l LEASE_MIN] -- CMD...
+#        wait for the lock (FIFO), run CMD holding it (renewed every 30 s
+#        while CMD runs), release it when CMD exits. CMD sees
+#        BOARD_LOCK_OWNER=OWNER. The usual way to use the board.
+#   board-lock acquire OWNER [-r RES] [-w WAIT_MIN] [-l LEASE_MIN] [-n NOTE]
+#   board-lock renew   OWNER [-r RES] [-l LEASE_MIN]
+#   board-lock release OWNER [-r RES]
+#   board-lock check   OWNER [-r RES]     exit 0 iff OWNER holds RES
+#   board-lock status  [-r RES]           holder, lease and queue (all RES if none)
+#
+# RES: "board" (default: USB BOOTSEL/picotool, the console port, SWD/probe-rs)
+# or "guest-build" (the rvemu-guest-work Docker volume, guest/run-build.sh).
+# A lease (default 20 min) that is not renewed expires, and the next waiter
+# takes the lock. Waiters are served first come, first served. Every grant and
+# release is appended to $RP2350_LOCK_HOME/history.log.
+set -euo pipefail
+
+H=${RP2350_LOCK_HOME:-$HOME/.cache/rp2350-board}
+mkdir -p "$H"
+QUEUE_TTL=90          # a waiter that stops polling for this long leaves the queue
+
+die() { echo "board-lock: $*" >&2; exit 1; }
+now() { date +%s; }
+log() { echo "$(date '+%F %T') $*" >> "$H/history.log"; }
+
+# A short mutex around every read-modify-write of the lock files.
+mutex() {
+  for _ in $(seq 1 200); do
+    if mkdir "$H/.mutex" 2>/dev/null; then return 0; fi
+    # a holder that died mid-update: the critical section takes milliseconds
+    if [ -d "$H/.mutex" ] && [ $(( $(now) - $(stat -f %m "$H/.mutex" 2>/dev/null || now) )) -gt 20 ]; then
+      rmdir "$H/.mutex" 2>/dev/null || true
+    fi
+    sleep 0.05
+  done
+  die "could not take $H/.mutex"
+}
+unmutex() { rmdir "$H/.mutex" 2>/dev/null || true; }
+
+# lock file: "OWNER EXPIRES_EPOCH SINCE_EPOCH NOTE..."
+lockf() { echo "$H/$RES.lock"; }
+queuef() { echo "$H/$RES.queue"; }
+holder() {   # prints "OWNER EXPIRES SINCE NOTE" of an unexpired lock, or nothing
+  local f; f=$(lockf)
+  [ -f "$f" ] || return 0
+  local o e rest; read -r o e rest < "$f" || true
+  if [ -n "${o:-}" ] && [ "${e:-0}" -gt "$(now)" ]; then echo "$o $e $rest"; fi
+}
+
+prune_queue() {
+  local q t n; q=$(queuef); t=$(now)
+  [ -f "$q" ] || return 0
+  awk -v t="$t" -v ttl=$QUEUE_TTL '$2 + ttl >= t' "$q" > "$q.tmp" || true
+  n=$(wc -l < "$q.tmp" | tr -d ' ')
+  if [ "$n" = 0 ]; then rm -f "$q" "$q.tmp"; else mv "$q.tmp" "$q"; fi
+}
+
+# try_acquire OWNER LEASE NOTE: 0 if granted (or already held: renewed)
+try_acquire() {
+  local o=$1 lease=$2 note=$3 h q first t
+  mutex
+  prune_queue
+  h=$(holder); q=$(queuef); t=$(now)
+  if [ -n "$h" ] && [ "${h%% *}" != "$o" ]; then
+    # wait in line: add or refresh our entry, keeping its place
+    if [ -f "$q" ] && grep -q "^$o " "$q"; then
+      awk -v o="$o" -v t="$t" '$1==o{$2=t} {print}' "$q" > "$q.tmp" && mv "$q.tmp" "$q"
+    else
+      echo "$o $t" >> "$q"
+    fi
+    unmutex; return 1
+  fi
+  first=$( [ -f "$q" ] && head -1 "$q" | cut -d' ' -f1 || true)
+  if [ -z "$h" ] && [ -n "$first" ] && [ "$first" != "$o" ]; then
+    # free, but someone queued before us: join the queue
+    grep -q "^$o " "$q" || echo "$o $t" >> "$q"
+    unmutex; return 1
+  fi
+  local since=$t
+  if [ -n "$h" ]; then since=$(echo "$h" | cut -d' ' -f3); else
+    local prev; prev=$( [ -f "$(lockf)" ] && cut -d' ' -f1 "$(lockf)" || true)
+    [ -n "$prev" ] && log "$RES: lease of $prev expired"
+    log "$RES: granted to $o ($note)"
+  fi
+  echo "$o $((t + lease * 60)) $since $note" > "$(lockf)"
+  if [ -f "$q" ]; then grep -v "^$o " "$q" > "$q.tmp" || true; mv "$q.tmp" "$q"; [ -s "$q" ] || rm -f "$q"; fi
+  unmutex; return 0
+}
+
+do_release() {
+  local o=$1 h
+  mutex
+  h=$(holder)
+  if [ -n "$h" ] && [ "${h%% *}" = "$o" ]; then
+    rm -f "$(lockf)"; log "$RES: released by $o after $(( ($(now) - $(echo "$h" | cut -d' ' -f3)) / 60 )) min"
+    unmutex; return 0
+  fi
+  unmutex
+  [ -z "$h" ] && return 0
+  die "$RES is held by ${h%% *}, not $o"
+}
+
+acquire_wait() {   # OWNER LEASE WAIT_MIN NOTE
+  local o=$1 lease=$2 wait=$3 note=$4 end shown=0 h
+  end=$(( $(now) + wait * 60 ))
+  while ! try_acquire "$o" "$lease" "$note"; do
+    if [ "$(now)" -ge "$end" ]; then
+      mutex; [ -f "$(queuef)" ] && { grep -v "^$o " "$(queuef)" > "$(queuef).tmp" || true; mv "$(queuef).tmp" "$(queuef)"; }; unmutex
+      h=$(holder); die "timed out after $wait min waiting for $RES (held by ${h%% *})"
+    fi
+    if [ $shown = 0 ]; then h=$(holder); echo "board-lock: waiting for $RES (held by ${h%% *}; queue: $(tr '\n' ' ' < "$(queuef)" 2>/dev/null | awk '{for(i=1;i<=NF;i+=2) printf "%s ", $i}'))" >&2; shown=1; fi
+    sleep 5
+  done
+}
+
+show_status() {
+  local r h q
+  for r in "$@"; do
+    RES=$r; h=$(holder); q=$(queuef)
+    if [ -n "$h" ]; then
+      set -- $h
+      printf '%-12s held by %-10s for %3d min, lease %3d min left  %s\n' "$r" "$1" $(( ($(now) - $3) / 60 )) $(( ($2 - $(now)) / 60 )) "${*:4}"
+    else
+      printf '%-12s free\n' "$r"
+    fi
+    [ -f "$q" ] && echo "             queue: $(awk -v t="$(now)" -v ttl=$QUEUE_TTL '$2+ttl>=t{printf "%s ", $1}' "$q")"
+  done
+  return 0
+}
+
+cmd=${1:-}; shift || true
+[ -n "$cmd" ] || { sed -n '2,22p' "$0"; exit 2; }
+OWNER=""
+if [ "$cmd" != status ]; then OWNER=${1:-}; shift || true; [ -n "$OWNER" ] || die "$cmd needs an OWNER"; fi
+case "$OWNER" in *" "*|*/*) die "OWNER must be one word";; esac
+RES=board; WAIT=0; LEASE=20; NOTE=""; RES_GIVEN=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -r) RES=$2; RES_GIVEN=1; shift 2;;
+    -w) WAIT=$2; shift 2;;
+    -l) LEASE=$2; shift 2;;
+    -n) NOTE=$2; shift 2;;
+    --) shift; break;;
+    *) die "unknown option $1";;
+  esac
+done
+case $RES in board|guest-build) ;; *) die "unknown resource $RES (board, guest-build)";; esac
+
+case $cmd in
+  acquire) acquire_wait "$OWNER" "$LEASE" "$WAIT" "${NOTE:-manual}"; echo "board-lock: $OWNER holds $RES (lease $LEASE min)";;
+  renew)   try_acquire "$OWNER" "$LEASE" renew || die "$RES is held by someone else";;
+  release) do_release "$OWNER";;
+  check)
+    h=$(holder)
+    [ -n "$h" ] && [ "${h%% *}" = "$OWNER" ] && exit 0
+    hn=${h%% *}; [ -n "$h" ] || hn=nobody
+    echo "board-lock: $RES is held by $hn, not '$OWNER'. Wrap the command: rp2350/tools/board-lock run YOUR_NAME -r $RES -- CMD" >&2
+    exit 1;;
+  status)  if [ $RES_GIVEN = 1 ]; then show_status "$RES"; else show_status board guest-build; fi;;
+  run)
+    [ $# -gt 0 ] || die "run needs -- CMD..."
+    [ "$WAIT" = 0 ] && WAIT=180
+    # nested inside another `run` by the same owner: keep the outer one's lock
+    h=$(holder)
+    if [ -n "$h" ] && [ "${h%% *}" = "$OWNER" ]; then
+      BOARD_LOCK_OWNER=$OWNER exec "$@"
+    fi
+    acquire_wait "$OWNER" "$LEASE" "$WAIT" "${NOTE:-$(basename "$1") ${2:-}}"
+    ( while sleep 30; do try_acquire "$OWNER" "$LEASE" renew >/dev/null 2>&1 || true; done ) &
+    RENEW=$!
+    trap 'kill $RENEW 2>/dev/null; do_release "$OWNER"' EXIT
+    trap 'exit 130' INT TERM
+    set +e
+    BOARD_LOCK_OWNER=$OWNER "$@"
+    rc=$?
+    exit $rc;;
+  *) die "unknown command $cmd";;
+esac

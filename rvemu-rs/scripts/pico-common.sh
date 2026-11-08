@@ -3,8 +3,16 @@
 # RP2350 into USB BOOTSEL and load the guest blob + firmware with picotool.
 
 P=${PROBE_RS:-$HOME/git/toolchains/probe-rs-master/bin/probe-rs}
-BLOB_STAMP=target/pico-linux-blob.sha256
-DISK_STAMP=target/pico-linux-disk.sha256
+# One board, several checkouts: the board lock (../rp2350/tools/board-lock)
+# and the record of what is in its flash live outside every checkout.
+LOCK_HOME=${RP2350_LOCK_HOME:-$HOME/.cache/rp2350-board}
+BOARD_LOCK=../rp2350/tools/board-lock
+mkdir -p "$LOCK_HOME/stamps"
+BLOB_STAMP=$LOCK_HOME/stamps/blob.sha256
+DISK_STAMP=$LOCK_HOME/stamps/disk.sha256
+
+# need_board: stop unless this caller holds the board lock (BOARD_LOCK_OWNER)
+need_board() { "$BOARD_LOCK" check "${BOARD_LOCK_OWNER:-nobody}" || exit 1; }
 
 in_bootsel() { picotool info >/dev/null 2>&1; }
 wait_bootsel() { for _ in $(seq 1 "$1"); do in_bootsel && return 0; sleep 1; done; return 1; }
@@ -32,6 +40,7 @@ request_bootsel() {
 
 # ensure_bootsel ELF: failing a request, flash ELF over SWD once (slow) and ask again
 ensure_bootsel() {
+  need_board
   in_bootsel && return
   request_bootsel && return
   echo "pico: no BOOTSEL device; flashing $1 over SWD once"
@@ -47,6 +56,7 @@ OLD_WIFI_ADDR=0x10ff0000   # before the kernel text moved to the end of flash
 
 # load_at FILE ADDR STAMP WHAT: write FILE to flash at ADDR unless STAMP says it is there
 load_at() {
+  need_board
   local sum; sum="$(shasum -a 256 "$1" | cut -d' ' -f1) @$2"
   if [ "${FORCE_BLOB:-0}" = 1 ] || [ "$(cat "$3" 2>/dev/null || true)" != "$sum" ]; then
     echo "pico: loading $4 ($(wc -c < "$1" | tr -d ' ') bytes) over USB"
@@ -67,7 +77,7 @@ load_text() {
   local n; n=$(wc -c < "$1" | tr -d ' ')
   load_at "$1" "$(printf '0x%x' $((0x11000000 - n)))" "$TEXT_STAMP" "kernel text"
 }
-TEXT_STAMP=target/pico-linux-text.sha256
+TEXT_STAMP=$LOCK_HOME/stamps/text.sha256
 
 # keep_wifi: once, copy Wi-Fi settings stored at the old address to the new
 # one (picotool wants both range bounds in hex; a failed read stops the load)

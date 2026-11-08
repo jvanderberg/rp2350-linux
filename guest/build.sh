@@ -8,12 +8,32 @@ export BR2_DL_DIR=/work/dl
 
 stage=${1:-all}
 
+# The /work volume is shared by every checkout. Buildroot never removes files
+# from target/, so when the configuration (defconfig, post-build script, overlay
+# or external tree under /guest) differs from the last one built in this tree,
+# reinstall every package into a fresh target/ (no recompiling) so the image
+# holds only this checkout's packages.
+fresh_target() {   # BR_OUT FILES...
+  local o=$1; shift
+  local sum; sum=$(cd /guest && find "$@" -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
+  if [[ -d $o/target && "$(cat "$o/.config-sum" 2>/dev/null)" != "$sum" ]]; then
+    echo "build.sh: configuration changed since the last build in $o: fresh target/"
+    rm -rf "$o/target"
+    find "$o/build" -name .stamp_target_installed -delete 2>/dev/null || true
+    rm -f "$o"/build/*/.stamp_images_installed
+    # host-gcc-final puts libgcc_s & co. into target/ from its host install
+    rm -f "$o"/build/host-gcc-final-*/.stamp_host_installed
+  fi
+  echo "$sum" > "$o/.config-sum"
+}
+
 # disk / disk-rootfs / disk-kernel: the squashfs-root variant, into /out-disk
 # (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment)
 if [[ $stage == disk* ]]; then
   if [[ $stage == disk || $stage == disk-rootfs ]]; then
     mkdir -p /work/br-disk
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
+    fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
     make -C /src/buildroot O=/work/br-disk BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
     make -C /work/br-disk -j"$JOBS"
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
@@ -41,6 +61,7 @@ fi
 if [[ $stage == all || $stage == rootfs ]]; then
   mkdir -p /work/br
   cp /guest/buildroot.defconfig /work/br/defconfig
+  fresh_target /work/br buildroot.defconfig post-build.sh overlay br-external
   make -C /src/buildroot O=/work/br BR2_DEFCONFIG=/work/br/defconfig defconfig
   make -C /work/br -j"$JOBS"
   cp /work/br/images/rootfs.cpio /out/rootfs.cpio

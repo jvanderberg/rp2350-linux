@@ -74,14 +74,19 @@ cd guest && ./run-build.sh disk && cd ..
 cd rvemu-rs && cargo build --release
 ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs -m 8
 
-# 3. Store the Wi-Fi network in the board's flash (asks for the passphrase).
+# 3. Take the board (see "Sharing the board" below); every script that
+#    touches it checks the lock.
+export BOARD_LOCK_OWNER=$USER
+../rp2350/tools/board-lock acquire $USER -l 120
+
+# 4. Store the Wi-Fi network in the board's flash (asks for the passphrase).
 scripts/pico-wifi.sh "My Network"
 
-# 4. Load the guest and rvemu-pico-shell over USB (only what changed) and boot.
+# 5. Load the guest and rvemu-pico-shell over USB (only what changed) and boot.
 #    -b rebuilds the guest first, -i uses the initramfs guest instead.
 scripts/pico-shell.sh
 
-# 5. Connect. Log in as root, no password. Ctrl-A k quits screen.
+# 6. Connect. Log in as root, no password. Ctrl-A k quits screen.
 screen /dev/cu.usbmodemrvemu1 115200
 
 # Or run one command without a terminal (screen must be closed):
@@ -91,6 +96,44 @@ screen /dev/cu.usbmodemrvemu1 115200
 `pico-shell.sh` gets the board into BOOTSEL with a 1200-baud touch on its
 console port, or failing that over SWD. It refuses while another program
 (screen, say) has the port open.
+
+## Sharing the board
+
+There is one board and one guest-build Docker volume, and several checkouts
+can use them, so both sit behind `rp2350/tools/board-lock` (state in
+`~/.cache/rp2350-board`, outside every checkout):
+
+```sh
+rp2350/tools/board-lock status                    # who holds what, who waits
+rp2350/tools/board-lock run NAME -- CMD...        # wait (FIFO), run, release
+rp2350/tools/board-lock acquire NAME [-l MIN] [-w MIN]   # hold across commands
+rp2350/tools/board-lock renew NAME; rp2350/tools/board-lock release NAME
+```
+
+- The board lock covers BOOTSEL/picotool, the console port and SWD.
+  `pico-*.sh`, `run-riscv.sh` and `board-cmd.py` refuse to run unless
+  `BOARD_LOCK_OWNER` holds it (`board-lock run` sets it for its command).
+- A lease (20 min by default) that isn't renewed expires, and the next
+  waiter gets the lock.
+- `guest/run-build.sh` takes the `guest-build` lock itself for the Docker
+  run, and refuses to start while you hold the board. When the
+  configuration differs from the last one built in the volume, it reinstalls
+  every package into a fresh `target/`, so an image never holds another
+  checkout's packages.
+- What each region of flash holds is recorded in
+  `~/.cache/rp2350-board/stamps`, so a checkout reloads a region another
+  checkout overwrote.
+
+`scripts/perf-gate.sh` is the on-device performance and stability gate:
+- the benchmark boot;
+- the disk guest's wall time to `login:`;
+- a fixed workload: first runs, MicroPython, Lua, fork+exec;
+- MemAvailable;
+- checksums of every file in the root filesystem against the image's own.
+
+It compares the results with `~/.cache/rp2350-board/perf-baseline.json` and
+fails on any slowdown over 3% (boot) or 5% (workload), on 128 KiB less
+MemAvailable, or on a checksum mismatch.
 
 ## Flash map (16 MB)
 
