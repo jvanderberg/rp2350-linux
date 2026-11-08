@@ -37,8 +37,14 @@ and the root filesystem.
   Mac host's and the firmware's default command line for a disk without an
   initramfs is
   `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`.
-- **Network:** `eth0` is virtio-net. `/etc/network/interfaces` runs DHCP in
-  the background (`udhcpc -b`), so boot doesn't wait for the Wi-Fi join.
+- **Init scripts:** only `S02sysctl` and `S40network`. Every script and
+  command at boot is a fork+exec of the shared BusyBox, about 1 M guest
+  instructions each, so syslogd, klogd, crond, seedrng (the device tree's
+  `rng-seed` seeds the CRNG) and the modules script are removed. `dmesg`
+  has the kernel log.
+- **Network:** `eth0` is virtio-net. `/etc/network/interfaces` starts
+  `udhcpc -b` in the background, so boot doesn't wait for a lease or the
+  Wi-Fi join.
   On the board the NIC is bridged to the Wi-Fi radio. On the Mac, `rvemu -N`
   gives a stub LAN (see `rvemu-rs/README.md`).
 - **`LANG=C.UTF-8`** in `/etc/profile`, for tmux and friends.
@@ -78,5 +84,5 @@ Kernel options of note in `linux-disk.fragment`:
 |---|---|---|
 | Image (of which text) | 2.4 MB (1.6 MB) | 4.0 MB (3.0 MB) |
 | Root filesystem | 1.2 MB cpio | 4.5 MB squashfs |
-| Guest instructions to `login:` | 58.1 M | 147.5 M (with `-N`) |
+| Guest instructions to `login:` | 46.7 M | 109.5 M (with `-N`) |
 | Boot on the board, 348 MHz | 8.0 s | 19.7 s |

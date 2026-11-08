@@ -4,15 +4,21 @@
 //!
 //! The bus is a port of `cyw43-pio` (embassy) to rp235x-hal: the same PIO
 //! program and per-transaction sequence, with the CPU feeding the FIFOs where
-//! the original uses DMA. There is no executor: `Radio::poll` polls the
-//! driver's futures with a no-op waker from the emulator's device poll, and
+//! the original uses DMA. There is no executor: core1's service loop
+//! (`RadioService::poll`) polls the driver's futures with a no-op waker, and
 //! `embassy-time` reads the core's cycle counter.
+//!
+//! All of this runs on core1 (`core1.rs`), from SRAM. Frames reach the
+//! guest's virtio-net on core0 through two `FrameRing`s (`NET_RX`, `NET_TX`);
+//! the MAC and link state are published in `RADIO`, `MAC` and `LINK_UP`.
 
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
+
+use crate::core1::{self, FrameRing};
 
 use cyw43::SpiBusCyw43;
 use embassy_net_driver::{Driver, HardwareAddress, LinkState, RxToken, TxToken};
@@ -22,20 +28,22 @@ use hal::gpio::{
     PullNone,
 };
 use hal::pio::{PIOBuilder, PIOExt, PinDir, PinState, SM0, ShiftDirection, StateMachine, Stopped};
-use rp2350_board as board;
 use rp235x_hal as hal;
 use rtt_target::rprintln;
-use rvcore::virtio::{FRAME_MAX, NetLink};
 
 // ------------------------------------------------------------------ time
 
-static CYCLES_PER_US: AtomicU32 = AtomicU32::new(150);
+/// 2^32 / (cycles per microsecond): `now` multiplies instead of dividing,
+/// because the u64 division is a libcall in flash.
+static US_PER_CYCLE_Q32: AtomicU32 = AtomicU32::new(u32::MAX / 150);
 
 struct CycleClock;
 
 impl embassy_time_driver::Driver for CycleClock {
     fn now(&self) -> u64 {
-        board::mcycle64() / u64::from(CYCLES_PER_US.load(Ordering::Relaxed))
+        let c = core1::now();
+        let m = u64::from(US_PER_CYCLE_Q32.load(Ordering::Relaxed));
+        (c >> 32) * m + (((c & 0xFFFF_FFFF) * m) >> 32)
     }
     /// Nothing to arm: every future is polled again on the next device poll.
     fn schedule_wake(&self, _at: u64, _waker: &Waker) {}
@@ -66,8 +74,8 @@ const PIN_CLK: u8 = 29;
 /// same at our clock.
 const PIO_HZ_MAX: u32 = 50_000_000;
 /// A transfer that takes longer than this is abandoned (no radio fitted, or
-/// it stopped answering), so the emulator never hangs on the bus.
-const XFER_TIMEOUT_US: u64 = 20_000;
+/// it stopped answering), so core1 never hangs on the bus.
+const XFER_TIMEOUT_MS: u32 = 20;
 
 fn rd(a: usize) -> u32 {
     // SAFETY: PIO0 register.
@@ -82,10 +90,14 @@ pub struct PioSpi {
     cs: GpioPin<Gpio25, FunctionSioOutput, PullDown>,
     /// Owned so nothing else claims SM0; driven through its registers.
     _sm: StateMachine<(hal::pac::PIO0, SM0), Stopped>,
-    wrap_target: u8,
     _dio: GpioPin<Gpio24, FunctionPio0, PullNone>,
     _clk: GpioPin<Gpio29, FunctionPio0, PullDown>,
     timeouts: u32,
+    /// `XFER_TIMEOUT_MS` in core cycles.
+    timeout_cycles: u64,
+    /// `set pindirs, 1` and `jmp wrap_target`, encoded once.
+    set_pindir_out: u16,
+    jmp_wrap: u16,
 }
 
 impl PioSpi {
@@ -151,7 +163,12 @@ impl PioSpi {
         sm.set_pindirs([(PIN_CLK, PinDir::Output), (PIN_DIO, PinDir::Output)]);
         sm.set_pins([(PIN_CLK, PinState::Low), (PIN_DIO, PinState::Low)]);
         rprintln!("[wifi] gSPI: PIO clock {} MHz (divider {})", sys_hz / div / 1_000_000, div);
-        PioSpi { cs, _sm: sm, wrap_target, _dio: dio, _clk: clk, timeouts: 0 }
+        let set_pindir_out =
+            pio::InstructionOperands::SET { destination: pio::SetDestination::PINDIRS, data: 1 }.encode();
+        let jmp_wrap =
+            pio::InstructionOperands::JMP { address: wrap_target, condition: pio::JmpCondition::Always }.encode();
+        let timeout_cycles = u64::from(sys_hz / 1000 * XFER_TIMEOUT_MS);
+        PioSpi { cs, _sm: sm, _dio: dio, _clk: clk, timeouts: 0, timeout_cycles, set_pindir_out, jmp_wrap }
     }
 
     fn set_enable(&mut self, on: bool) {
@@ -174,30 +191,21 @@ impl PioSpi {
         self.exec(OUT);
     }
 
-    fn set_pindir(&mut self, data: u8) {
-        let set = pio::InstructionOperands::SET { destination: pio::SetDestination::PINDIRS, data }.encode();
-        self.exec(set);
-    }
-
-    fn exec_jmp(&mut self, address: u8) {
-        let jmp = pio::InstructionOperands::JMP { address, condition: pio::JmpCondition::Always }.encode();
-        self.exec(jmp);
-    }
-
     /// Restart the program with X = bits to write - 1, Y = bits to read - 1.
     fn start(&mut self, write_bits: u32, read_bits: u32) {
         self.set_enable(false);
         self.set_x(write_bits);
         self.set_y(read_bits);
-        self.set_pindir(0b1);
-        self.exec_jmp(self.wrap_target);
+        self.exec(self.set_pindir_out);
+        self.exec(self.jmp_wrap);
         self.set_enable(true);
     }
 
-    /// Spin until `ready` or the transfer deadline; false on timeout.
+    /// Spin until `ready` or the transfer deadline (in cycles); false on
+    /// timeout.
     fn wait(&mut self, deadline: u64, ready: impl Fn() -> bool) -> bool {
         while !ready() {
-            if embassy_time_driver::now() > deadline {
+            if core1::now() > deadline {
                 self.timeouts += 1;
                 return false;
             }
@@ -220,7 +228,7 @@ impl PioSpi {
     /// Write data to peripheral and return status.
     fn write(&mut self, write: &[u32]) -> u32 {
         self.start(write.len() as u32 * 32 - 1, 31);
-        let deadline = embassy_time_driver::now() + XFER_TIMEOUT_US;
+        let deadline = core1::now() + self.timeout_cycles;
         for &w in write {
             if !self.push(deadline, w) {
                 return 0;
@@ -232,7 +240,7 @@ impl PioSpi {
     /// Send command and read response into buffer.
     fn read(&mut self, cmd: u32, read: &mut [u32]) -> u32 {
         self.start(31, read.len() as u32 * 32 + 32 - 1);
-        let deadline = embassy_time_driver::now() + XFER_TIMEOUT_US;
+        let deadline = core1::now() + self.timeout_cycles;
         if !self.push(deadline, cmd) {
             return 0;
         }
@@ -332,20 +340,38 @@ impl Creds {
 type Pwr = GpioPin<Gpio23, FunctionSioOutput, PullDown>;
 
 static mut STATE: cyw43::State = cyw43::State::new();
-/// The driver's network device once it is up; the guest's link reads it.
+/// The driver's network device once it is up (core1 only).
 static mut NET: Option<cyw43::NetDriver<'static>> = None;
 static READY: AtomicBool = AtomicBool::new(false);
 
 fn net() -> Option<&'static mut cyw43::NetDriver<'static>> {
-    // SAFETY: single core, no interrupts: only the emulator loop touches it.
+    // SAFETY: only core1's radio service touches it, from one place at a
+    // time (the driver future publishes it before the service reads it).
     unsafe { (*addr_of_mut!(NET)).as_mut() }
+}
+
+/// The same bytes through flash's uncached, non-allocating XIP alias, so
+/// uploading the firmware doesn't sweep the guest's data out of the XIP
+/// cache.
+fn uncached(b: &'static cyw43::Aligned<cyw43::A4, [u8]>) -> &'static cyw43::Aligned<cyw43::A4, [u8]> {
+    const XIP_NOCACHE_NOALLOC_OFFSET: usize = 0x1400_0000 - 0x1000_0000;
+    let p = core::ptr::from_ref(b);
+    let a = p.cast::<u8>() as usize;
+    if !(0x1000_0000..0x1400_0000).contains(&a) {
+        return b;
+    }
+    let q = core::ptr::slice_from_raw_parts((a + XIP_NOCACHE_NOALLOC_OFFSET) as *const u8, b.len());
+    // SAFETY: the same flash bytes at another address with the same
+    // alignment, never written while we run; `Aligned` is repr(C) around
+    // the slice, so the pointer metadata carries over.
+    unsafe { &*(q as *const cyw43::Aligned<cyw43::A4, [u8]>) }
 }
 
 /// Bring the chip up, then join `creds` (retrying) while serving the bus.
 async fn run(pwr: Pwr, spi: PioSpi, creds: Option<Creds>) {
-    let fw = cyw43::aligned_bytes!("../firmware/43439A0.bin");
-    let clm = cyw43::aligned_bytes!("../firmware/43439A0_clm.bin");
-    let nvram = cyw43::aligned_bytes!("../firmware/nvram_rp2040.bin");
+    let fw = uncached(cyw43::aligned_bytes!("../firmware/43439A0.bin"));
+    let clm = uncached(cyw43::aligned_bytes!("../firmware/43439A0_clm.bin"));
+    let nvram = uncached(cyw43::aligned_bytes!("../firmware/nvram_rp2040.bin"));
     // SAFETY: STATE is borrowed here only, once.
     let state = unsafe { &mut *addr_of_mut!(STATE) };
     let (device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
@@ -380,27 +406,6 @@ async fn run(pwr: Pwr, spi: PioSpi, creds: Option<Creds>) {
     embassy_futures::join::join(runner.run(), control_task).await;
 }
 
-/// The driver, polled from the emulator's device poll.
-pub struct Radio<'a> {
-    fut: Pin<&'a mut dyn Future<Output = ()>>,
-}
-
-impl<'a> Radio<'a> {
-    pub fn poll(&mut self) {
-        let mut cx = Context::from_waker(Waker::noop());
-        let _ = self.fut.as_mut().poll(&mut cx);
-    }
-
-    /// Poll until the chip is up (its MAC known) or `timeout_us` passes.
-    pub fn bring_up(&mut self, timeout_us: u64) -> bool {
-        let t0 = embassy_time_driver::now();
-        while !READY.load(Ordering::Relaxed) && embassy_time_driver::now() - t0 < timeout_us {
-            self.poll();
-        }
-        READY.load(Ordering::Relaxed)
-    }
-}
-
 /// The RM2's pins, as `hal::gpio::Pins::new` hands them out.
 pub struct RadioPins {
     pub pwr: GpioPin<Gpio23, FunctionNull, PullDown>,
@@ -409,8 +414,7 @@ pub struct RadioPins {
     pub clk: GpioPin<Gpio29, FunctionNull, PullDown>,
 }
 
-/// The driver future for `Radio`; pin it where it lives
-/// (`core::pin::pin!`).
+/// The driver future for `RadioService` (set up on core0, run on core1).
 pub fn driver(
     pio0: hal::pac::PIO0,
     resets: &mut hal::pac::RESETS,
@@ -418,48 +422,110 @@ pub fn driver(
     pins: RadioPins,
     creds: Option<Creds>,
 ) -> impl Future<Output = ()> + use<> {
-    CYCLES_PER_US.store(sys_hz / 1_000_000, Ordering::Relaxed);
+    US_PER_CYCLE_Q32.store(u32::MAX / (sys_hz / 1_000_000), Ordering::Relaxed);
     let spi = PioSpi::new(pio0, resets, sys_hz, pins.dio, pins.clk, pins.cs);
     let pwr = pins.pwr.into_push_pull_output_in_state(hal::gpio::PinState::Low);
     run(pwr, spi, creds)
 }
 
-impl<'a> Radio<'a> {
-    pub fn new(fut: Pin<&'a mut dyn Future<Output = ()>>) -> Self {
-        Radio { fut }
+// ------------------------------------------------------------------ the guest's link (shared with core0)
+
+/// Frames from the radio to the guest (core1 pushes, core0 pops). More
+/// wait in the driver's own buffers (4).
+#[unsafe(link_section = ".sram89.net_rx")]
+pub static NET_RX: FrameRing<2> = FrameRing::new();
+/// Frames from the guest to the radio (core0 pushes, core1 pops).
+#[unsafe(link_section = ".sram89.net_tx")]
+pub static NET_TX: FrameRing<2> = FrameRing::new();
+
+pub const RADIO_STARTING: u32 = 0;
+pub const RADIO_UP: u32 = 1;
+pub const RADIO_ABSENT: u32 = 2;
+/// `RADIO_*`; `MAC` is valid once it is `RADIO_UP`.
+pub static RADIO: AtomicU32 = AtomicU32::new(RADIO_STARTING);
+/// The MAC, bytes 0-3 and 4-5, little-endian.
+pub static MAC: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+pub static LINK_UP: AtomicBool = AtomicBool::new(false);
+
+/// core1's radio service: drives the driver, moves frames between it and
+/// the rings, publishes the MAC and the link state.
+pub struct RadioService<F> {
+    /// Pinned in place: services never move (`core1::launch`).
+    fut: F,
+    /// When bring-up started, and how long it may take.
+    t0: u64,
+    bring_up_cycles: u64,
+}
+
+// SAFETY: built on core0 before core1 starts, then used by core1 only.
+unsafe impl<F> Send for RadioService<F> {}
+
+impl<F: Future<Output = ()>> RadioService<F> {
+    /// `bring_up_ms`: how long the chip may take to come up before the
+    /// guest's NIC is reported absent.
+    pub fn new(fut: F, sys_hz: u32, bring_up_ms: u32) -> Self {
+        RadioService { fut, t0: 0, bring_up_cycles: u64::from(sys_hz / 1000) * u64::from(bring_up_ms) }
+    }
+
+    fn poll_driver(&mut self) {
+        let mut cx = Context::from_waker(core1::waker());
+        // SAFETY: `fut` never moves (see the field).
+        let _ = unsafe { Pin::new_unchecked(&mut self.fut) }.poll(&mut cx);
     }
 }
 
-// ------------------------------------------------------------------ guest link
-
-/// The guest's Ethernet: frames to and from the driver's network device.
-pub struct WifiLink;
-
-fn cx() -> Context<'static> {
-    Context::from_waker(Waker::noop())
-}
-
-impl NetLink for WifiLink {
-    fn mac(&self) -> [u8; 6] {
-        match net().map(|d| d.hardware_address()) {
-            Some(HardwareAddress::Ethernet(m)) => m,
-            _ => [0; 6],
+impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
+    fn poll(&mut self) {
+        let mut cx = Context::from_waker(core1::waker());
+        // guest -> radio: as many frames as the driver takes
+        if let Some(d) = net() {
+            while !NET_TX.is_empty() {
+                let Some(tx) = d.transmit(&mut cx) else { break };
+                NET_TX.pop_with(|f| tx.consume(f.len(), |b| b.copy_from_slice(f)));
+            }
         }
-    }
-    fn link_up(&self) -> bool {
-        net().is_some_and(|d| d.link_state(&mut cx()) == LinkState::Up)
-    }
-    fn send(&mut self, frame: &[u8]) {
-        if let Some(tx) = net().and_then(|d| d.transmit(&mut cx())) {
-            tx.consume(frame.len(), |b| b.copy_from_slice(frame));
+        self.poll_driver();
+        if RADIO.load(Ordering::Relaxed) == RADIO_STARTING && !READY.load(Ordering::Relaxed) {
+            let now = core1::now();
+            if self.t0 == 0 {
+                self.t0 = now;
+            } else if now - self.t0 > self.bring_up_cycles {
+                rprintln!("[wifi] radio did not come up; the guest's eth0 stays down");
+                RADIO.store(RADIO_ABSENT, Ordering::Release);
+                core1::notify_core0();
+            }
+            return;
         }
-    }
-    fn recv(&mut self, buf: &mut [u8; FRAME_MAX]) -> Option<usize> {
-        let (rx, _tx) = net()?.receive(&mut cx())?;
-        Some(rx.consume(|b| {
-            let n = b.len().min(FRAME_MAX);
-            buf[..n].copy_from_slice(&b[..n]);
-            n
-        }))
+        let Some(d) = net() else { return };
+        // radio -> guest, while there's room (the rest waits in the driver)
+        let mut got = false;
+        while NET_RX.has_room() {
+            let Some((rx, _tx)) = d.receive(&mut cx) else { break };
+            NET_RX.push_with(|slot| {
+                Some(rx.consume(|b| {
+                    let n = b.len().min(slot.len());
+                    slot[..n].copy_from_slice(&b[..n]);
+                    n
+                }))
+            });
+            got = true;
+        }
+        if RADIO.load(Ordering::Relaxed) == RADIO_STARTING {
+            // READY: the chip is up and the driver knows its MAC
+            if let HardwareAddress::Ethernet(m) = d.hardware_address() {
+                MAC[0].store(u32::from_le_bytes([m[0], m[1], m[2], m[3]]), Ordering::Relaxed);
+                MAC[1].store(u32::from_le_bytes([m[4], m[5], 0, 0]), Ordering::Relaxed);
+            }
+            RADIO.store(RADIO_UP, Ordering::Release);
+            got = true;
+        }
+        let up = d.link_state(&mut cx) == LinkState::Up;
+        if up != LINK_UP.load(Ordering::Relaxed) {
+            LINK_UP.store(up, Ordering::Release);
+            got = true;
+        }
+        if got {
+            core1::notify_core0();
+        }
     }
 }

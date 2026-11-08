@@ -1,24 +1,30 @@
 //! Block translator: RV32IMA guest code -> RV32 host code (Hazard3).
 //!
-//! Guest register xN lives in host register xN, except five host registers
+//! Guest register xN lives in host register xN, except six host registers
 //! the translator reserves; the guest values of those live in `cpu.x[]`:
 //!   x3  S   pointer to the `Cpu`
 //!   x4  K0  scratch: guest address / host address / exit pc
 //!   x7  K1  scratch / exit info
+//!   x22 KB  instruction budget (`cpu.jit.budget` while in translated code)
 //!   x23 K2  scratch
 //!   x24 K3  link register for the TLB helpers
-//! (the five least-used guest registers in a boot, ~1.5% of operand uses).
+//! (the six least-used guest registers in a boot, ~2% of operand uses).
 //!
-//! Every block starts with `budget -= N; if budget < 0 exit`. The dispatcher
-//! sets the budget to the instructions left before the next timer deadline,
-//! which keeps `instret` exact and makes interrupt timing identical to the
+//! A block is `pc0; jal K1, budget_exit; addi KB, KB, -N; blt KB, zero, -8`
+//! and then its body; it is entered at the `addi`. The dispatcher sets the
+//! budget to the instructions left before the next timer deadline, which
+//! keeps `instret` exact and makes interrupt timing identical to the
 //! interpreter's. Anything other than ALU / M / loads / stores / branches /
 //! jumps ends the block and is run by the interpreter (`Cpu::step`).
 //!
 //! Loads and stores call a shared soft-TLB helper (`jal K3`) that returns
-//! the host address in K0 and skips the following `j miss_stub` on a hit. A
-//! miss, MMIO, a fault or a misaligned access exits, and the interpreter
-//! executes that one instruction.
+//! the host address in K0. On a TLB miss the helper calls into Rust on the
+//! host stack to fill the entry, and carries on. MMIO, a fault, a write to a
+//! code page or a misaligned access exits with the call site, and the
+//! interpreter executes that one instruction: the dispatcher finds the block from the call site (the
+//! `jal K1, budget_exit` before its entry; data words in a block are guest
+//! pcs, 4-aligned, so they never look like an instruction) and which
+//! instruction it was (counting `jal K3` sites).
 //!
 //! Blocks are keyed by (virtual pc, physical pc) and never cross a page.
 //! Exits to the same page are chained by patching a `jal`. Other jumps go
@@ -30,7 +36,9 @@
 //! When the code buffer is full it is either flushed (`regions` = 1) or used
 //! as a ring of `regions` equal parts: blocks fill one region after another,
 //! and moving on to the next region evicts the blocks it holds, the oldest.
-//! Block descriptors are a ring in the same order. A chain from a block into
+//! Each block's descriptor (hash-chain link, physical and virtual pc) is a
+//! header in the code buffer in front of its code, so the buffer has no
+//! separate block limit. A chain from a block into
 //! an older region is logged in that region's `chain_log` and reset to a
 //! chain request when the region is evicted; chains into the same or a newer
 //! region need nothing, because the source is evicted first.
@@ -47,24 +55,25 @@
 
 pub mod emit;
 
-use core::mem::offset_of;
+use core::mem::{MaybeUninit, offset_of};
 use emit::*;
-use rvcore::{ACC_R, ACC_W, ACC_X, Bus, Cpu, JitRegs, TlbEntry};
+use rvcore::{ACC_R, ACC_W, ACC_X, Bus, Cpu, JitRegs, Priv, TlbEntry};
 
 pub const S: Reg = 3;
 pub const K0: Reg = 4;
 pub const K1: Reg = 7;
 pub const K2: Reg = 23;
 pub const K3: Reg = 24;
+pub const KB: Reg = 22;
 
 #[inline(always)]
 pub const fn spilled(r: u32) -> bool {
-    r == S || r == K0 || r == K1 || r == K2 || r == K3
+    r == S || r == K0 || r == K1 || r == K2 || r == K3 || r == KB
 }
 
 /// Guest registers held in host registers while in translated code.
-const GUEST_REGS: [Reg; 26] = [
-    1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 30, 31,
+const GUEST_REGS: [Reg; 25] = [
+    1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 25, 26, 27, 28, 29, 30, 31,
 ];
 /// Host registers the entry trampoline must preserve for the Rust caller
 /// (ra, callee-saved s0-s11, and gp/tp which we repurpose).
@@ -74,6 +83,17 @@ const FRAME: i32 = 64;
 pub const EXIT_JUMP: u32 = 0; // info = chain slot address, or 0
 pub const EXIT_INTERP: u32 = 1; // interpret the instruction at exit_pc
 pub const EXIT_BUDGET: u32 = 2; // budget exhausted before the block ran
+pub const EXIT_MEM: u32 = 3; // info = 3 + the return address of a `jal K3` site
+
+/// A block in the code buffer: a header of `HDR_NEXT` (the next block in its
+/// hash chain, as the word index of its header, or EMPTY), `HDR_PA` (its
+/// physical pc) and `HDR_VA` (its virtual pc), then `jal K1, budget_exit`,
+/// then the entry point (`ENTRY_OFF`).
+const HDR_NEXT: usize = 0;
+const HDR_PA: usize = 1;
+const HDR_VA: usize = 2;
+const ENTRY_OFF: usize = 4;
+const HASH_MUL: u32 = 0x9E37_79B1;
 
 pub const MAX_BLOCK: usize = 32;
 /// Most code-buffer regions (`JitMem::regions`).
@@ -103,23 +123,30 @@ const OFF_EXIT_PC: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, exit_pc)) a
 const OFF_EXIT_INFO: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, exit_info)) as i32;
 const OFF_HOST_SP: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, host_sp)) as i32;
 const OFF_JC: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, jc_base)) as i32;
+const OFF_IRQ_PENDING: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, irq_pending)) as i32;
+const OFF_SIE_BIT: i32 = offset_of!(Cpu, sie_bit) as i32;
+const OFF_RES_VALID: i32 = offset_of!(Cpu, res_valid) as i32;
+const OFF_RES_ADDR: i32 = offset_of!(Cpu, res_addr) as i32;
+/// sstatus as csr_read composes it: (field, bit)
+const SSTATUS_BITS: [(i32, u32); 5] = [
+    (offset_of!(Cpu, sie_bit) as i32, 1),
+    (offset_of!(Cpu, spie) as i32, 5),
+    (offset_of!(Cpu, spp) as i32, 8),
+    (offset_of!(Cpu, sum) as i32, 18),
+    (offset_of!(Cpu, mxr) as i32, 19),
+];
+const CSR_SSTATUS: u32 = 0x100;
+/// CSRs that are plain fields: (csr, field offset)
+const CSR_FIELDS: [(u32, i32); 4] = [
+    (0x140, offset_of!(Cpu, sscratch) as i32),
+    (0x141, offset_of!(Cpu, sepc) as i32),
+    (0x142, offset_of!(Cpu, scause) as i32),
+    (0x143, offset_of!(Cpu, stval) as i32),
+];
 const fn off_tlb_cur(acc: usize) -> i32 {
     (offset_of!(Cpu, jit) + offset_of!(JitRegs, tlb_cur) + acc * core::mem::size_of::<usize>()) as i32
 }
 const OFF_ADDEND: i32 = offset_of!(TlbEntry, addend) as i32;
-
-#[derive(Clone, Copy)]
-pub struct Block {
-    pub va: u32,
-    pub pa: u32,
-    /// Word index of the code, or NO_CODE for "always interpret".
-    pub code: u32,
-    pub next: u32,
-}
-
-impl Block {
-    pub const EMPTY: Block = Block { va: 0, pa: 0, code: NO_CODE, next: EMPTY };
-}
 
 #[derive(Clone, Copy)]
 pub struct JitStats {
@@ -207,8 +234,31 @@ enum Kind {
     Nop,
     /// AMO*.W except LR/SC: done with the host AMO on the host address.
     Amo,
+    /// S-mode access to sscratch, sepc, scause, stval or sstatus
+    /// (`emit_csr`).
+    Csr,
+    /// LR.W / SC.W on the interpreter's reservation (`emit_lrsc`).
+    LrSc,
     Interp,
 }
+
+/// Helper-call sites (`jal K3`) a Csr instruction emits: one for an sstatus
+/// write unless it is an immediate SIE set or clear.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn csr_sites(insn: u32) -> usize {
+    let (f3, rs1) = ((insn >> 12) & 7, (insn >> 15) & 31);
+    usize::from(insn >> 20 == CSR_SSTATUS && (f3 & 3 == 1 || rs1 != 0) && !sie_imm(f3, rs1))
+}
+
+/// An sstatus `csrrsi` / `csrrci` that sets or clears at most SIE.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn sie_imm(f3: u32, rs1: u32) -> bool {
+    f3 >= 4 && f3 & 3 != 1 && rs1 & !2 == 0
+}
+
+/// Translated host words, at most, for one instruction (an sstatus write;
+/// an AMO is 12).
+const MAX_WORDS: usize = 36;
 
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn imm_i(insn: u32) -> i32 {
@@ -242,8 +292,9 @@ fn imm_j(insn: u32) -> i32 {
 /// Which instructions the translator handles itself. Encodings are checked
 /// as strictly as the interpreter does, so anything copied verbatim is a
 /// valid RV32IM instruction with identical semantics on the host.
+#[inline(always)]
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-fn classify(insn: u32, pc: u32) -> Kind {
+fn classify(insn: u32, pc: u32, sup: bool) -> Kind {
     let f3 = (insn >> 12) & 7;
     let f7 = insn >> 25;
     match insn & 0x7F {
@@ -274,37 +325,267 @@ fn classify(insn: u32, pc: u32) -> Kind {
         0x2F if f3 == 2 && matches!(insn >> 27, 0x00 | 0x01 | 0x04 | 0x08 | 0x0C | 0x10 | 0x14 | 0x18 | 0x1C) => {
             Kind::Amo
         }
+        0x2F if f3 == 2 && (insn >> 27 == 3 || (insn >> 27 == 2 && (insn >> 20) & 31 == 0)) => Kind::LrSc,
+        // (a page executable in S-mode never is in U-mode, so a block's
+        // privilege is the one it was translated in)
+        0x73 if sup && f3 & 3 != 0 => {
+            let csr = insn >> 20;
+            if csr == CSR_SSTATUS || CSR_FIELDS.iter().any(|&(c, _)| c == csr) {
+                Kind::Csr
+            } else {
+                Kind::Interp
+            }
+        }
         _ => Kind::Interp,
     }
 }
 
-/// Pass 1 of translation: the instructions of the block starting at `pc0`.
+/// Pass 1 of translation: the extent of the block starting at `pc0`, and
+/// the kind of each instruction (pass 2 reads the instructions again).
 struct Scan {
-    insns: [u32; MAX_BLOCK],
-    kinds: [Kind; MAX_BLOCK],
+    /// host address of the instruction at `pc0`
+    host0: usize,
     n: usize,
+    /// kind of the last instruction (Interp if n == 0)
+    last: Kind,
     /// stopped before an instruction only the interpreter runs
     end_interp: bool,
 }
 
+/// Instruction `k` of the block at host address `host0`.
+#[inline(always)]
+fn insn_at(host0: usize, k: usize) -> u32 {
+    // SAFETY: callers stay within the block's guest RAM page.
+    unsafe { ((host0 + 4 * k) as *const u32).read() }
+}
+
+/// Kinds of a block's instructions; scan() writes the first `n` (left
+/// uninitialized otherwise: zero-filling it cost more than the scan).
+type Kinds = [MaybeUninit<Kind>; MAX_BLOCK];
+
+/// A translated LR.W / SC.W (out of line like `emit_csr`).
+#[inline(never)]
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-fn scan(cpu: &Cpu, pc0: u32, pa0: u32) -> Scan {
-    let page_end = (pc0 & !0xFFF).wrapping_add(0x1000);
+fn emit_lrsc<'a>(mut a: Asm<'a>, r: &Routines, insn: u32) -> Asm<'a> {
+    let rd = (insn >> 7) & 31;
+    let rs1 = (insn >> 15) & 31;
+    let rs2 = (insn >> 20) & 31;
+    macro_rules! call {
+        ($link:expr, $to:expr) => {{
+            let off = ($to as isize - a.pos() as isize) * 4;
+            a.emit(j_type($link, off as i32));
+        }};
+    }
+    if spilled(rs1) {
+        a.lw(K0, S, xoff(rs1));
+    } else {
+        a.addi(K0, rs1, 0);
+    }
+    // A slow case (miss, MMIO, fault, misaligned) leaves at the helper call
+    // with the reservation as it was, and the interpreter does it all.
+    if insn >> 27 == 2 {
+        // LR.W
+        a.sw(K0, S, OFF_RES_ADDR);
+        call!(K3, r.helper[0][2]);
+        if spilled(rd) {
+            a.lw(K1, K0, 0);
+            a.sw(K1, S, xoff(rd));
+        } else {
+            a.lw(rd, K0, 0); // (rd = x0 still loads)
+        }
+        a.addi(K1, ZERO, 1);
+        a.store(0, K1, S, OFF_RES_VALID); // sb
+        return a;
+    }
+    // SC.W: a misaligned address goes to the helper, which leaves for the
+    // interpreter to raise the fault before looking at the reservation
+    a.andi(K1, K0, 3);
+    let misaligned = a.branch_fwd(1, K1, ZERO);
+    a.load(4, K1, S, OFF_RES_VALID); // lbu
+    let fail1 = a.branch_fwd(0, K1, ZERO);
+    a.lw(K1, S, OFF_RES_ADDR);
+    let fail2 = a.branch_fwd(1, K1, K0);
+    let here = a.pos();
+    a.fix(misaligned, here);
+    call!(K3, r.helper[1][2]);
+    if spilled(rs2) {
+        a.lw(K1, S, xoff(rs2));
+        a.sw(K1, K0, 0);
+    } else {
+        a.sw(rs2, K0, 0);
+    }
+    a.addi(K2, ZERO, 0);
+    let done = a.jump_fwd();
+    let here = a.pos();
+    a.fix(fail1, here);
+    a.fix(fail2, here);
+    a.addi(K2, ZERO, 1);
+    let here = a.pos();
+    a.fix(done, here);
+    a.store(0, ZERO, S, OFF_RES_VALID);
+    if spilled(rd) {
+        a.sw(K2, S, xoff(rd));
+    } else if rd != 0 {
+        a.addi(rd, K2, 0);
+    }
+    a
+}
+
+/// A translated S-mode CSR access (classify() picked which); `left` is the
+/// number of instructions after it in the block. Out of line, and `a` by
+/// value, so the translator loop keeps `a` in registers.
+#[inline(never)]
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn emit_csr<'a>(mut a: Asm<'a>, r: &Routines, insn: u32, pc: u32, left: usize) -> Asm<'a> {
+    let rd = (insn >> 7) & 31;
+    let rs1 = (insn >> 15) & 31;
+    let f3 = (insn >> 12) & 7;
+    macro_rules! call {
+        ($link:expr, $to:expr) => {{
+            let off = ($to as isize - a.pos() as isize) * 4;
+            a.emit(j_type($link, off as i32));
+        }};
+    }
+    let csr = insn >> 20;
+    let op = f3 & 3; // 1 rw, 2 rs, 3 rc
+    let imm = f3 & 4 != 0; // the rs1 field is the operand
+    let write = op == 1 || rs1 != 0;
+    let src = if imm || rs1 == 0 {
+        ZERO
+    } else if spilled(rs1) {
+        a.lw(K0, S, xoff(rs1));
+        K0
+    } else {
+        rs1
+    };
+    // the old value goes to K2, then rd
+    macro_rules! write_rd {
+        () => {
+            if spilled(rd) {
+                a.sw(K2, S, xoff(rd));
+            } else if rd != 0 {
+                a.addi(rd, K2, 0);
+            }
+        };
+    }
+    if csr == CSR_SSTATUS {
+        if rd != 0 {
+            for (i, &(off, bit)) in SSTATUS_BITS.iter().enumerate() {
+                let t = if i == 0 { K2 } else { K1 };
+                a.load(4, t, S, off); // lbu
+                a.slli(t, t, bit);
+                if i > 0 {
+                    a.or(K2, K2, K1);
+                }
+            }
+        }
+        let refund = left as i32;
+        // `beq reg, zero` past the exit for an interrupt now taken
+        macro_rules! exit_if {
+            ($reg:expr) => {{
+                let past = 4 * (3 + i32::from(refund > 0));
+                a.emit(b_type(0, $reg, ZERO, past));
+                if refund > 0 {
+                    a.addi(KB, KB, refund);
+                }
+                call!(K1, r.jump_exit);
+                a.emit(pc.wrapping_add(4));
+            }};
+        }
+        // SIE set (op 2) or clear (op 3) inline
+        macro_rules! set_sie {
+            () => {{
+                if op == 2 {
+                    a.addi(K1, ZERO, 1);
+                    a.store(0, K1, S, OFF_SIE_BIT); // sb
+                    // an interrupt pending since entry is now taken
+                    a.lw(K1, S, OFF_IRQ_PENDING);
+                    exit_if!(K1);
+                } else {
+                    a.store(0, ZERO, S, OFF_SIE_BIT);
+                }
+            }};
+        }
+        if !write {
+            write_rd!();
+        } else if sie_imm(f3, rs1) {
+            write_rd!();
+            if rs1 != 0 {
+                set_sie!();
+            }
+        } else {
+            // other writes: sstatus_op(), which says whether an interrupt is
+            // now taken; a register operand holding only SIE is done inline
+            if imm {
+                a.addi(K0, ZERO, rs1 as i32);
+            } else if src != K0 {
+                a.addi(K0, src, 0);
+            }
+            write_rd!();
+            // (inline: the branch when SIE is not in it, the jump at the end)
+            let mut inline_done = [None; 2];
+            if op != 1 && !imm {
+                a.andi(K1, K0, -3);
+                let to_call = a.branch_fwd(1, K1, ZERO);
+                a.andi(K1, K0, 2);
+                inline_done[0] = Some(a.branch_fwd(0, K1, ZERO));
+                set_sie!();
+                inline_done[1] = Some(a.jump_fwd());
+                let here = a.pos();
+                a.fix(to_call, here);
+            }
+            a.addi(K1, ZERO, op as i32);
+            call!(K3, r.sstatus);
+            exit_if!(K0);
+            let here = a.pos();
+            for d in inline_done.into_iter().flatten() {
+                a.fix(d, here);
+            }
+        }
+    } else {
+        let off = CSR_FIELDS.iter().find(|&&(c, _)| c == csr).map_or(0, |&(_, o)| o);
+        if !(op == 1 && rd == 0) {
+            a.lw(K2, S, off);
+        }
+        if write {
+            match (op, imm) {
+                (1, true) => a.addi(K1, ZERO, rs1 as i32),
+                (1, false) => a.addi(K1, src, 0),
+                (2, true) => a.ori(K1, K2, rs1 as i32),
+                (2, false) => a.or(K1, K2, src),
+                (_, true) => a.andi(K1, K2, !(rs1 as i32)),
+                (_, false) => {
+                    a.xori(K1, src, -1);
+                    a.and(K1, K1, K2);
+                }
+            }
+            if csr == 0x141 {
+                a.andi(K1, K1, -4); // sepc
+            }
+            a.sw(K1, S, off);
+        }
+        write_rd!();
+    }
+    a
+}
+
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn scan(cpu: &Cpu, pc0: u32, pa0: u32, kinds: &mut Kinds) -> Scan {
     let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
-    let mut s = Scan { insns: [0; MAX_BLOCK], kinds: [Kind::Interp; MAX_BLOCK], n: 0, end_interp: false };
-    let mut pc = pc0;
-    while s.n < MAX_BLOCK && pc != page_end {
-        // SAFETY: within the same guest RAM page as pa0.
-        let insn = unsafe { ((host0 + (pc - pc0) as usize) as *const u32).read() };
-        let k = classify(insn, pc);
+    // instructions left in the page
+    let max = (((0x1000 - (pc0 & 0xFFF)) >> 2) as usize).min(MAX_BLOCK);
+    let sup = cpu.privilege == Priv::S;
+    // header, prologue and the closing jump
+    let mut s = Scan { host0, n: 0, last: Kind::Interp, end_interp: false };
+    while s.n < max {
+        let k = classify(insn_at(host0, s.n), pc0.wrapping_add(4 * s.n as u32), sup);
         if k == Kind::Interp {
             s.end_interp = true;
             break;
         }
-        s.insns[s.n] = insn;
-        s.kinds[s.n] = k;
+        kinds[s.n] = MaybeUninit::new(k);
+        s.last = k;
         s.n += 1;
-        pc = pc.wrapping_add(4);
         if matches!(k, Kind::Branch | Kind::Jal | Kind::Jalr) {
             break;
         }
@@ -347,6 +628,24 @@ pub struct BlockInfo {
 
 type EnterFn = unsafe extern "C" fn(*mut Cpu, usize);
 
+/// Called from translated code on a TLB miss (the `refill` routine): the host
+/// address of `va`, or 0 to leave for the interpreter.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+extern "C" fn tlb_refill(cpu: &mut Cpu, va: u32, acc: usize) -> usize {
+    cpu.tlb_refill(va, acc).unwrap_or(0)
+}
+
+/// Called from translated code for an sstatus write (the `sstatus`
+/// routine): 1 if an interrupt is now taken.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+extern "C" fn sstatus_op(cpu: &mut Cpu, src: u32, op: u32) -> usize {
+    cpu.sstatus_op(op, src);
+    usize::from(cpu.sie_bit && cpu.jit.irq_pending != 0)
+}
+
+/// Guest registers in host registers a Rust call may clobber (besides sp).
+const CALLER_SAVED: [Reg; 15] = [1, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31];
+
 /// What one dispatcher step did (used by lockstep checking).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Event {
@@ -360,10 +659,10 @@ pub enum Event {
 
 /// Memory the translator works in, supplied by the platform.
 pub struct JitMem<'m> {
+    /// Translated code, block headers included.
     pub code: &'m mut [u32],
-    /// Power of two.
+    /// Hash chains of blocks. Power of two.
     pub buckets: &'m mut [u32],
-    pub blocks: &'m mut [Block],
     /// One bit per RAM page.
     pub code_pages: &'m mut [u8],
     /// Power of two.
@@ -391,16 +690,17 @@ pub struct Jit<'m> {
     enter: usize,
     buckets: &'m mut [u32],
     bucket_shift: u32,
-    blocks: &'m mut [Block],
-    /// descriptor ring: oldest live descriptor, live count
-    bhead: usize,
-    nblocks: usize,
+    /// host address - guest physical address in guest RAM
+    ram_off: u32,
     code_pages: &'m mut [u8],
     ring: Ring<'m>,
     store: Store<'m>,
     jc: &'m mut [JcEntry],
     generation: u32,
     force_interp: bool,
+    /// (pc, host, code) that chain() just looked up for the pc the next
+    /// step starts at
+    next: Option<(u32, usize, u32)>,
     /// Translate AMOs to the host AMO (true) or to a plain load / operate /
     /// store sequence (false). RP2350 only supports exclusives, and so
     /// Hazard3 AMOs, on main SRAM: an AMO to guest RAM in PSRAM is a
@@ -439,8 +739,6 @@ struct Ring<'m> {
     /// allocation sequence of each region (0 = empty)
     seq: [u32; MAX_REGIONS],
     seq_next: u32,
-    /// descriptors per region (they are contiguous in the descriptor ring)
-    nblk: [u32; MAX_REGIONS],
     log: &'m mut [u32],
     log_per: usize,
     nlog: [u32; MAX_REGIONS],
@@ -458,18 +756,17 @@ struct Routines {
     ijmp_imm: usize,
     /// `jal K1, interp_exit; .word pc`
     interp_exit: usize,
-    /// from the block prologue: `jal K1, budget_exit` (K1 = entry + 16)
+    /// `jal K1, jump_exit; .word pc` - leave for the dispatcher at pc
+    jump_exit: usize,
+    /// `jal K3, sstatus` with K0 = operand, K1 = op: `Cpu::sstatus_op`;
+    /// K0 = 1 if an interrupt is now taken
+    sstatus: usize,
+    /// from the block prologue: `jal K1, budget_exit` (K1 = entry)
     budget_exit: usize,
-    /// `jal K3, ...; .word meta` - interpret the instruction meta names
+    /// `jal K3, mem_miss` - interpret the instruction of that call site
     mem_miss: usize,
     /// TLB helpers, [store][log2 size]
     helper: [[usize; 3]; 2],
-}
-
-/// Metadata word after a helper call: distance back to the block header,
-/// index of the instruction, and block length.
-const fn meta(dist: usize, k: usize, n: usize) -> u32 {
-    (dist as u32) | ((k as u32) << 10) | ((n as u32) << 16)
 }
 
 #[inline(always)]
@@ -510,9 +807,7 @@ impl<'m> Jit<'m> {
             enter: 0,
             buckets: mem.buckets,
             bucket_shift,
-            blocks: mem.blocks,
-            bhead: 0,
-            nblocks: 0,
+            ram_off: (cpu.ram_ptr() as usize as u32).wrapping_sub(cpu.ram_base()),
             code_pages: mem.code_pages,
             ring: Ring {
                 regions: mem.regions,
@@ -520,7 +815,6 @@ impl<'m> Jit<'m> {
                 cur: 0,
                 seq: [0; MAX_REGIONS],
                 seq_next: 1,
-                nblk: [0; MAX_REGIONS],
                 log: mem.chain_log,
                 log_per,
                 nlog: [0; MAX_REGIONS],
@@ -529,6 +823,7 @@ impl<'m> Jit<'m> {
             jc: mem.jump_cache,
             generation: 0,
             force_interp: false,
+            next: None,
             native_amo: true,
             measure_only: false,
             stats: JitStats::default(),
@@ -569,6 +864,7 @@ impl<'m> Jit<'m> {
         for &reg in &GUEST_REGS {
             a.lw(reg, S, xoff(reg));
         }
+        a.lw(KB, S, OFF_BUDGET);
         a.jalr(ZERO, K0, 0);
 
         // exit: K0 = guest pc, K1 = info
@@ -576,6 +872,7 @@ impl<'m> Jit<'m> {
         for &reg in &GUEST_REGS {
             a.sw(reg, S, xoff(reg));
         }
+        a.sw(KB, S, OFF_BUDGET);
         a.sw(K0, S, OFF_EXIT_PC);
         a.sw(K1, S, OFF_EXIT_INFO);
         a.lw(SP, S, OFF_HOST_SP);
@@ -597,37 +894,70 @@ impl<'m> Jit<'m> {
         a.addi(K1, ZERO, EXIT_INTERP as i32);
         jump!(r.exit);
 
-        // budget exhausted: K1 = entry + 16, block header (pc0) at entry - 4
+        // back to the dispatcher at the pc in the word at K1
+        r.jump_exit = a.pos();
+        a.lw(K0, K1, 0);
+        a.addi(K1, ZERO, EXIT_JUMP as i32);
+        jump!(r.exit);
+
+        // budget exhausted: K1 = entry, which is `addi KB, KB, -n`; undo it.
+        // The block header (pc0) is at entry - 8.
         r.budget_exit = a.pos();
-        a.lw(K0, K1, -20);
+        a.lw(K2, K1, 0);
+        a.srai(K2, K2, 20);
+        a.sub(KB, KB, K2);
+        a.lw(K0, K1, -8);
         a.addi(K1, ZERO, EXIT_BUDGET as i32);
         jump!(r.exit);
 
-        // K3 = address of a meta word: interpret instruction k of the block,
-        // refunding the n - k instructions that did not run
+        // K3 = return address of a `jal K3` site: the dispatcher works out
+        // the instruction and the refund (`mem_exit`)
         r.mem_miss = a.pos();
-        a.lw(K1, K3, 0); // meta
-        a.andi(K2, K1, 0x3FF);
-        a.slli(K2, K2, 2);
-        a.sub(K2, K3, K2);
-        a.lw(K0, K2, 0); // pc0 from the header
-        a.srli(K2, K1, 10);
-        a.andi(K2, K2, 63); // k
-        a.slli(K3, K2, 2);
-        a.add(K0, K0, K3); // pc = pc0 + 4k
-        a.srli(K1, K1, 16); // n
-        a.sub(K1, K1, K2);
-        a.lw(K2, S, OFF_BUDGET);
-        a.add(K2, K2, K1);
-        a.sw(K2, S, OFF_BUDGET);
-        a.addi(K1, ZERO, EXIT_INTERP as i32);
+        a.addi(K1, K3, EXIT_MEM as i32);
         jump!(r.exit);
+
+        // f(cpu, K0, K1) on the host stack, result in K0. The callee-saved
+        // registers (S, K0 = tp, KB, K2, K3, s-registers) survive the call.
+        macro_rules! call_rust {
+            ($f:expr) => {{
+                for &reg in &CALLER_SAVED {
+                    a.sw(reg, S, xoff(reg));
+                }
+                a.sw(SP, S, xoff(SP));
+                a.lw(SP, S, OFF_HOST_SP);
+                a.addi(10, S, 0);
+                a.addi(11, K0, 0);
+                a.addi(12, K1, 0);
+                a.li(5, $f as *const () as usize as u32);
+                a.jalr(RA, 5, 0);
+                a.addi(K0, 10, 0);
+                a.lw(SP, S, xoff(SP));
+                for &reg in &CALLER_SAVED {
+                    a.lw(reg, S, xoff(reg));
+                }
+            }};
+        }
+
+        // TLB miss: K0 = guest va, K1 = access type, K3 = return address.
+        // tlb_refill() fills the entry and returns the host address, or 0
+        // for mem_miss.
+        let refill = a.pos();
+        call_rust!(tlb_refill);
+        a.emit(b_type(1, K0, ZERO, 8)); // bne K0, zero, +8
+        jump!(r.mem_miss);
+        a.jalr(ZERO, K3, 0);
+
+        r.sstatus = a.pos();
+        call_rust!(sstatus_op);
+        a.jalr(ZERO, K3, 0);
 
         // indirect jump with the target in the word at K1
         r.ijmp_imm = a.pos();
         a.lw(K0, K1, 0);
         // falls through into ijmp: indirect jump to guest K0 via the
-        // fetch-TLB check and the jump cache
+        // fetch-TLB check and the jump cache, and on a jump-cache miss the
+        // block's hash chain (refilling the jump cache), before giving up
+        // to the dispatcher
         r.ijmp = a.pos();
         a.srli(K1, K0, 9);
         a.andi(K1, K1, 0x7F8);
@@ -649,15 +979,64 @@ impl<'m> Jit<'m> {
         let miss3 = a.branch_fwd(1, K2, K3); // same mapping
         a.lw(K2, K1, 8);
         a.jalr(ZERO, K2, 0);
+        // jump-cache miss: K0 = va, K3 = addend. K3 = pa - va from here on.
+        let walk = a.pos();
+        a.fix(miss2, walk);
+        a.fix(miss3, walk);
+        a.li(K1, self.ram_off);
+        a.sub(K3, K3, K1);
+        a.add(K1, K0, K3); // pa
+        a.srli(K1, K1, 12);
+        a.srli(K2, K0, 2);
+        a.xor(K1, K1, K2);
+        a.li(K2, HASH_MUL);
+        a.mul(K1, K1, K2);
+        a.srli(K1, K1, self.bucket_shift);
+        a.slli(K1, K1, 2);
+        a.li(K2, self.buckets.as_ptr() as usize as u32);
+        a.add(K1, K1, K2);
+        a.lw(K2, K1, 0); // first header (word index) or EMPTY
+        let lp = a.pos();
+        a.addi(K1, K2, 1);
+        let end = a.branch_fwd(0, K1, ZERO); // EMPTY
+        a.slli(K2, K2, 2);
+        a.li(K1, self.code_base as u32);
+        a.add(K2, K2, K1); // header address
+        a.lw(K1, K2, (4 * HDR_VA) as i32);
+        let nx1 = a.branch_fwd(1, K1, K0);
+        a.lw(K1, K2, (4 * HDR_PA) as i32);
+        a.sub(K1, K1, K0);
+        let nx2 = a.branch_fwd(1, K1, K3);
+        // found: fill the jump-cache entry and go
+        a.addi(K2, K2, (4 * ENTRY_OFF) as i32);
+        a.li(K1, self.ram_off);
+        a.add(K3, K3, K1); // the addend again
+        a.srli(K1, K0, 2);
+        a.slli(K1, K1, 32 - jc_bits);
+        a.srli(K1, K1, 32 - jc_bits - 4);
+        // (exit_info is free until the exit routine writes it)
+        a.sw(K3, S, OFF_EXIT_INFO);
+        a.lw(K3, S, OFF_JC);
+        a.add(K1, K1, K3);
+        a.lw(K3, S, OFF_EXIT_INFO);
+        a.sw(K0, K1, 0);
+        a.sw(K3, K1, 4);
+        a.sw(K2, K1, 8);
+        a.jalr(ZERO, K2, 0);
+        let next = a.pos();
+        a.fix(nx1, next);
+        a.fix(nx2, next);
+        a.lw(K2, K2, (4 * HDR_NEXT) as i32);
+        let back = a.jump_fwd();
+        a.fix(back, lp);
         let miss = a.pos();
         a.fix(miss1, miss);
-        a.fix(miss2, miss);
-        a.fix(miss3, miss);
+        a.fix(end, miss);
         a.addi(K1, ZERO, EXIT_JUMP as i32);
         jump!(r.exit);
 
-        // TLB helpers: K0 = guest va -> host address, K3 = meta word.
-        // Hit returns to K3 + 4; miss goes to mem_miss.
+        // TLB helpers: K0 = guest va -> host address, K3 = return address.
+        // A miss goes to mem_miss.
         //
         // Misaligned accesses also take the miss path, so the interpreter
         // does them in software: Hazard3 has no misaligned loads/stores (on
@@ -683,13 +1062,16 @@ impl<'m> Jit<'m> {
                 let m = a.branch_fwd(1, K2, ZERO);
                 a.lw(K1, K1, OFF_ADDEND);
                 a.add(K0, K0, K1);
-                a.jalr(ZERO, K3, 4);
+                a.jalr(ZERO, K3, 0);
                 let here = a.pos();
                 a.fix(m, here);
+                a.addi(K1, ZERO, if store == 1 { ACC_W } else { ACC_R } as i32);
+                jump!(refill);
                 if let Some(mis) = misaligned {
+                    let here = a.pos();
                     a.fix(mis, here);
+                    jump!(r.mem_miss);
                 }
-                jump!(r.mem_miss);
             }
         }
 
@@ -703,8 +1085,6 @@ impl<'m> Jit<'m> {
 
     fn reset_tables(&mut self) {
         self.buckets.fill(EMPTY);
-        self.bhead = 0;
-        self.nblocks = 0;
         // with a backing store, pages keep their write protection: stored
         // blocks from them must still see stores to them
         if self.store.nidx == 0 {
@@ -718,7 +1098,6 @@ impl<'m> Jit<'m> {
         g.seq = [0; MAX_REGIONS];
         g.seq[0] = g.seq_next;
         g.seq_next += 1;
-        g.nblk = [0; MAX_REGIONS];
         g.nlog = [0; MAX_REGIONS];
     }
 
@@ -732,13 +1111,13 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn make_room(&mut self, need: usize) {
         if self.ring.regions == 1 {
-            if self.pos + need > self.code.len() || self.nblocks == self.blocks.len() {
+            if self.pos + need > self.code.len() {
                 self.flush();
             }
             return;
         }
         let end = self.code_start + (self.ring.cur + 1) * self.ring.region_words;
-        if self.pos + need <= end && self.nblocks < self.blocks.len() {
+        if self.pos + need <= end {
             return;
         }
         let next = (self.ring.cur + 1) % self.ring.regions;
@@ -750,40 +1129,39 @@ impl<'m> Jit<'m> {
         self.pos = self.code_start + next * self.ring.region_words;
         self.generation = self.generation.wrapping_add(1);
         self.stats.evictions += 1;
-        if self.nblocks == self.blocks.len() {
-            // one region holds every descriptor (no-code blocks)
-            self.flush();
-        }
     }
 
-    /// Drop region `r`'s blocks: descriptors out of the hash table, logged
-    /// chains into it back to chain requests, jump-cache entries into it.
+    /// Drop region `r`'s blocks: out of the hash chains, logged chains into
+    /// it back to chain requests, jump-cache entries into it.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn evict_region(&mut self, r: usize) {
-        let nb = self.ring.nblk[r] as usize;
-        for k in 0..nb {
-            let d = (self.bhead + k) % self.blocks.len();
-            let (va, pa) = (self.blocks[d].va, self.blocks[d].pa);
-            let h = self.hash(va, pa);
-            let mut prev = EMPTY;
+        // Chains are newest first, and `r` is the oldest region still
+        // holding blocks, so its blocks are the tail of every chain: cut
+        // each chain at the first one.
+        let lo = (self.code_start + r * self.ring.region_words) as u32;
+        let hi = lo + self.ring.region_words as u32;
+        let inr = |i: u32| i.wrapping_sub(lo) < hi - lo;
+        for h in 0..self.buckets.len() {
             let mut i = self.buckets[h];
-            while i != EMPTY {
-                let next = self.blocks[i as usize].next;
-                if i as usize == d {
-                    if prev == EMPTY {
-                        self.buckets[h] = next;
-                    } else {
-                        self.blocks[prev as usize].next = next;
-                    }
+            if i == EMPTY {
+                continue;
+            }
+            if inr(i) {
+                self.buckets[h] = EMPTY;
+                continue;
+            }
+            loop {
+                let next = self.code[i as usize + HDR_NEXT];
+                if next == EMPTY {
                     break;
                 }
-                prev = i;
+                if inr(next) {
+                    self.code[i as usize + HDR_NEXT] = EMPTY;
+                    break;
+                }
                 i = next;
             }
         }
-        self.bhead = (self.bhead + nb) % self.blocks.len();
-        self.nblocks -= nb;
-        self.ring.nblk[r] = 0;
         let base = r * self.ring.log_per;
         for k in 0..self.ring.nlog[r] as usize {
             let slot = self.ring.log[base + k] as usize;
@@ -791,8 +1169,7 @@ impl<'m> Jit<'m> {
         }
         self.ring.nlog[r] = 0;
         self.ring.seq[r] = 0;
-        let lo = self.code_addr((self.code_start + r * self.ring.region_words) as u32) as u32;
-        let hi = lo + (self.ring.region_words * 4) as u32;
+        let (lo, hi) = (self.code_addr(lo) as u32, self.code_addr(hi) as u32);
         for e in self.jc.iter_mut() {
             if e.code >= lo && e.code < hi {
                 *e = JcEntry::EMPTY;
@@ -808,45 +1185,47 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn hash(&self, va: u32, pa: u32) -> usize {
-        ((va ^ pa.rotate_left(16)) >> 2).wrapping_mul(0x9E37_79B1) as usize >> self.bucket_shift
+        // (the ijmp routine computes the same in host code)
+        ((va >> 2) ^ (pa >> 12)).wrapping_mul(HASH_MUL) as usize >> self.bucket_shift
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    /// Entry point (code word index) of block (va, pa).
     fn lookup(&self, va: u32, pa: u32) -> Option<u32> {
         let mut i = self.buckets[self.hash(va, pa)];
         while i != EMPTY {
-            let b = &self.blocks[i as usize];
-            if b.va == va && b.pa == pa {
-                return Some(b.code);
+            let h = i as usize;
+            if self.code[h + HDR_VA] == va && self.code[h + HDR_PA] == pa {
+                return Some((h + ENTRY_OFF) as u32);
             }
-            i = b.next;
+            i = self.code[h + HDR_NEXT];
         }
         None
     }
 
+    /// Fill in the header at word `h` and put the block in its hash chain.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    fn insert(&mut self, va: u32, pa: u32, code: u32) {
-        let h = self.hash(va, pa);
-        let i = (self.bhead + self.nblocks) % self.blocks.len();
-        self.blocks[i] = Block { va, pa, code, next: self.buckets[h] };
-        self.buckets[h] = i as u32;
-        self.nblocks += 1;
-        self.ring.nblk[self.ring.cur] += 1;
+    fn insert(&mut self, va: u32, pa: u32, h: usize) {
+        let b = self.hash(va, pa);
+        self.code[h + HDR_NEXT] = self.buckets[b];
+        self.code[h + HDR_PA] = pa;
+        self.code[h + HDR_VA] = va;
+        self.buckets[b] = h as u32;
     }
 
     /// Drop every block translated from physical page `ppage`.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn invalidate_page(&mut self, cpu: &Cpu, ppage: u32) {
-        for h in 0..self.buckets.len() {
+        for b in 0..self.buckets.len() {
             let mut prev = EMPTY;
-            let mut i = self.buckets[h];
+            let mut i = self.buckets[b];
             while i != EMPTY {
-                let next = self.blocks[i as usize].next;
-                if self.blocks[i as usize].pa & !0xFFF == ppage {
+                let next = self.code[i as usize + HDR_NEXT];
+                if self.code[i as usize + HDR_PA] & !0xFFF == ppage {
                     if prev == EMPTY {
-                        self.buckets[h] = next;
+                        self.buckets[b] = next;
                     } else {
-                        self.blocks[prev as usize].next = next;
+                        self.code[prev as usize + HDR_NEXT] = next;
                     }
                 } else {
                     prev = i;
@@ -890,7 +1269,7 @@ impl<'m> Jit<'m> {
         } else {
             let r = self.translate_inner(cpu, pc0, pa0);
             if r != NO_CODE {
-                self.store_append(cpu, pc0, pa0, r as usize - 1);
+                self.store_append(cpu, pc0, pa0, r as usize - ENTRY_OFF);
             }
             r
         };
@@ -997,9 +1376,9 @@ impl<'m> Jit<'m> {
         let at = self.pos;
         self.code[at..at + words].copy_from_slice(&self.store.mem[e + STORE_HDR..e + STORE_HDR + words]);
         // re-point the jals into the shared routines, stepping over the
-        // data word after a chain / jump / interp request or a helper call
+        // data word after a chain / jump / interp request
         let r = self.r;
-        let mut i = 1;
+        let mut i = HDR_VA + 1;
         while i < words {
             let w = self.code[at + i];
             i += 1;
@@ -1013,7 +1392,7 @@ impl<'m> Jit<'m> {
             let rd = (w >> 7) & 31;
             self.code[at + i - 1] = j_type(rd, ((tgt - (at + i - 1) as isize) * 4) as i32);
             let t = tgt as usize;
-            if rd == K3 || (rd == K1 && (t == r.chain_req || t == r.ijmp_imm || t == r.interp_exit)) {
+            if rd == K1 && (t == r.chain_req || t == r.ijmp_imm || t == r.interp_exit || t == r.jump_exit) {
                 i += 1;
             }
         }
@@ -1021,42 +1400,52 @@ impl<'m> Jit<'m> {
         fence_i();
         self.stats.restores += 1;
         self.stats.restore_words += words as u64;
-        self.insert(va, pa, (at + 1) as u32);
-        (at + 1) as u32
+        self.insert(va, pa, at);
+        (at + ENTRY_OFF) as u32
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         // pass 1: find the block
-        let Scan { insns, kinds, n, end_interp } = scan(cpu, pc0, pa0);
+        let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
+        let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0, &mut kinds);
         let pc = pc0.wrapping_add(4 * n as u32);
 
+        // (no-code blocks are not kept: scanning one instruction again is
+        // about as cheap as looking it up)
+        if n == 0 {
+            return NO_CODE;
+        }
         // room for the worst case (measuring never keeps the block)
         if !self.measure_only {
-            self.make_room(n * 12 + 16);
-        }
-        if n == 0 {
-            self.insert(pc0, pa0, NO_CODE);
-            return NO_CODE;
+            self.make_room(n * MAX_WORDS + 16 + ENTRY_OFF);
         }
         if !self.measure_only {
             self.mark_code_page(cpu, pa0);
         }
 
-        let r = self.r;
+        let r = &self.r;
         let mut a = Asm::at(self.code, self.code_base, self.pos);
 
-        // header word (guest pc), then the entry point
-        let header = a.emit(pc0);
-        let start = a.pos();
-        let same_page = |t: u32| t & !0xFFF == pc0 & !0xFFF;
-
+        // `jal link, routine` (the buffer is at most 1 MiB, so always in range)
         macro_rules! call {
             ($link:expr, $to:expr) => {{
-                let c = a.emit(j_type($link, 0));
-                a.fix(c, $to);
+                let off = ($to as isize - a.pos() as isize) * 4;
+                a.emit(j_type($link, off as i32));
             }};
         }
+
+        // header word (guest pc), the budget exit, then the entry point:
+        // `addi KB, KB, -n; blt KB, zero, <the budget exit>`
+        let header = a.pos();
+        a.emit(EMPTY); // HDR_NEXT, HDR_PA: filled in by `insert`
+        a.emit(pa0);
+        a.emit(pc0);
+        call!(K1, r.budget_exit);
+        let start = a.pos();
+        a.addi(KB, KB, -(n as i32));
+        a.emit(b_type(4, KB, ZERO, -8));
+        let same_page = |t: u32| t & !0xFFF == pc0 & !0xFFF;
         // jump to a known guest pc: chainable slot if same page, else jump cache
         macro_rules! goto_pc {
             ($target:expr) => {{
@@ -1065,30 +1454,17 @@ impl<'m> Jit<'m> {
                 a.emit(t);
             }};
         }
-        // `jal K3, to; .word meta` for instruction k
-        macro_rules! call_meta {
-            ($to:expr, $k:expr) => {{
-                call!(K3, $to);
-                let here = a.pos();
-                a.emit(meta(here - header, $k, n));
-            }};
-        }
 
-        // prologue: budget check
-        a.lw(K0, S, OFF_BUDGET);
-        a.addi(K0, K0, -(n as i32));
-        a.emit(b_type(5, K0, ZERO, 8)); // bge K0, zero, +8
-        call!(K1, r.budget_exit);
-        a.sw(K0, S, OFF_BUDGET);
-
-        for k in 0..n {
-            let insn = insns[k];
+        for (k, kind) in kinds[..n].iter().enumerate() {
+            let insn = insn_at(host0, k);
             let pc = pc0.wrapping_add(4 * k as u32);
+            // SAFETY: scan() wrote kinds[..n].
+            let kind = unsafe { kind.assume_init() };
             let rd = (insn >> 7) & 31;
             let rs1 = (insn >> 15) & 31;
             let rs2 = (insn >> 20) & 31;
             let f3 = (insn >> 12) & 7;
-            match kinds[k] {
+            match kind {
                 Kind::Alu { rs1: u1, rs2: u2 } => {
                     let mut w = insn;
                     if u1 && spilled(rs1) {
@@ -1118,7 +1494,7 @@ impl<'m> Jit<'m> {
                     }
                 }
                 Kind::Load | Kind::Store => {
-                    let store = kinds[k] == Kind::Store;
+                    let store = kind == Kind::Store;
                     let imm = if store { imm_s(insn) } else { imm_i(insn) };
                     if spilled(rs1) {
                         a.lw(K0, S, xoff(rs1));
@@ -1128,7 +1504,7 @@ impl<'m> Jit<'m> {
                     } else {
                         a.addi(K0, rs1, imm);
                     }
-                    call_meta!(r.helper[store as usize][(f3 & 3) as usize], k);
+                    call!(K3, r.helper[store as usize][(f3 & 3) as usize]);
                     if store {
                         if spilled(rs2) {
                             a.lw(K1, S, xoff(rs2));
@@ -1182,8 +1558,8 @@ impl<'m> Jit<'m> {
                     a.andi(K0, K0, -2);
                     // misaligned target: let the interpreter raise it
                     a.andi(K1, K0, 2);
-                    a.emit(b_type(0, K1, ZERO, 12)); // beq K1, zero, +12
-                    call_meta!(r.mem_miss, k);
+                    a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+                    call!(K3, r.mem_miss);
                     if rd != 0 {
                         let link = pc.wrapping_add(4);
                         if spilled(rd) {
@@ -1197,6 +1573,8 @@ impl<'m> Jit<'m> {
                     a.fix(j, r.ijmp);
                 }
                 Kind::Nop => {}
+                Kind::Csr => a = emit_csr(a, r, insn, pc, n - 1 - k),
+                Kind::LrSc => a = emit_lrsc(a, r, insn),
                 Kind::Amo => {
                     // misaligned AMOs and every slow case go to the interpreter
                     if spilled(rs1) {
@@ -1205,9 +1583,9 @@ impl<'m> Jit<'m> {
                         a.addi(K0, rs1, 0);
                     }
                     a.andi(K1, K0, 3);
-                    a.emit(b_type(0, K1, ZERO, 12)); // beq K1, zero, +12
-                    call_meta!(r.mem_miss, k);
-                    call_meta!(r.helper[1][2], k);
+                    a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+                    call!(K3, r.mem_miss);
+                    call!(K3, r.helper[1][2]);
                     let src = if spilled(rs2) {
                         a.lw(K1, S, xoff(rs2));
                         K1
@@ -1270,7 +1648,6 @@ impl<'m> Jit<'m> {
         }
 
         // block end without a terminator
-        let last = kinds[n - 1];
         if !matches!(last, Kind::Branch | Kind::Jal | Kind::Jalr) {
             if end_interp {
                 call!(K1, r.interp_exit);
@@ -1282,14 +1659,13 @@ impl<'m> Jit<'m> {
 
         let end = a.pos();
         assert!(!a.overflowed(), "code buffer overflow");
-        assert!(end - header < 1024, "block too long for meta words");
         self.pos = end;
         fence_i();
 
         self.stats.blocks += 1;
         self.stats.guest_insns_translated += n as u64;
         self.stats.code_words += (end - header) as u64;
-        self.insert(pc0, pa0, start as u32);
+        self.insert(pc0, pa0, header);
         start as u32
     }
 
@@ -1330,7 +1706,7 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn chain(&mut self, cpu: &mut Cpu, slot_addr: usize, target: u32) {
         let generation = self.generation;
-        let Ok((pa, _)) = cpu.translate_pc(target) else { return };
+        let Ok((pa, host)) = cpu.translate_pc(target) else { return };
         let code = match self.lookup(target, pa) {
             Some(c) => c,
             None => self.translate(cpu, target, pa),
@@ -1338,6 +1714,8 @@ impl<'m> Jit<'m> {
         if code == NO_CODE || generation != self.generation {
             return;
         }
+        // the next step starts there: save it the lookup
+        self.next = Some((target, host, code));
         let slot = (slot_addr - self.code_base) / 4;
         let off = (code as isize - slot as isize) * 4;
         if (-(1 << 20)..(1 << 20)).contains(&off) {
@@ -1360,6 +1738,51 @@ impl<'m> Jit<'m> {
         }
     }
 
+    /// A `jal K3` site returning to host address `ret` left translated code
+    /// (TLB miss, MMIO, fault, misaligned access or jump target): set
+    /// `exit_pc` to its instruction and refund the budget for the
+    /// instructions from that one to the end of the block, which did not run.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn mem_exit(&mut self, cpu: &mut Cpu, ret: usize) {
+        let site = (ret - self.code_base) / 4 - 1;
+        // back to the block's `jal K1, budget_exit`: no other word is a jal
+        // there (guest pcs in data words are 4-aligned; instructions are not)
+        let mut p = site - 1;
+        while !(self.code[p] & 0xFFF == (K1 << 7) | 0x6F
+            && p as isize + (jal_off(self.code[p]) / 4) as isize == self.r.budget_exit as isize)
+        {
+            p -= 1;
+        }
+        let entry = p + 1;
+        let pc0 = self.code[p - 1];
+        let n = -((self.code[entry] as i32) >> 20) as u32;
+        let before = self.code[entry..site].iter().filter(|&&w| w & 0xFFF == (K3 << 7) | 0x6F).count();
+        // the guest instruction with that many sites before it
+        let pa0 = match cpu.tlb_probe(pc0, ACC_X) {
+            Some(pa) => pa,
+            None => cpu.translate_pc(pc0).map(|(pa, _)| pa).expect("mem exit: block page unmapped"),
+        };
+        let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
+        let (mut k, mut seen) = (0u32, 0usize);
+        loop {
+            // SAFETY: instruction k of the block, in the same guest RAM page.
+            let insn = unsafe { ((host0 + 4 * k as usize) as *const u32).read() };
+            seen += match classify(insn, pc0.wrapping_add(4 * k), cpu.privilege == Priv::S) {
+                Kind::Load | Kind::Store | Kind::Jalr => 1,
+                Kind::Amo => 2,
+                Kind::Csr => csr_sites(insn),
+                Kind::LrSc => 1,
+                _ => 0,
+            };
+            if seen > before {
+                break;
+            }
+            k += 1;
+        }
+        cpu.jit.exit_pc = pc0.wrapping_add(4 * k);
+        cpu.jit.budget += (n - k) as i32;
+    }
+
     /// One dispatcher step: take an interrupt, interpret one instruction, or
     /// run translated code until it exits.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
@@ -1372,6 +1795,7 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn run_one_inner<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Event {
+        let next = self.next.take();
         if cpu.check_irq(bus) {
             self.force_interp = false;
             return Event::Irq;
@@ -1382,13 +1806,19 @@ impl<'m> Jit<'m> {
             return Event::Interp;
         }
         let pc = cpu.pc;
-        let Ok((pa, host)) = cpu.translate_pc(pc) else {
-            self.interp(cpu, bus); // raises the fetch fault
-            return Event::Interp;
-        };
-        let code = match self.lookup(pc, pa) {
-            Some(c) => c,
-            None => self.translate(cpu, pc, pa),
+        let (host, code) = match next {
+            Some((npc, host, code)) if npc == pc => (host, code),
+            _ => {
+                let Ok((pa, host)) = cpu.translate_pc(pc) else {
+                    self.interp(cpu, bus); // raises the fetch fault
+                    return Event::Interp;
+                };
+                let code = match self.lookup(pc, pa) {
+                    Some(c) => c,
+                    None => self.translate(cpu, pc, pa),
+                };
+                (host, code)
+            }
         };
         if code == NO_CODE {
             self.interp(cpu, bus);
@@ -1413,12 +1843,15 @@ impl<'m> Jit<'m> {
             enter(cpu, self.code_addr(code));
         }
         self.stats.h_code += host_instret() - t0;
+        let info = cpu.jit.exit_info;
+        if info & 3 == EXIT_MEM {
+            self.mem_exit(cpu, (info & !3) as usize);
+        }
         let executed = (budget - cpu.jit.budget) as u64;
         cpu.instret += executed;
         self.stats.jit_insns += executed;
         self.stats.entries += 1;
         cpu.pc = cpu.jit.exit_pc;
-        let info = cpu.jit.exit_info;
         match info & 3 {
             EXIT_JUMP => {
                 self.stats.exit_jump += 1;
@@ -1427,6 +1860,10 @@ impl<'m> Jit<'m> {
                 }
             }
             EXIT_INTERP => {
+                self.stats.exit_interp += 1;
+                self.force_interp = true;
+            }
+            EXIT_MEM => {
                 self.stats.exit_interp += 1;
                 self.force_interp = true;
             }
@@ -1456,10 +1893,10 @@ impl<'m> Jit<'m> {
     /// `block_info`, plus the words the translator emits for the block and
     /// the word index they were emitted at (valid until the next translation).
     pub fn block_code(&mut self, cpu: &mut Cpu, va: u32, pa: u32) -> (BlockInfo, &[u32], usize) {
-        let sc = scan(cpu, va, pa);
+        let sc = scan(cpu, va, pa, &mut [MaybeUninit::uninit(); MAX_BLOCK]);
         let end = match sc.n {
             0 => BlockEnd::Interp,
-            n => match sc.kinds[n - 1] {
+            _ => match sc.last {
                 Kind::Branch => BlockEnd::Branch,
                 Kind::Jal => BlockEnd::Jal,
                 Kind::Jalr => BlockEnd::Jalr,
@@ -1470,7 +1907,7 @@ impl<'m> Jit<'m> {
         if sc.n == 0 {
             return (BlockInfo { n: 0, words: 0, end }, &[], self.pos);
         }
-        let (pos, nblocks, nblk) = (self.pos, self.nblocks, self.ring.nblk);
+        let pos = self.pos;
         let h = self.hash(va, pa);
         let head = self.buckets[h];
         let stats = self.stats;
@@ -1479,8 +1916,6 @@ impl<'m> Jit<'m> {
         self.measure_only = false;
         let words = (self.pos - pos) as u32;
         self.pos = pos;
-        self.nblocks = nblocks;
-        self.ring.nblk = nblk;
         self.buckets[h] = head;
         self.stats = stats;
         (BlockInfo { n: sc.n as u32, words, end }, &self.code[pos..pos + words as usize], pos)
@@ -1499,8 +1934,5 @@ impl<'m> Jit<'m> {
 
     pub fn code_words_used(&self) -> usize {
         self.pos - self.code_start
-    }
-    pub fn blocks_live(&self) -> usize {
-        self.nblocks
     }
 }

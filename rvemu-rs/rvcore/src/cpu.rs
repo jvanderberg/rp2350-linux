@@ -105,6 +105,11 @@ pub struct JitRegs {
     pub tlb_cur: [usize; ACC_N],
     /// Translator's jump cache (owned by the translator; 0 if none).
     pub jc_base: usize,
+    /// Pending and enabled interrupts (`sip & sie`) at the last
+    /// `check_irq`, which the dispatcher calls before entering translated
+    /// code; they cannot change while it runs. Translated code that sets
+    /// sstatus.SIE exits to the dispatcher if any.
+    pub irq_pending: u32,
 }
 
 #[repr(C)]
@@ -134,8 +139,9 @@ pub struct Cpu {
     pub stimecmp: u64,
     pub instret: u64,
     pub time_skip: u64,
-    pub(crate) res_valid: bool,
-    pub(crate) res_addr: u32,
+    /// LR/SC reservation (a translator does LR/SC itself)
+    pub res_valid: bool,
+    pub res_addr: u32,
 
     pub(crate) ram: *mut u8,
     pub(crate) ram_base: u32,
@@ -215,7 +221,7 @@ impl Cpu {
         Cpu {
             x: [0; 32],
             pc: entry,
-            jit: JitRegs { budget: 0, exit_pc: 0, exit_info: 0, host_sp: 0, tlb_cur: [0; ACC_N], jc_base: 0 },
+            jit: JitRegs { budget: 0, exit_pc: 0, exit_info: 0, host_sp: 0, tlb_cur: [0; ACC_N], jc_base: 0, irq_pending: 0 },
             privilege: Priv::S,
             mmu_idx: MMU_S,
             sie_bit: false,
@@ -344,6 +350,8 @@ impl Cpu {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn check_irq<B: Bus>(&mut self, bus: &B) -> bool {
         let p = self.sip_value(bus) & self.sie;
+        // for translated code that sets SIE (rvjit)
+        self.jit.irq_pending = p;
         if p == 0 || (self.privilege == Priv::S && !self.sie_bit) {
             return false;
         }
@@ -386,13 +394,7 @@ impl Cpu {
             return Err(exc::ILLEGAL);
         }
         Ok(match csr {
-            0x100 => {
-                (self.sie_bit as u32) << 1
-                    | (self.spie as u32) << 5
-                    | (self.spp as u32) << 8
-                    | (self.sum as u32) << 18
-                    | (self.mxr as u32) << 19
-            }
+            0x100 => self.sstatus(),
             0x104 => self.sie,
             0x105 => self.stvec,
             0x106 => self.scounteren,
@@ -404,6 +406,28 @@ impl Cpu {
             0x180 => self.satp,
             _ => return Err(exc::ILLEGAL),
         })
+    }
+
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn sstatus(&self) -> u32 {
+        (self.sie_bit as u32) << 1
+            | (self.spie as u32) << 5
+            | (self.spp as u32) << 8
+            | (self.sum as u32) << 18
+            | (self.mxr as u32) << 19
+    }
+
+    /// `csrrw` (op 1), `csrrs` (2) or `csrrc` (3) of sstatus with operand
+    /// `src`, in S-mode, for a translator.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn sstatus_op(&mut self, op: u32, src: u32) {
+        let old = self.sstatus();
+        let nv = match op {
+            1 => src,
+            2 => old | src,
+            _ => old & !src,
+        };
+        let _ = self.csr_write(0x100, nv);
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
