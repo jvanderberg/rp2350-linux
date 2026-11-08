@@ -55,35 +55,19 @@ pub struct Asm<'a> {
     buf: &'a mut [u32],
     base: usize,
     pos: usize,
-    /// `vpos() - pos()`
-    shift: isize,
     overflow: bool,
 }
 
 impl<'a> Asm<'a> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn new(buf: &'a mut [u32], base: usize) -> Self {
-        Asm { buf, base, pos: 0, shift: 0, overflow: false }
+        Asm { buf, base, pos: 0, overflow: false }
     }
 
     /// Continue emitting at word `pos` of `buf`.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn at(buf: &'a mut [u32], base: usize, pos: usize) -> Self {
-        Asm { buf, base, pos, shift: 0, overflow: false }
-    }
-
-    /// Emit from `buf[0]` as if at word `virt` of the code buffer: jumps
-    /// into the shared routines (`vpos()`-relative) then hold once the words
-    /// are copied to `virt`, or relinked from there.
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    pub fn at_virtual(buf: &'a mut [u32], virt: usize) -> Self {
-        Asm { buf, base: 0, pos: 0, shift: virt as isize, overflow: false }
-    }
-
-    /// Word index in the code buffer the next word is emitted for.
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    pub fn vpos(&self) -> isize {
-        self.pos as isize + self.shift
+        Asm { buf, base, pos, overflow: false }
     }
 
     /// Number of words emitted.

@@ -169,11 +169,6 @@ pub struct JitStats {
     pub restore_words: u64,
     /// laps of the backing store's log
     pub store_resets: u64,
-    /// blocks the prefetcher had ready, and their words; ones overwritten
-    /// while being copied
-    pub prefetched: u64,
-    pub prefetch_words: u64,
-    pub prefetch_lost: u64,
     /// Interpreted instructions by major opcode.
     pub interp_op: [u64; 128],
     /// Host instructions spent (riscv32 hosts; minstret based).
@@ -216,9 +211,6 @@ impl Default for JitStats {
             restores: 0,
             restore_words: 0,
             store_resets: 0,
-            prefetched: 0,
-            prefetch_words: 0,
-            prefetch_lost: 0,
             interp_op: [0; 128],
             h_translate: 0,
             h_interp: 0,
@@ -380,7 +372,7 @@ fn emit_lrsc<'a>(mut a: Asm<'a>, r: &Routines, insn: u32) -> Asm<'a> {
     let rs2 = (insn >> 20) & 31;
     macro_rules! call {
         ($link:expr, $to:expr) => {{
-            let off = ($to as isize - a.vpos()) * 4;
+            let off = ($to as isize - a.pos() as isize) * 4;
             a.emit(j_type($link, off as i32));
         }};
     }
@@ -450,7 +442,7 @@ fn emit_csr<'a>(mut a: Asm<'a>, r: &Routines, insn: u32, pc: u32, left: usize) -
     let f3 = (insn >> 12) & 7;
     macro_rules! call {
         ($link:expr, $to:expr) => {{
-            let off = ($to as isize - a.vpos()) * 4;
+            let off = ($to as isize - a.pos() as isize) * 4;
             a.emit(j_type($link, off as i32));
         }};
     }
@@ -580,14 +572,9 @@ fn emit_csr<'a>(mut a: Asm<'a>, r: &Routines, insn: u32, pc: u32, left: usize) -
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn scan(cpu: &Cpu, pc0: u32, pa0: u32, kinds: &mut Kinds) -> Scan {
     let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
-    scan_host(host0, cpu.privilege == Priv::S, pc0, kinds)
-}
-
-/// `scan` of the block whose first instruction is at host address `host0`.
-#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-fn scan_host(host0: usize, sup: bool, pc0: u32, kinds: &mut Kinds) -> Scan {
     // instructions left in the page
     let max = (((0x1000 - (pc0 & 0xFFF)) >> 2) as usize).min(MAX_BLOCK);
+    let sup = cpu.privilege == Priv::S;
     // header, prologue and the closing jump
     let mut s = Scan { host0, n: 0, last: Kind::Interp, end_interp: false };
     while s.n < max {
@@ -604,242 +591,6 @@ fn scan_host(host0: usize, sup: bool, pc0: u32, kinds: &mut Kinds) -> Scan {
         }
     }
     s
-}
-
-/// Pass 2: the code for block `sc` (guest `pc0` / `pa0`), header first.
-#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-fn codegen<'a>(mut a: Asm<'a>, r: &Routines, native_amo: bool, sc: &Scan, kinds: &Kinds, pc0: u32, pa0: u32) -> Asm<'a> {
-    let &Scan { host0, n, last, end_interp } = sc;
-    let pc = pc0.wrapping_add(4 * n as u32);
-
-    // `jal link, routine` (the buffer is at most 1 MiB, so always in range)
-    macro_rules! call {
-        ($link:expr, $to:expr) => {{
-            let off = ($to as isize - a.vpos()) * 4;
-            a.emit(j_type($link, off as i32));
-        }};
-    }
-
-    // header word (guest pc), the budget exit, then the entry point:
-    // `addi KB, KB, -n; blt KB, zero, <the budget exit>`
-    a.emit(EMPTY); // HDR_NEXT, HDR_PA: filled in by `insert`
-    a.emit(pa0);
-    a.emit(pc0);
-    call!(K1, r.budget_exit);
-    a.addi(KB, KB, -(n as i32));
-    a.emit(b_type(4, KB, ZERO, -8));
-    let same_page = |t: u32| t & !0xFFF == pc0 & !0xFFF;
-    // jump to a known guest pc: chainable slot if same page, else jump cache
-    macro_rules! goto_pc {
-        ($target:expr) => {{
-            let t: u32 = $target;
-            call!(K1, if same_page(t) { r.chain_req } else { r.ijmp_imm });
-            a.emit(t);
-        }};
-    }
-
-    for (k, kind) in kinds[..n].iter().enumerate() {
-        let insn = insn_at(host0, k);
-        let pc = pc0.wrapping_add(4 * k as u32);
-        // SAFETY: scan() wrote kinds[..n].
-        let kind = unsafe { kind.assume_init() };
-        let rd = (insn >> 7) & 31;
-        let rs1 = (insn >> 15) & 31;
-        let rs2 = (insn >> 20) & 31;
-        let f3 = (insn >> 12) & 7;
-        match kind {
-            Kind::Alu { rs1: u1, rs2: u2 } => {
-                let mut w = insn;
-                if u1 && spilled(rs1) {
-                    a.lw(K0, S, xoff(rs1));
-                    w = (w & !(31 << 15)) | (K0 << 15);
-                }
-                if u2 && spilled(rs2) {
-                    a.lw(K1, S, xoff(rs2));
-                    w = (w & !(31 << 20)) | (K1 << 20);
-                }
-                if spilled(rd) {
-                    a.emit((w & !(31 << 7)) | (K2 << 7));
-                    a.sw(K2, S, xoff(rd));
-                } else {
-                    a.emit(w);
-                }
-            }
-            Kind::Auipc => {
-                if rd != 0 {
-                    let v = pc.wrapping_add(insn & 0xFFFF_F000);
-                    if spilled(rd) {
-                        a.li(K2, v);
-                        a.sw(K2, S, xoff(rd));
-                    } else {
-                        a.li(rd, v);
-                    }
-                }
-            }
-            Kind::Load | Kind::Store => {
-                let store = kind == Kind::Store;
-                let imm = if store { imm_s(insn) } else { imm_i(insn) };
-                if spilled(rs1) {
-                    a.lw(K0, S, xoff(rs1));
-                    if imm != 0 {
-                        a.addi(K0, K0, imm);
-                    }
-                } else {
-                    a.addi(K0, rs1, imm);
-                }
-                call!(K3, r.helper[store as usize][(f3 & 3) as usize]);
-                if store {
-                    if spilled(rs2) {
-                        a.lw(K1, S, xoff(rs2));
-                        a.store(f3, K1, K0, 0);
-                    } else {
-                        a.store(f3, rs2, K0, 0);
-                    }
-                } else if spilled(rd) {
-                    a.load(f3, K1, K0, 0);
-                    a.sw(K1, S, xoff(rd));
-                } else {
-                    a.load(f3, rd, K0, 0);
-                }
-            }
-            Kind::Branch => {
-                let r1 = if spilled(rs1) {
-                    a.lw(K0, S, xoff(rs1));
-                    K0
-                } else {
-                    rs1
-                };
-                let r2 = if spilled(rs2) {
-                    a.lw(K1, S, xoff(rs2));
-                    K1
-                } else {
-                    rs2
-                };
-                a.emit(b_type(f3 ^ 1, r1, r2, 12)); // not taken: skip slot + word
-                goto_pc!(pc.wrapping_add(imm_b(insn) as u32));
-                goto_pc!(pc.wrapping_add(4));
-            }
-            Kind::Jal => {
-                if rd != 0 {
-                    let link = pc.wrapping_add(4);
-                    if spilled(rd) {
-                        a.li(K2, link);
-                        a.sw(K2, S, xoff(rd));
-                    } else {
-                        a.li(rd, link);
-                    }
-                }
-                goto_pc!(pc.wrapping_add(imm_j(insn) as u32));
-            }
-            Kind::Jalr => {
-                if spilled(rs1) {
-                    a.lw(K0, S, xoff(rs1));
-                    a.addi(K0, K0, imm_i(insn));
-                } else {
-                    a.addi(K0, rs1, imm_i(insn));
-                }
-                a.andi(K0, K0, -2);
-                // misaligned target: let the interpreter raise it
-                a.andi(K1, K0, 2);
-                a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
-                call!(K3, r.mem_miss);
-                if rd != 0 {
-                    let link = pc.wrapping_add(4);
-                    if spilled(rd) {
-                        a.li(K2, link);
-                        a.sw(K2, S, xoff(rd));
-                    } else {
-                        a.li(rd, link);
-                    }
-                }
-                call!(ZERO, r.ijmp);
-            }
-            Kind::Nop => {}
-            Kind::Csr => a = emit_csr(a, r, insn, pc, n - 1 - k),
-            Kind::LrSc => a = emit_lrsc(a, r, insn),
-            Kind::Amo => {
-                // misaligned AMOs and every slow case go to the interpreter
-                if spilled(rs1) {
-                    a.lw(K0, S, xoff(rs1));
-                } else {
-                    a.addi(K0, rs1, 0);
-                }
-                a.andi(K1, K0, 3);
-                a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
-                call!(K3, r.mem_miss);
-                call!(K3, r.helper[1][2]);
-                let src = if spilled(rs2) {
-                    a.lw(K1, S, xoff(rs2));
-                    K1
-                } else {
-                    rs2
-                };
-                if native_amo {
-                    let dst = if spilled(rd) { K2 } else { rd };
-                    // same funct5, aq/rl cleared, host registers substituted
-                    a.emit(r_type(0x2F, dst, 2, K0, src, (insn >> 27) << 2));
-                    if spilled(rd) {
-                        a.sw(K2, S, xoff(rd));
-                    }
-                } else {
-                    // K2 = old, K3 (free once the helper has returned) = new
-                    a.lw(K2, K0, 0);
-                    let new = match insn >> 27 {
-                        0x01 => src,
-                        0x00 => {
-                            a.add(K3, K2, src);
-                            K3
-                        }
-                        0x04 => {
-                            a.emit(r_type(0x33, K3, 4, K2, src, 0));
-                            K3
-                        }
-                        0x08 => {
-                            a.emit(r_type(0x33, K3, 6, K2, src, 0));
-                            K3
-                        }
-                        0x0C => {
-                            a.emit(r_type(0x33, K3, 7, K2, src, 0));
-                            K3
-                        }
-                        f5 => {
-                            // min/max[u]: new = old; if src beats old, new = src
-                            // (branch over the move when it does not)
-                            let skip_f3 = match f5 {
-                                0x10 => 5, // min:  bge  src, old
-                                0x14 => 4, // max:  blt  src, old
-                                0x18 => 7, // minu: bgeu src, old
-                                _ => 6,    // maxu: bltu src, old
-                            };
-                            a.addi(K3, K2, 0);
-                            a.emit(b_type(skip_f3, src, K2, 8));
-                            a.addi(K3, src, 0);
-                            K3
-                        }
-                    };
-                    a.sw(new, K0, 0);
-                    if spilled(rd) {
-                        a.sw(K2, S, xoff(rd));
-                    } else if rd != 0 {
-                        a.addi(rd, K2, 0);
-                    }
-                }
-            }
-            Kind::Interp => unreachable!(),
-        }
-    }
-
-    // block end without a terminator
-    if !matches!(last, Kind::Branch | Kind::Jal | Kind::Jalr) {
-        if end_interp {
-            call!(K1, r.interp_exit);
-            a.emit(pc);
-        } else {
-            goto_pc!(pc);
-        }
-    }
-
-    a
 }
 
 /// How a block ends (for the board-cost simulator in the Mac host).
@@ -958,59 +709,7 @@ pub struct Jit<'m> {
     pub native_amo: bool,
     /// set while `block_info` measures a block: translate without side effects
     measure_only: bool,
-    prefetch: Option<&'m mut dyn Prefetch>,
     pub stats: JitStats,
-}
-
-/// Blocks translated ahead of time somewhere else (another core), with
-/// `Gen::translate`. The translator tells it what it evicts and what it
-/// translates, and asks it first on every miss.
-pub trait Prefetch {
-    /// Block (va, pa) left the code buffer.
-    fn evicted(&mut self, va: u32, pa: u32);
-    /// Block (va, pa) was translated, in privilege S (`sup`) or U, while its
-    /// page's epoch was `epoch` (a store to the page, or a flush, changes the
-    /// epoch, retiring the page's translations). Its page is write
-    /// protected from now on until the epoch changes.
-    fn missed(&mut self, va: u32, pa: u32, sup: bool, epoch: u8);
-    /// The length of a ready translation of (va, pa, sup) made at `epoch`.
-    fn find(&mut self, va: u32, pa: u32, sup: bool, epoch: u8) -> Option<usize>;
-    /// Copy the translation `find` just named into `dst` (its length);
-    /// false if it was overwritten meanwhile (`dst` is then garbage).
-    fn copy(&mut self, dst: &mut [u32]) -> bool;
-}
-
-/// Block translation on its own, for a `Prefetch` (`Jit::block_gen`).
-#[derive(Clone, Copy)]
-pub struct Gen {
-    r: Routines,
-    native_amo: bool,
-    code_start: usize,
-    ram_host: usize,
-    ram_base: u32,
-    ram_size: u32,
-}
-
-impl Gen {
-    /// Translate block (va, pa) for privilege S (`sup`) or U into `buf`,
-    /// as `Jit::translate` would at the first block position (the words
-    /// `Prefetch::copy` hands back). Returns the words written: 0 if the
-    /// first instruction needs the interpreter, pa is outside guest RAM, or
-    /// `buf` is too small.
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    pub fn translate(&self, va: u32, pa: u32, sup: bool, buf: &mut [u32]) -> usize {
-        let off = pa.wrapping_sub(self.ram_base);
-        if off >= self.ram_size || pa & 3 != 0 || va & 0xFFF != pa & 0xFFF {
-            return 0;
-        }
-        let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
-        let sc = scan_host(self.ram_host + off as usize, sup, va, &mut kinds);
-        if sc.n == 0 {
-            return 0;
-        }
-        let a = codegen(Asm::at_virtual(buf, self.code_start), &self.r, self.native_amo, &sc, &kinds, va, pa);
-        if a.overflowed() { 0 } else { a.pos() }
-    }
 }
 
 /// Backing store (see the crate docs). Log entry: va, pa,
@@ -1127,7 +826,6 @@ impl<'m> Jit<'m> {
             next: None,
             native_amo: true,
             measure_only: false,
-            prefetch: None,
             stats: JitStats::default(),
         };
         j.emit_prelude();
@@ -1391,10 +1089,6 @@ impl<'m> Jit<'m> {
         // blocks from them must still see stores to them
         if self.store.nidx == 0 {
             self.code_pages.fill(0);
-            // (and blocks translated elsewhere from them are stale)
-            for e in self.store.epochs.iter_mut() {
-                *e = e.wrapping_add(1);
-            }
         }
         self.jc.fill(JcEntry::EMPTY);
         self.pos = self.code_start;
@@ -1454,30 +1148,18 @@ impl<'m> Jit<'m> {
             }
             if inr(i) {
                 self.buckets[h] = EMPTY;
-            } else {
-                loop {
-                    let next = self.code[i as usize + HDR_NEXT];
-                    if next == EMPTY {
-                        break;
-                    }
-                    if inr(next) {
-                        self.code[i as usize + HDR_NEXT] = EMPTY;
-                        i = next;
-                        break;
-                    }
-                    i = next;
-                }
-                if !inr(i) {
-                    continue;
-                }
+                continue;
             }
-            // `i` heads the evicted tail
-            if let Some(p) = self.prefetch.as_mut() {
-                while i != EMPTY {
-                    let b = i as usize;
-                    p.evicted(self.code[b + HDR_VA], self.code[b + HDR_PA]);
-                    i = self.code[b + HDR_NEXT];
+            loop {
+                let next = self.code[i as usize + HDR_NEXT];
+                if next == EMPTY {
+                    break;
                 }
+                if inr(next) {
+                    self.code[i as usize + HDR_NEXT] = EMPTY;
+                    break;
+                }
+                i = next;
             }
         }
         let base = r * self.ring.log_per;
@@ -1555,8 +1237,8 @@ impl<'m> Jit<'m> {
         let n = ((ppage - cpu.ram_base()) >> 12) as usize;
         self.code_pages[n >> 3] &= !(1 << (n & 7));
         self.stats.smc_invalidations += 1;
-        if let Some(e) = self.store.epochs.get_mut(n) {
-            *e = e.wrapping_add(1);
+        if self.store.nidx != 0 {
+            self.store.epochs[n] = self.store.epochs[n].wrapping_add(1);
         }
     }
 
@@ -1580,17 +1262,8 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         let t0 = host_instret();
-        let r = if let Some(r) = self.take_prefetched(cpu, pc0, pa0) {
-            r
-        } else if self.store.nidx == 0 {
-            let r = self.translate_inner(cpu, pc0, pa0);
-            if r != NO_CODE
-                && let Some(p) = self.prefetch.as_mut()
-            {
-                let epoch = self.store.epochs.get(((pa0 - cpu.ram_base()) >> 12) as usize).copied().unwrap_or(0);
-                p.missed(pc0, pa0, cpu.privilege == Priv::S, epoch);
-            }
-            r
+        let r = if self.store.nidx == 0 {
+            self.translate_inner(cpu, pc0, pa0)
         } else if let Some(e) = self.store_find(cpu, pc0, pa0) {
             self.restore(cpu, e)
         } else {
@@ -1602,23 +1275,6 @@ impl<'m> Jit<'m> {
         };
         self.stats.h_translate += host_instret() - t0;
         r
-    }
-
-    /// A copy of block (va, pa) the prefetcher has ready, put in place.
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    fn take_prefetched(&mut self, cpu: &mut Cpu, va: u32, pa: u32) -> Option<u32> {
-        let epoch = self.page_epoch(cpu, pa) as u8;
-        let words = self.prefetch.as_mut()?.find(va, pa, cpu.privilege == Priv::S, epoch)?;
-        self.make_room(words);
-        self.mark_code_page(cpu, pa);
-        let at = self.pos;
-        if !self.prefetch.as_mut()?.copy(&mut self.code[at..at + words]) {
-            self.stats.prefetch_lost += 1;
-            return None;
-        }
-        self.stats.prefetched += 1;
-        self.stats.prefetch_words += words as u64;
-        Some(self.relink(va, pa, at, words, self.code_start))
     }
 
     // ------------------------------------------------------------ backing store
@@ -1646,7 +1302,7 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn page_epoch(&self, cpu: &Cpu, pa: u32) -> u32 {
-        self.store.epochs.get(((pa - cpu.ram_base()) >> 12) as usize).map_or(0, |&e| u32::from(e))
+        u32::from(self.store.epochs[((pa - cpu.ram_base()) >> 12) as usize])
     }
 
     /// Log entry of a current stored copy of block (va, pa).
@@ -1719,17 +1375,8 @@ impl<'m> Jit<'m> {
         self.mark_code_page(cpu, pa);
         let at = self.pos;
         self.code[at..at + words].copy_from_slice(&self.store.mem[e + STORE_HDR..e + STORE_HDR + words]);
-        self.stats.restores += 1;
-        self.stats.restore_words += words as u64;
-        self.relink(va, pa, at, words, orig)
-    }
-
-    /// Re-point the jals into the shared routines of the `words` just copied
-    /// to word `at` (emitted for word `orig`), stepping over the data word
-    /// after a chain / jump / interp request; then make the block the
-    /// newest one. Returns its entry point.
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    fn relink(&mut self, va: u32, pa: u32, at: usize, words: usize, orig: usize) -> u32 {
+        // re-point the jals into the shared routines, stepping over the
+        // data word after a chain / jump / interp request
         let r = self.r;
         let mut i = HDR_VA + 1;
         while i < words {
@@ -1751,6 +1398,8 @@ impl<'m> Jit<'m> {
         }
         self.pos = at + words;
         fence_i();
+        self.stats.restores += 1;
+        self.stats.restore_words += words as u64;
         self.insert(va, pa, at);
         (at + ENTRY_OFF) as u32
     }
@@ -1759,33 +1408,265 @@ impl<'m> Jit<'m> {
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         // pass 1: find the block
         let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
-        let sc = scan(cpu, pc0, pa0, &mut kinds);
+        let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0, &mut kinds);
+        let pc = pc0.wrapping_add(4 * n as u32);
 
         // (no-code blocks are not kept: scanning one instruction again is
         // about as cheap as looking it up)
-        if sc.n == 0 {
+        if n == 0 {
             return NO_CODE;
         }
         // room for the worst case (measuring never keeps the block)
         if !self.measure_only {
-            self.make_room(sc.n * MAX_WORDS + 16 + ENTRY_OFF);
+            self.make_room(n * MAX_WORDS + 16 + ENTRY_OFF);
         }
         if !self.measure_only {
             self.mark_code_page(cpu, pa0);
         }
 
-        let header = self.pos;
-        let a = codegen(Asm::at(self.code, self.code_base, header), &self.r, self.native_amo, &sc, &kinds, pc0, pa0);
+        let r = &self.r;
+        let mut a = Asm::at(self.code, self.code_base, self.pos);
+
+        // `jal link, routine` (the buffer is at most 1 MiB, so always in range)
+        macro_rules! call {
+            ($link:expr, $to:expr) => {{
+                let off = ($to as isize - a.pos() as isize) * 4;
+                a.emit(j_type($link, off as i32));
+            }};
+        }
+
+        // header word (guest pc), the budget exit, then the entry point:
+        // `addi KB, KB, -n; blt KB, zero, <the budget exit>`
+        let header = a.pos();
+        a.emit(EMPTY); // HDR_NEXT, HDR_PA: filled in by `insert`
+        a.emit(pa0);
+        a.emit(pc0);
+        call!(K1, r.budget_exit);
+        let start = a.pos();
+        a.addi(KB, KB, -(n as i32));
+        a.emit(b_type(4, KB, ZERO, -8));
+        let same_page = |t: u32| t & !0xFFF == pc0 & !0xFFF;
+        // jump to a known guest pc: chainable slot if same page, else jump cache
+        macro_rules! goto_pc {
+            ($target:expr) => {{
+                let t: u32 = $target;
+                call!(K1, if same_page(t) { r.chain_req } else { r.ijmp_imm });
+                a.emit(t);
+            }};
+        }
+
+        for (k, kind) in kinds[..n].iter().enumerate() {
+            let insn = insn_at(host0, k);
+            let pc = pc0.wrapping_add(4 * k as u32);
+            // SAFETY: scan() wrote kinds[..n].
+            let kind = unsafe { kind.assume_init() };
+            let rd = (insn >> 7) & 31;
+            let rs1 = (insn >> 15) & 31;
+            let rs2 = (insn >> 20) & 31;
+            let f3 = (insn >> 12) & 7;
+            match kind {
+                Kind::Alu { rs1: u1, rs2: u2 } => {
+                    let mut w = insn;
+                    if u1 && spilled(rs1) {
+                        a.lw(K0, S, xoff(rs1));
+                        w = (w & !(31 << 15)) | (K0 << 15);
+                    }
+                    if u2 && spilled(rs2) {
+                        a.lw(K1, S, xoff(rs2));
+                        w = (w & !(31 << 20)) | (K1 << 20);
+                    }
+                    if spilled(rd) {
+                        a.emit((w & !(31 << 7)) | (K2 << 7));
+                        a.sw(K2, S, xoff(rd));
+                    } else {
+                        a.emit(w);
+                    }
+                }
+                Kind::Auipc => {
+                    if rd != 0 {
+                        let v = pc.wrapping_add(insn & 0xFFFF_F000);
+                        if spilled(rd) {
+                            a.li(K2, v);
+                            a.sw(K2, S, xoff(rd));
+                        } else {
+                            a.li(rd, v);
+                        }
+                    }
+                }
+                Kind::Load | Kind::Store => {
+                    let store = kind == Kind::Store;
+                    let imm = if store { imm_s(insn) } else { imm_i(insn) };
+                    if spilled(rs1) {
+                        a.lw(K0, S, xoff(rs1));
+                        if imm != 0 {
+                            a.addi(K0, K0, imm);
+                        }
+                    } else {
+                        a.addi(K0, rs1, imm);
+                    }
+                    call!(K3, r.helper[store as usize][(f3 & 3) as usize]);
+                    if store {
+                        if spilled(rs2) {
+                            a.lw(K1, S, xoff(rs2));
+                            a.store(f3, K1, K0, 0);
+                        } else {
+                            a.store(f3, rs2, K0, 0);
+                        }
+                    } else if spilled(rd) {
+                        a.load(f3, K1, K0, 0);
+                        a.sw(K1, S, xoff(rd));
+                    } else {
+                        a.load(f3, rd, K0, 0);
+                    }
+                }
+                Kind::Branch => {
+                    let r1 = if spilled(rs1) {
+                        a.lw(K0, S, xoff(rs1));
+                        K0
+                    } else {
+                        rs1
+                    };
+                    let r2 = if spilled(rs2) {
+                        a.lw(K1, S, xoff(rs2));
+                        K1
+                    } else {
+                        rs2
+                    };
+                    a.emit(b_type(f3 ^ 1, r1, r2, 12)); // not taken: skip slot + word
+                    goto_pc!(pc.wrapping_add(imm_b(insn) as u32));
+                    goto_pc!(pc.wrapping_add(4));
+                }
+                Kind::Jal => {
+                    if rd != 0 {
+                        let link = pc.wrapping_add(4);
+                        if spilled(rd) {
+                            a.li(K2, link);
+                            a.sw(K2, S, xoff(rd));
+                        } else {
+                            a.li(rd, link);
+                        }
+                    }
+                    goto_pc!(pc.wrapping_add(imm_j(insn) as u32));
+                }
+                Kind::Jalr => {
+                    if spilled(rs1) {
+                        a.lw(K0, S, xoff(rs1));
+                        a.addi(K0, K0, imm_i(insn));
+                    } else {
+                        a.addi(K0, rs1, imm_i(insn));
+                    }
+                    a.andi(K0, K0, -2);
+                    // misaligned target: let the interpreter raise it
+                    a.andi(K1, K0, 2);
+                    a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+                    call!(K3, r.mem_miss);
+                    if rd != 0 {
+                        let link = pc.wrapping_add(4);
+                        if spilled(rd) {
+                            a.li(K2, link);
+                            a.sw(K2, S, xoff(rd));
+                        } else {
+                            a.li(rd, link);
+                        }
+                    }
+                    let j = a.jump_fwd();
+                    a.fix(j, r.ijmp);
+                }
+                Kind::Nop => {}
+                Kind::Csr => a = emit_csr(a, r, insn, pc, n - 1 - k),
+                Kind::LrSc => a = emit_lrsc(a, r, insn),
+                Kind::Amo => {
+                    // misaligned AMOs and every slow case go to the interpreter
+                    if spilled(rs1) {
+                        a.lw(K0, S, xoff(rs1));
+                    } else {
+                        a.addi(K0, rs1, 0);
+                    }
+                    a.andi(K1, K0, 3);
+                    a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+                    call!(K3, r.mem_miss);
+                    call!(K3, r.helper[1][2]);
+                    let src = if spilled(rs2) {
+                        a.lw(K1, S, xoff(rs2));
+                        K1
+                    } else {
+                        rs2
+                    };
+                    if self.native_amo {
+                        let dst = if spilled(rd) { K2 } else { rd };
+                        // same funct5, aq/rl cleared, host registers substituted
+                        a.emit(r_type(0x2F, dst, 2, K0, src, (insn >> 27) << 2));
+                        if spilled(rd) {
+                            a.sw(K2, S, xoff(rd));
+                        }
+                    } else {
+                        // K2 = old, K3 (free once the helper has returned) = new
+                        a.lw(K2, K0, 0);
+                        let new = match insn >> 27 {
+                            0x01 => src,
+                            0x00 => {
+                                a.add(K3, K2, src);
+                                K3
+                            }
+                            0x04 => {
+                                a.emit(r_type(0x33, K3, 4, K2, src, 0));
+                                K3
+                            }
+                            0x08 => {
+                                a.emit(r_type(0x33, K3, 6, K2, src, 0));
+                                K3
+                            }
+                            0x0C => {
+                                a.emit(r_type(0x33, K3, 7, K2, src, 0));
+                                K3
+                            }
+                            f5 => {
+                                // min/max[u]: new = old; if src beats old, new = src
+                                // (branch over the move when it does not)
+                                let skip_f3 = match f5 {
+                                    0x10 => 5, // min:  bge  src, old
+                                    0x14 => 4, // max:  blt  src, old
+                                    0x18 => 7, // minu: bgeu src, old
+                                    _ => 6,    // maxu: bltu src, old
+                                };
+                                a.addi(K3, K2, 0);
+                                a.emit(b_type(skip_f3, src, K2, 8));
+                                a.addi(K3, src, 0);
+                                K3
+                            }
+                        };
+                        a.sw(new, K0, 0);
+                        if spilled(rd) {
+                            a.sw(K2, S, xoff(rd));
+                        } else if rd != 0 {
+                            a.addi(rd, K2, 0);
+                        }
+                    }
+                }
+                Kind::Interp => unreachable!(),
+            }
+        }
+
+        // block end without a terminator
+        if !matches!(last, Kind::Branch | Kind::Jal | Kind::Jalr) {
+            if end_interp {
+                call!(K1, r.interp_exit);
+                a.emit(pc);
+            } else {
+                goto_pc!(pc);
+            }
+        }
+
         let end = a.pos();
         assert!(!a.overflowed(), "code buffer overflow");
         self.pos = end;
         fence_i();
 
         self.stats.blocks += 1;
-        self.stats.guest_insns_translated += sc.n as u64;
+        self.stats.guest_insns_translated += n as u64;
         self.stats.code_words += (end - header) as u64;
         self.insert(pc0, pa0, header);
-        (header + ENTRY_OFF) as u32
+        start as u32
     }
 
     // ------------------------------------------------------------ dispatch
@@ -2048,23 +1929,6 @@ impl<'m> Jit<'m> {
         } else {
             let n = ((pa - cpu.ram_base()) >> 12) as usize;
             self.code_pages[n >> 3] &= !(1 << (n & 7));
-        }
-    }
-
-    /// Ask `p` on every miss from now on (set before running any code).
-    pub fn set_prefetch(&mut self, p: &'m mut dyn Prefetch) {
-        self.prefetch = Some(p);
-    }
-
-    /// A block translator for a `Prefetch` (after `native_amo` is set).
-    pub fn block_gen(&self, cpu: &Cpu) -> Gen {
-        Gen {
-            r: self.r,
-            native_amo: self.native_amo,
-            code_start: self.code_start,
-            ram_host: cpu.ram_ptr() as usize,
-            ram_base: cpu.ram_base(),
-            ram_size: cpu.ram_size(),
         }
     }
 
