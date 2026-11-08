@@ -15,7 +15,6 @@ stage=${1:-all}
 # holds only this checkout's packages.
 fresh_target() {   # BR_OUT FILES...
   local o=$1; shift
-  # (find fails on paths that don't exist, such as an absent br-external)
   local sum; sum=$(cd /guest && { find "$@" -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
   if [[ -d $o/target && "$(cat "$o/.config-sum" 2>/dev/null)" != "$sum" ]]; then
     echo "build.sh: configuration changed since the last build in $o: fresh target/"
