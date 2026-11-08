@@ -123,22 +123,3 @@ it wrote under `rvemu-rs/target/` and skips writes when nothing changed
 Every board run of the benchmark firmware matches the Mac's instruction
 count and console bytes exactly. The emulator is deterministic: guest time
 is retired instructions plus skipped idle time.
-
-## Known issues
-
-- **Bit flips after the Wi-Fi join (unresolved).** After the radio joined
-  Wi-Fi, one boot hung so hard that SWD stopped answering, and only a power
-  cycle recovered it. Another boot got a userland segfault in libc `strchr`
-  with pointer 0xefd27f00: a valid address (0x6fd27f00) with bit 31 flipped.
-  The untested hypothesis is that the radio's transmit current spikes disturb
-  the overclocked system (348 MHz at 1.20 V, PSRAM at 116 MHz). The planned
-  A/B test: checksum `/usr/bin` and `/lib` repeatedly, with the radio joined
-  and with it idle. Then try power-save mode, a slower PSRAM clock and stock
-  clocks.
-- **Translator code-cache thrashing** with the disk userland: 2,595
-  evictions per boot. Translation is about half of host time (QEMU
-  `-icount`: 31 host instructions per guest instruction).
-- **An intermittent host trap** (`mcause=1`, instruction access fault) seen
-  once, while probe-rs was attached.
-- **SWD flakiness:** probe-rs sometimes fails with "Error during transport".
-  Retrying usually works, and loading over USB doesn't use SWD.

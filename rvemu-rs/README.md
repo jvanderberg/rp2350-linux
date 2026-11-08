@@ -110,7 +110,7 @@ counters.
 
 With the disk guest, lockstep matches through boot to `login:` (2,517,290
 events). Translation is about half of host time, at 31 host instructions per
-guest instruction under `-icount` (see the top-level README, known issues).
+guest instruction under `-icount`.
 
 ## On the RP2350 (`rvemu-pico/`)
 
