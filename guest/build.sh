@@ -47,6 +47,11 @@ if [[ $stage == disk* ]]; then
       mkdir -p "$K" && curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar xJ -C "$K" --strip-components=1
     fi
     cd "$K"
+    # the rvemu machine's own drivers (guest/linux/drivers/rvemu); each one
+    # is off unless its Kconfig symbol is set
+    rm -rf drivers/rvemu && cp -r /guest/linux/drivers/rvemu drivers/rvemu
+    grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
+    grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
     make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
     scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment
     make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig

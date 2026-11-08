@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0
+# Devices of the rvemu machine (rvemu-rs/rvcore/src/periph.rs): the RP2350's
+# GPIO, PWM and ADC as the emulator presents them. guest/build.sh copies this
+# directory into the kernel tree.
+
+config RVEMU_GPIO
+	bool "rvemu GPIO controller"
+	depends on GPIOLIB && OF
+	select GPIOLIB_IRQCHIP
+	help
+	  The rvemu machine's GPIO controller: the RP2350's pads, with pulls
+	  and edge interrupts.
+
+config RVEMU_PWM
+	bool "rvemu PWM controller"
+	depends on PWM && OF
+	help
+	  The rvemu machine's PWM controller: one channel per GPIO, on the
+	  RP2350's PWM slices.
+
+config RVEMU_ADC
+	bool "rvemu ADC"
+	depends on IIO && OF
+	help
+	  The rvemu machine's ADC: the RP2350B's ADC inputs GP40-GP47 and its
+	  temperature sensor.

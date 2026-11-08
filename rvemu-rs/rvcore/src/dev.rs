@@ -1,8 +1,10 @@
 //! Platform devices: 16550-style UART, a single-context SiFive PLIC (hart 0,
-//! S-mode) and optional virtio-mmio block and network devices. The host
-//! supplies the console, the disk and the network link.
+//! S-mode), optional virtio-mmio block and network devices, and optionally
+//! the board's pins (`periph`). The host supplies the console, the disk,
+//! the network link and the pins.
 
 use crate::cpu::exc;
+use crate::periph::{IO_BASE, IO_SIZE, Io, NoPins, Pins};
 use crate::virtio::{
     Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE,
     VirtioBlk, VirtioNet,
@@ -186,20 +188,27 @@ impl Uart {
     }
 }
 
-/// UART + PLIC (+ disk, + network) wired together, generic over the host
-/// console, disk and network link.
-pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet> {
+/// UART + PLIC (+ disk, + network, + pins) wired together, generic over the
+/// host console, disk, network link and pins.
+pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet, P: Pins = NoPins> {
     pub uart: Uart,
     pub plic: Plic,
     pub con: C,
     pub blk: Option<VirtioBlk<D>>,
     pub net: Option<VirtioNet<N>>,
+    pub io: Option<Io<P>>,
 }
 
-impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
+impl<C: Console, D: Disk, N: NetLink, P: Pins> Platform<C, D, N, P> {
     /// UART and PLIC only.
     pub fn new(con: C) -> Self {
-        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None }
+        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, io: None }
+    }
+
+    /// Add the GPIO, I2C, SPI, PWM and ADC devices at `IO_BASE` on `pins`.
+    pub fn with_io(mut self, pins: P, mem: GuestMem) -> Self {
+        self.io = Some(Io::new(pins, mem));
+        self
     }
 
     /// Add a virtio block device at `VIRTIO_BASE` reading and writing `mem`.
@@ -226,13 +235,22 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
             n.poll();
             self.plic.set_level(VIRTIO_NET_IRQ, n.irq_line());
         }
+        if let Some(io) = &mut self.io {
+            io.poll();
+            for (irq, high) in io.irq_lines() {
+                self.plic.set_level(irq, high);
+            }
+        }
     }
 
     pub fn take_dma_write(&mut self) -> Option<(u32, u32)> {
         if let Some(r) = self.blk.as_mut().and_then(|b| b.take_dma_write()) {
             return Some(r);
         }
-        self.net.as_mut().and_then(|n| n.take_dma_write())
+        if let Some(r) = self.net.as_mut().and_then(|n| n.take_dma_write()) {
+            return Some(r);
+        }
+        self.io.as_mut().and_then(|io| io.take_dma_write())
     }
 
     pub fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
@@ -255,6 +273,13 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
             && pa.wrapping_sub(VIRTIO_NET_BASE) < VIRTIO_SIZE
         {
             return n.load(pa - VIRTIO_NET_BASE, size);
+        }
+        if let Some(io) = &mut self.io
+            && pa.wrapping_sub(IO_BASE) < IO_SIZE
+        {
+            let r = io.load(pa, size);
+            self.update_irqs();
+            return r;
         }
         Err(exc::LOAD_FAULT)
     }
@@ -281,6 +306,13 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
             && pa.wrapping_sub(VIRTIO_NET_BASE) < VIRTIO_SIZE
         {
             let r = n.store(pa - VIRTIO_NET_BASE, size, v);
+            self.update_irqs();
+            return r;
+        }
+        if let Some(io) = &mut self.io
+            && pa.wrapping_sub(IO_BASE) < IO_SIZE
+        {
+            let r = io.store(pa, size, v);
             self.update_irqs();
             return r;
         }
