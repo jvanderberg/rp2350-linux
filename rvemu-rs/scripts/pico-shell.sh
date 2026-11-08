@@ -28,7 +28,9 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 cargo build -q --release -p rvemu
 cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
-NET=1 IO=1 pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
+# the pin devices only for a kernel with their drivers (PINS=1 guest build)
+IO=0; grep -q '^CONFIG_RVEMU_GPIO=y' "$(dirname "$K")/linux.config" 2>/dev/null && IO=1
+NET=1 IO=$IO pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
 ensure_bootsel "$ELF"
 keep_wifi
 load_text "$T/text.bin"

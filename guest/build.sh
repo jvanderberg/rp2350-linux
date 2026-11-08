@@ -48,18 +48,26 @@ ext_rebuild() {   # BR_OUT
 }
 
 # disk / disk-rootfs / disk-kernel: the squashfs-root variant, into /out-disk
-# (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment)
+# (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment). PINS=1
+# adds the board's pins: buildroot-pins.fragment and linux-pins.fragment.
+PINS=${PINS:-0}
 if [[ $stage == disk* ]]; then
   if [[ $stage == disk || $stage == disk-rootfs ]]; then
     mkdir -p /work/br-disk
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
-    fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
+    pins_br=()
+    if [[ $PINS == 1 ]]; then
+      cat /guest/buildroot-pins.fragment >> /work/br-disk/defconfig
+      pins_br=(buildroot-pins.fragment)
+    fi
+    fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external "${pins_br[@]}"
     make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
     ext_rebuild /work/br-disk
-    # MicroPython is built with the external packages' C modules (cmod/,
-    # USER_C_MODULES), which Buildroot doesn't track: rebuild it unless its
-    # build directory (shared with other checkouts) has these ones
-    mp=$(cd /guest && { find br-external/package/*/cmod -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
+    # With PINS=1 MicroPython is built with the external packages' C modules
+    # (cmod/, USER_C_MODULES), which Buildroot doesn't track: rebuild it
+    # unless its build directory (shared with other checkouts) has these ones
+    mp=none
+    [[ $PINS == 1 ]] && mp=$(cd /guest && { find br-external/package/*/cmod -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
     for d in /work/br-disk/build/micropython-[0-9]*/; do
       [[ -d $d && "$(cat "$d/.cmod-sum" 2>/dev/null)" != "$mp" ]] && make -C /work/br-disk micropython-dirclean
     done
@@ -82,7 +90,9 @@ if [[ $stage == disk* ]]; then
     grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
     grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
     make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
-    scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment
+    pins_k=()
+    [[ $PINS == 1 ]] && pins_k=(/guest/linux-pins.fragment)
+    scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment "${pins_k[@]}"
     make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig
     make ARCH=riscv CROSS_COMPILE=$CROSS -j"$JOBS" Image vmlinux
     cp arch/riscv/boot/Image vmlinux System.map /out-disk/

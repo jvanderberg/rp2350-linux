@@ -42,11 +42,3 @@ BR2_PACKAGE_BC=y
 BR2_PACKAGE_NCDU=y
 BR2_PACKAGE_LSOF=y
 BR2_PACKAGE_LESS=y
-# the board's pins: libgpiod tools, i2c-tools, spidev_test, MicroPython's
-# machine module, C examples (guest/br-external)
-BR2_PACKAGE_LIBGPIOD2=y
-BR2_PACKAGE_LIBGPIOD2_TOOLS=y
-BR2_PACKAGE_I2C_TOOLS=y
-BR2_PACKAGE_SPIDEV_TEST=y
-BR2_PACKAGE_MICROPYTHON_MACHINE=y
-BR2_PACKAGE_PINS_EXAMPLES=y

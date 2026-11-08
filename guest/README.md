@@ -18,8 +18,8 @@ password.
 | Stages | `all`, `rootfs`, `kernel` | `disk`, `disk-rootfs`, `disk-kernel` |
 | Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` |
 | Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay |
-| Userland | static BusyBox | shared musl; BusyBox, nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less; libgpiod tools, i2c-tools, spidev_test |
-| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, the pin drivers |
+| Userland | static BusyBox | shared musl; BusyBox, nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less (`PINS=1`: + libgpiod tools, i2c-tools, spidev_test) |
+| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets (`PINS=1`: + the pin drivers) |
 | Used by | the boot benchmark (`scripts/pico-linux.sh`), `pico-shell.sh -i` | `scripts/pico-shell.sh` (default), `rvemu -d`, `virt.sh -D` |
 
 Outputs in each directory: `Image`, `vmlinux`, `System.map`, `linux.config`
@@ -59,8 +59,13 @@ Kernel options of note in `linux-disk.fragment`:
 
 ## Pins
 
-The disk guest drives the board's GPIO, I2C, SPI, PWM and ADC (pin map in
-the top-level README; the devices in `rvemu-rs/README.md`).
+`PINS=1 ./run-build.sh disk` (or `disk-rootfs`, `disk-kernel`) builds the
+disk guest with the board's GPIO, I2C, SPI, PWM and ADC (pin map in the
+top-level README; the devices in `rvemu-rs/README.md`). It adds
+`linux-pins.fragment` to the kernel and `buildroot-pins.fragment` to the
+root filesystem; without it the guest has none of them, so it pays nothing
+for them (their subsystems alone take about 110 KiB of kernel text, read
+from flash on the board, and 30-70 KiB of RAM).
 
 - **Drivers:** `linux/drivers/rvemu/` holds the machine's own drivers,
   which `build.sh` copies into the kernel tree (`drivers/rvemu`):
@@ -68,9 +73,9 @@ the top-level README; the devices in `rvemu-rs/README.md`).
   `i2c-rvemu.c`, `spi-rvemu.c`, `pwm-rvemu.c` and `adc-rvemu.c` (IIO).
   Each one is off unless its `CONFIG_RVEMU_*` symbol is set, and binds to an
   `rvemu,*` node in the device tree `rvemu -G` generates.
-- **Kernel options** (`linux-disk.fragment`): `GPIO_CDEV` (v2 only),
+- **Kernel options** (`linux-pins.fragment`): `GPIO_CDEV` (v2 only),
   `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO` without buffers or triggers.
-- **Packages:** libgpiod 2 tools (`gpiodetect`, `gpioinfo`, `gpioget`,
+- **Packages** (`buildroot-pins.fragment`): libgpiod 2 tools (`gpiodetect`, `gpioinfo`, `gpioget`,
   `gpioset`, `gpiomon`, ...), i2c-tools, `spidev_test`, and two of this
   repository's (`br-external/package/`):
   - `micropython-machine`: `machine.py` (compiled to
@@ -84,8 +89,8 @@ the top-level README; the devices in `rvemu-rs/README.md`).
     `adc-read`, built and as source in `/usr/share/examples/pins` (its
     `Makefile` builds them on the board).
 - **Rebuilds:** `build.sh` rebuilds an external package whose files
-  changed, and MicroPython when the C modules it was built with differ from
-  the checkout's `cmod/` directories.
+  changed, and MicroPython when the C modules it was built with (none
+  without `PINS=1`) differ from the build's.
 
 ## Configuration notes
 

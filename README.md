@@ -54,8 +54,16 @@ Each directory has its own README with the details: [rvemu-rs](rvemu-rs/README.m
 
 ## Pins
 
-`rvemu-pico-shell` gives the guest the board's pins through the standard
-Linux interfaces:
+`rvemu-pico-shell` can give the guest the board's pins through the standard
+Linux interfaces. They are an opt-in build of the disk guest, because their
+kernel subsystems cost RAM and kernel text even when no pin is in use:
+
+```
+cd guest && PINS=1 ./run-build.sh disk    # the default build has none of it
+```
+
+`scripts/pico-shell.sh` then adds the pin devices to the guest's device tree
+(it does so whenever the kernel has their drivers).
 
 | Linux | Board |
 |---|---|
@@ -66,7 +74,7 @@ Linux interfaces:
 | IIO `rp2350-adc` (`/sys/bus/iio/devices/iio:device0`) | `in_voltage0..7` = GP40-GP47 (mV = raw x `in_voltage_scale`), `in_temp` (the chip's sensor, m°C = (raw + offset) x scale) |
 
 GP0 (the PSRAM's chip select) and GP23/24/25/29 (the radio) are not offered
-to the guest; the gpiochip names every line (`gpioinfo`). The disk guest has
+to the guest; the gpiochip names every line (`gpioinfo`). The pins build has
 the tools for them, all of which also work under `rvemu -G` on the Mac:
 
 ```

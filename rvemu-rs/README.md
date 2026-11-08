@@ -172,7 +172,11 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 ### Pins (`rvemu-pico/src/pins.rs`)
 
 `BoardPins` puts the guest's pin devices on rp235x-hal's drivers; the pin
-map is in the top-level README.
+map is in the top-level README. `pico-shell.sh` puts the devices in the
+guest's device tree when the kernel has their drivers (a `PINS=1` guest
+build). Nothing on the emulator's hot path looks at them: the pins are
+polled for edges only in the firmware's periodic poll (`Platform::poll_pins`,
+every 256 dispatches), and only while a line has an edge interrupt on.
 
 - **GPIO.** Free pins switch between SIO input and output (and PWM) as the
   guest configures them; pulls and levels go straight to the pad. Edges
