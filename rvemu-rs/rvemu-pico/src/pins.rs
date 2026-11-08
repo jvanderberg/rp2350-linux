@@ -249,43 +249,70 @@ fn spin(cyc_us: u64, us: u64, mut ready: impl FnMut() -> bool) -> bool {
     true
 }
 
-/// One I2C controller: its registers and its SDA/SCL pins.
+/// One I2C controller: its registers, its reset bit and its SDA/SCL pins.
 struct I2cBus {
     regs: &'static pac::i2c0::RegisterBlock,
+    reset_bit: u32,
     sda: usize,
     scl: usize,
 }
+
+/// RESETS (0x4002_0000): RESET, its atomic set and clear aliases, and
+/// RESET_DONE.
+const RESETS_SET: *mut u32 = 0x4002_2000 as *mut u32;
+const RESETS_CLR: *mut u32 = 0x4002_3000 as *mut u32;
+const RESET_DONE: *const u32 = 0x4002_0008 as *const u32;
 
 impl I2cBus {
     fn new(bus: usize) -> Self {
         // SAFETY: the controllers are ours (`BoardPins::_i2c0`/`_i2c1`); only
         // `i2c_run` uses their registers once the HAL has set them up.
-        let regs: &'static pac::i2c0::RegisterBlock =
-            unsafe { if bus == 0 { &*pac::I2C0::ptr() } else { &*pac::I2C1::ptr() } };
-        if bus == 0 { I2cBus { regs, sda: 4, scl: 5 } } else { I2cBus { regs, sda: 6, scl: 7 } }
+        if bus == 0 {
+            I2cBus { regs: unsafe { &*pac::I2C0::ptr() }, reset_bit: 1 << 4, sda: 4, scl: 5 }
+        } else {
+            I2cBus { regs: unsafe { &*pac::I2C1::ptr() }, reset_bit: 1 << 5, sda: 6, scl: 7 }
+        }
     }
 
-    /// After an abort (the controller ends it with a STOP once it can).
-    fn aborted(&self, cyc_us: u64) -> I2cError {
-        let r = self.regs;
-        let src = r.ic_tx_abrt_source().read();
-        r.ic_clr_tx_abrt().read();
-        if spin(cyc_us, I2C_BYTE_US, || r.ic_raw_intr_stat().read().stop_det().is_active()) {
-            r.ic_clr_stop_det().read();
-        }
+    /// The error for an abort the controller reported (and clear it).
+    fn abort_error(&self) -> I2cError {
+        let src = self.regs.ic_tx_abrt_source().read();
+        self.regs.ic_clr_tx_abrt().read();
         if src.abrt_7b_addr_noack().bit_is_set() { I2cError::Nack } else { I2cError::Bus }
     }
 
-    /// The bus stayed busy past the deadline: abort, and if a device still
-    /// holds SDA low, clock it free (up to 9 SCL pulses, then a STOP) with
-    /// the pins on SIO for the moment.
+    /// After an abort: the controller ends the transfer with a STOP.
+    fn aborted(&self, cyc_us: u64) -> I2cError {
+        let r = self.regs;
+        let e = self.abort_error();
+        if spin(cyc_us, I2C_BYTE_US, || r.ic_raw_intr_stat().read().stop_det().is_active()) {
+            r.ic_clr_stop_det().read();
+        }
+        e
+    }
+
+    /// The bus stayed busy past the deadline. A controller that is waiting
+    /// on a held line can't finish an abort either, so reset it (that also
+    /// lets go of the lines) and put back the HAL's setup. If a device still
+    /// holds SDA low, clock it free first: up to 9 SCL pulses, then a STOP,
+    /// with the pins on SIO for the moment.
     fn timed_out(&self, cyc_us: u64) -> I2cError {
         let r = self.regs;
-        r.ic_enable().modify(|_, w| w.abort().set_bit());
-        spin(cyc_us, I2C_BYTE_US, || r.ic_enable().read().abort().bit_is_clear());
-        r.ic_clr_tx_abrt().read();
-        r.ic_enable().write(|w| w.enable().disabled());
-        spin(cyc_us, I2C_BYTE_US, || r.ic_enable_status().read().ic_en().bit_is_clear());
+        let saved = [
+            r.ic_con().read().bits(),
+            r.ic_tx_tl().read().bits(),
+            r.ic_rx_tl().read().bits(),
+            r.ic_fs_scl_hcnt().read().bits(),
+            r.ic_fs_scl_lcnt().read().bits(),
+            r.ic_fs_spklen().read().bits(),
+            r.ic_sda_hold().read().bits(),
+        ];
+        // SAFETY: the atomic aliases touch only this controller's bit.
+        unsafe {
+            RESETS_SET.write_volatile(self.reset_bit);
+            RESETS_CLR.write_volatile(self.reset_bit);
+        }
+        spin(cyc_us, 100, || unsafe { RESET_DONE.read_volatile() } & self.reset_bit != 0);
         // SAFETY: our own two pins; their function goes back to I2C below.
         let (io, sio) = unsafe { (&*pac::IO_BANK0::ptr(), &*pac::SIO::ptr()) };
         let (sda, scl) = (1u32 << self.sda, 1u32 << self.scl);
@@ -319,6 +346,16 @@ impl I2cBus {
             for n in [self.sda, self.scl] {
                 io.gpio(n).gpio_ctrl().modify(|_, w| w.funcsel().i2c());
             }
+        }
+        // SAFETY: the values the HAL wrote, read back above.
+        unsafe {
+            r.ic_con().write(|w| w.bits(saved[0]));
+            r.ic_tx_tl().write(|w| w.bits(saved[1]));
+            r.ic_rx_tl().write(|w| w.bits(saved[2]));
+            r.ic_fs_scl_hcnt().write(|w| w.bits(saved[3]));
+            r.ic_fs_scl_lcnt().write(|w| w.bits(saved[4]));
+            r.ic_fs_spklen().write(|w| w.bits(saved[5]));
+            r.ic_sda_hold().write(|w| w.bits(saved[6]));
         }
         I2cError::Timeout
     }
@@ -395,6 +432,10 @@ fn i2c_xfer(bus: &I2cBus, cyc_us: u64, addr: u8, ops: &mut [I2cOp<'_>]) -> Resul
                     return Err(bus.timed_out(cyc_us));
                 }
                 r.ic_clr_stop_det().read();
+                // an abort can show only once the STOP is out
+                if r.ic_tx_abrt_source().read().bits() != 0 {
+                    return Err(bus.abort_error());
+                }
             }
         }
     }

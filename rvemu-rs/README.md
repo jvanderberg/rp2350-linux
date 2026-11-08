@@ -182,9 +182,10 @@ map is in the top-level README.
 - **I2C.** 100 kHz with the pads' pull-ups. `hal::I2C` sets the
   controllers up; the transfers run on their registers (one byte in flight,
   as the pico-sdk does), because the HAL's waits have no time limit. Each
-  byte and the STOP get 5 ms. Past that the transfer is aborted, a device
-  still holding SDA low gets up to 9 SCL pulses and a STOP, and the guest's
-  transfer fails with `-ETIMEDOUT`: a stuck bus can't stop the emulator.
+  byte and the STOP get 5 ms. Past that the controller is reset (it can't
+  finish an abort on a held line) and set up again, a device still holding
+  SDA low gets up to 9 SCL pulses and a STOP, and the guest's transfer
+  fails with `-ETIMEDOUT`: a stuck bus can't stop the emulator.
   The controller can't send an address without data, so a zero-length
   write (i2cdetect's probe) becomes a one-byte read.
 - **SPI.** `hal::spi::Spi`, 8-bit frames; the clock rate (100 kHz to
