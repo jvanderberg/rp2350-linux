@@ -43,6 +43,8 @@ CONFIG_TMPFS_XATTR=y
 # bit-writable NOR), no zlib (its deflate workspace is ~270 KiB of vmalloc).
 CONFIG_MTD=y
 CONFIG_MTD_RVEMU_FLASH=y
+# no partitions on it
+# CONFIG_MTD_OF_PARTS is not set
 CONFIG_JFFS2_FS=y
 # CONFIG_JFFS2_FS_WRITEBUFFER is not set
 CONFIG_JFFS2_COMPRESSION_OPTIONS=y
