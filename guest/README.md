@@ -17,9 +17,9 @@ password.
 |---|---|---|
 | Stages | `all`, `rootfs`, `kernel` | `disk`, `disk-rootfs`, `disk-kernel` |
 | Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` |
-| Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay |
+| Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay; `/home` and `/root` on jffs2 in flash |
 | Userland | static BusyBox | shared musl; BusyBox, nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less |
-| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets |
+| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, MTD + jffs2 |
 | Used by | the boot benchmark (`scripts/pico-linux.sh`), `pico-shell.sh -i` | `scripts/pico-shell.sh` (default), `rvemu -d`, `virt.sh -D` |
 
 Outputs in each directory: `Image`, `vmlinux`, `System.map`, `linux.config`
@@ -32,11 +32,29 @@ and the root filesystem.
   so the blocks are kept small.
 - **Boot:** the kernel mounts `/dev/vda` read-only and runs
   `/sbin/overlay-init` (from `post-build-disk.sh`). It mounts a tmpfs
-  overlay on top of the squashfs, pivots into it and starts BusyBox init.
-  Changes last until reboot, and the squashfs stays visible at `/rom`. The
+  overlay on top of the squashfs, mounts `/home` (below), pivots into it
+  and starts BusyBox init. Changes outside `/home` and `/root` last until
+  reboot, and the squashfs stays visible at `/rom`. The
   Mac host's and the firmware's default command line for a disk without an
   initramfs is
   `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`.
+- **`/home`:** jffs2 on the board's 1 MB flash region (the `rvemu,flash`
+  device, `mtd0`), mounted `noatime` by overlay-init. `/root` is a bind
+  mount of `/home/root`, created from the squashfs's `/root` the first time.
+  - jffs2 is log-structured and checksums every node, so a power cut or
+    reset loses at most the write in flight. A `write()` is on flash when it
+    returns (no write buffer).
+  - It formats a blank region itself, and erases flash it can't parse, in
+    the background.
+  - Its GC thread (`jffs2_gcd_mtd0`) is SCHED_IDLE (build.sh edits
+    `fs/jffs2/background.c`): after a mount it CRC-checks every node, and
+    that waits for idle time instead of slowing the boot.
+  - No compression beyond jffs2's rtime: zlib's deflate workspace is about
+    270 KiB of vmalloc.
+  - The driver, `linux/rvemu-flash.c`, is copied into the kernel tree by
+    build.sh. `/sys/bus/platform/devices/f8000400.flash/stats` reads the
+    device's counters: erases, erases skipped (already blank), pages
+    programmed, longest stall (us), total stall (ms).
 - **Network:** `eth0` is virtio-net. `/etc/network/interfaces` runs DHCP in
   the background (`udhcpc -b`), so boot doesn't wait for the Wi-Fi join.
   On the board the NIC is bridged to the Wi-Fi radio. On the Mac, `rvemu -N`
@@ -51,6 +69,7 @@ Kernel options of note in `linux-disk.fragment`:
 |---|---|
 | `CONFIG_MISC_FILESYSTEMS=y` | the menu squashfs sits under; tinyconfig turns it off |
 | `CONFIG_SQUASHFS_LZ4`, `SQUASHFS_DECOMP_SINGLE` | matches the image; one decompressor buffer |
+| `CONFIG_MTD`, `MTD_RVEMU_FLASH`, `JFFS2_FS` (no write buffer, zlib or lzo) | `/home` on the flash device |
 | `CONFIG_OVERLAY_FS`, `CONFIG_TMPFS_XATTR` | the writable overlay (overlayfs wants xattrs on its upper layer) |
 | `CONFIG_BASE_SMALL=y` | smaller kernel tables, for 8 MiB |
 | `CONFIG_INET_TABLE_PERTURB_ORDER=8` | 1 KiB instead of 256 KiB for RFC 6056 port perturbation |

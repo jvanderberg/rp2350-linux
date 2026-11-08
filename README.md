@@ -140,6 +140,7 @@ MemAvailable, or on a checksum mismatch.
 | Address | Contents | Written by |
 |---|---|---|
 | 0x10000000 | firmware (`rvemu-pico-shell` or `rvemu-pico-linux`) | `picotool load -x` |
+| 0x10100000 | the guest's `/home`, 1 MB (jffs2) | the firmware (`rvemu-pico/src/flash.rs`) |
 | 0x103FF000 | Wi-Fi settings, 4 KB (`"WIFI"`, lengths, SSID, passphrase) | `scripts/pico-wifi.sh` |
 | 0x10400000 | guest blob, at most 2 MB: `RVLY` header, the kernel after its text, initramfs, DTB | `pack-guest.py` via `pico-common.sh` |
 | 0x10600000 | root filesystem (squashfs) | `pico-common.sh` `load_disk` |
