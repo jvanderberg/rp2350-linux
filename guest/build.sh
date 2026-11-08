@@ -8,6 +8,10 @@ export BR2_DL_DIR=/work/dl
 
 stage=${1:-all}
 
+# Buildroot saves BR2_EXTERNAL in the (shared) output directory, so always
+# pass it: the external tree, or empty when this checkout has none.
+EXT=; [[ -f /guest/br-external/external.desc ]] && EXT=/guest/br-external
+
 # The /work volume is shared by every checkout. Buildroot never removes files
 # from target/, so when the configuration (defconfig, post-build script, overlay
 # or external tree under /guest) differs from the last one built in this tree,
@@ -34,7 +38,7 @@ if [[ $stage == disk* ]]; then
     mkdir -p /work/br-disk
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
     fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
-    make -C /src/buildroot O=/work/br-disk BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
+    make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
     make -C /work/br-disk -j"$JOBS"
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
@@ -73,7 +77,7 @@ if [[ $stage == all || $stage == rootfs ]]; then
   mkdir -p /work/br
   cp /guest/buildroot.defconfig /work/br/defconfig
   fresh_target /work/br buildroot.defconfig post-build.sh overlay br-external
-  make -C /src/buildroot O=/work/br BR2_DEFCONFIG=/work/br/defconfig defconfig
+  make -C /src/buildroot O=/work/br BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br/defconfig defconfig
   make -C /work/br -j"$JOBS"
   cp /work/br/images/rootfs.cpio /out/rootfs.cpio
 fi
