@@ -15,7 +15,8 @@ stage=${1:-all}
 # holds only this checkout's packages.
 fresh_target() {   # BR_OUT FILES...
   local o=$1; shift
-  local sum; sum=$(cd /guest && find "$@" -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
+  # (find fails on paths that don't exist, such as an absent br-external)
+  local sum; sum=$(cd /guest && { find "$@" -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
   if [[ -d $o/target && "$(cat "$o/.config-sum" 2>/dev/null)" != "$sum" ]]; then
     echo "build.sh: configuration changed since the last build in $o: fresh target/"
     rm -rf "$o/target"
@@ -47,6 +48,13 @@ if [[ $stage == disk* ]]; then
       mkdir -p "$K" && curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar xJ -C "$K" --strip-components=1
     fi
     cd "$K"
+    # the rvemu NOR flash driver for /home (guest/linux/rvemu-flash.c); the
+    # tree is shared, and builds without CONFIG_MTD_RVEMU_FLASH ignore it
+    cmp -s /guest/linux/rvemu-flash.c drivers/mtd/devices/rvemu-flash.c || cp /guest/linux/rvemu-flash.c drivers/mtd/devices/
+    grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Kconfig ||
+      sed -i '$i config MTD_RVEMU_FLASH\n\ttristate "rvemu NOR flash device"\n\tdepends on HAS_IOMEM \&\& OF\n' drivers/mtd/devices/Kconfig
+    grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Makefile ||
+      echo 'obj-$(CONFIG_MTD_RVEMU_FLASH) += rvemu-flash.o' >> drivers/mtd/devices/Makefile
     make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
     scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment
     make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig

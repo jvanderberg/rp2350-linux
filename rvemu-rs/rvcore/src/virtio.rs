@@ -155,7 +155,7 @@ pub struct GuestMem {
 }
 
 impl GuestMem {
-    fn range(&self, pa: u64, len: usize) -> Option<*mut u8> {
+    pub(crate) fn range(&self, pa: u64, len: usize) -> Option<*mut u8> {
         let off = pa.checked_sub(self.base as u64)?;
         (off.checked_add(len as u64)? <= self.size as u64).then(|| {
             // SAFETY: in bounds of guest RAM (checked above).
@@ -163,7 +163,7 @@ impl GuestMem {
         })
     }
     /// As `range`, for a device write.
-    fn range_mut(&self, pa: u64, len: usize) -> Option<*mut u8> {
+    pub(crate) fn range_mut(&self, pa: u64, len: usize) -> Option<*mut u8> {
         if pa < self.base as u64 + self.ro as u64 {
             return None;
         }

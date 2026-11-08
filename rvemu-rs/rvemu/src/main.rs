@@ -8,9 +8,12 @@ use std::time::Instant;
 
 use rvcore::dev::{Console, PLIC_BASE, PLIC_SIZE, Platform, UART_BASE, UART_IRQ, UART_SIZE};
 use rvcore::virtio::{GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE};
+use norfile::FileNor;
+use rvcore::nor::{NOR_BASE, NOR_SIZE};
 use stubnet::StubNet;
 use rvcore::{Bus, Cpu, Halt, Priv, TIMEBASE_HZ};
 
+mod norfile;
 mod sim;
 mod stubnet;
 
@@ -133,7 +136,7 @@ impl Console for TermConsole {
 // ------------------------------------------------------------------ bus
 
 struct HostBus {
-    plat: Platform<TermConsole, MemDisk, StubNet>,
+    plat: Platform<TermConsole, MemDisk, StubNet, FileNor>,
     interactive: bool,
 }
 
@@ -200,7 +203,15 @@ impl Bus for HostBus {
 
 // ------------------------------------------------------------------ setup
 
-fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u32)>, disk: bool, net: bool) -> String {
+fn make_dts(
+    ram_base: u32,
+    ram_size: u32,
+    bootargs: &str,
+    initrd: Option<(u32, u32)>,
+    disk: bool,
+    net: bool,
+    nor: bool,
+) -> String {
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -222,6 +233,15 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     }
     if net {
         virtio += &node(VIRTIO_NET_BASE, VIRTIO_NET_IRQ);
+    }
+    if nor {
+        virtio += &format!(
+            r#"    flash@{NOR_BASE:x} {{
+      compatible = "rvemu,flash";
+      reg = <0x{NOR_BASE:x} 0x{NOR_SIZE:x}>;
+    }};
+"#
+        );
     }
     format!(
         r#"/dts-v1/;
@@ -404,6 +424,8 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  guest/post-build-disk.sh)
   -N             virtio network device on a stub LAN: gateway 10.0.2.2
                  answers ARP and ping (the guest is 52:54:00:12:34:56)
+  -F FILE        NOR flash device (the board's /home region, 1 MB) backed by
+                 FILE, created blank if missing; with -D, any FILE adds the node
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size (default 64)
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only
@@ -436,6 +458,7 @@ struct Opts {
     sim_out: String,
     corpus: Option<String>,
     disk: Option<String>,
+    nor: Option<String>,
     bootargs_set: bool,
     net: bool,
 }
@@ -457,6 +480,7 @@ fn parse_args() -> Result<Opts, String> {
         sim_out: "sim.json".into(),
         corpus: None,
         disk: None,
+        nor: None,
         bootargs_set: false,
         net: false,
     };
@@ -485,6 +509,7 @@ fn parse_args() -> Result<Opts, String> {
             }
             "-d" => o.disk = Some(val()?),
             "-N" => o.net = true,
+            "-F" => o.nor = Some(val()?),
             "-u" => o.until = Some(val()?),
             "-n" => o.max_insns = val()?.parse().map_err(|_| "bad -n")?,
             "-M" => o.model = true,
@@ -539,6 +564,7 @@ fn run() -> Result<(), String> {
         initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
         o.disk.is_some(),
         o.net,
+        o.nor.is_some(),
     );
     if o.dump_dts {
         print!("{dts}");
@@ -584,6 +610,9 @@ fn run() -> Result<(), String> {
     }
     if o.net {
         plat = plat.with_net(StubNet::default(), gmem);
+    }
+    if let Some(path) = &o.nor {
+        plat = plat.with_nor(FileNor::open(path)?, gmem);
     }
     let mut bus = HostBus { plat, interactive: !o.batch };
 

@@ -30,6 +30,7 @@ use rp2350_board as board;
 use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
+use rvcore::nor::NorFlash;
 use rvcore::virtio::{Disk as _, GuestMem, MemDisk};
 use rvcore::{Bus, Cpu, Halt, TIMEBASE_HZ};
 use rvjit::{Block, JcEntry, Jit, JitMem};
@@ -43,6 +44,9 @@ use guest_blob::{BLOB_ADDR, BlobHeader};
 
 #[path = "../wifi.rs"]
 mod wifi;
+
+#[path = "../flash.rs"]
+mod flash;
 use wifi::{Creds, Radio, RadioPins, WifiLink};
 
 #[unsafe(link_section = ".start_block")]
@@ -78,6 +82,37 @@ fn flash_disk() -> Option<MemDisk> {
     (magic == SQUASHFS_MAGIC && len <= DISK_MAX)
         // SAFETY: `len` bytes of mapped flash, never written while we run.
         .then(|| unsafe { MemDisk::new(base as *const u8, len) })
+}
+
+/// The guest's /home: `flash::STORAGE` (1 MB) as the NOR flash device.
+struct BoardNor;
+
+impl NorFlash for BoardNor {
+    fn size(&self) -> u32 {
+        flash::STORAGE.end - flash::STORAGE.start
+    }
+    fn read(&mut self, off: u32, buf: &mut [u8]) -> bool {
+        flash::read(flash::STORAGE.start + off, buf);
+        true
+    }
+    fn program(&mut self, off: u32, data: &[u8]) -> bool {
+        flash::program(flash::STORAGE.start + off, data).is_ok()
+    }
+    fn erase(&mut self, off: u32) -> bool {
+        flash::erase_sector(flash::STORAGE.start + off).is_ok()
+    }
+    fn stat(&self, i: u32) -> u32 {
+        let s = flash::stats();
+        let mhz = u64::from(flash::sys_hz() / 1_000_000).max(1);
+        match i {
+            0 => s.erases,
+            1 => s.erases_skipped,
+            2 => s.pages,
+            3 => (u64::from(s.stall_cycles_max) / mhz) as u32,
+            4 => (s.stall_cycles_total / mhz / 1000) as u32,
+            _ => 0,
+        }
+    }
 }
 
 // ------------------------------------------------------------------ translator storage (SRAM)
@@ -168,7 +203,7 @@ impl Console for UsbConsole {
 }
 
 struct PicoBus<'a> {
-    plat: Platform<UsbConsole, MemDisk, WifiLink>,
+    plat: Platform<UsbConsole, MemDisk, WifiLink, BoardNor>,
     radio: Radio<'a>,
     usb: UsbDevice<'static, hal::usb::UsbBus>,
     serial: SerialPort<'static, hal::usb::UsbBus>,
@@ -306,6 +341,7 @@ fn main() -> ! {
     let pins = hal::gpio::Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
     use hal::Clock as _;
     let sys_hz = clocks.system_clock.freq().to_Hz();
+    flash::set_sys_hz(sys_hz);
     rprintln!("\n=== rvemu-pico shell: Hazard3 @ {} MHz{} ===", sys_hz / 1_000_000, board::CLOCK_NOTE);
 
     let psram = match board::psram_init(pins.gpio0, sys_hz) {
@@ -358,7 +394,7 @@ fn main() -> ! {
         fail("no root filesystem: no initramfs in the blob and no squashfs at 0x10600000");
     }
     let gmem = GuestMem { ptr: h.ram_host() as *mut u8, base: 0, size: h.ram_size, ro: h.text_len };
-    let mut plat = Platform::new(con).with_net(WifiLink, gmem);
+    let mut plat = Platform::new(con).with_net(WifiLink, gmem).with_nor(BoardNor, gmem);
     if let Some(d) = disk {
         plat = plat.with_disk(d, gmem);
     }

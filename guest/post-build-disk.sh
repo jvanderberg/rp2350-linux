@@ -7,13 +7,23 @@ mkdir -p "$T/overlay" "$T/rom"
 cat > "$T/sbin/overlay-init" <<'S'
 #!/bin/sh
 # PID 1 on the read-only squashfs root: put a tmpfs overlay on top of it,
-# move into the overlay and start BusyBox init there. Changes last until
-# reboot; the squashfs is at /rom.
+# move into the overlay and start BusyBox init there. Changes outside /home
+# and /root last until reboot; the squashfs is at /rom.
 mount -t tmpfs -o mode=0755 tmpfs /overlay
 mkdir /overlay/upper /overlay/work /overlay/root
 mount -t overlay -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work overlay /overlay/root
 mount --move /dev /overlay/root/dev
 cd /overlay/root
+# /home: jffs2 on the board's flash region (the rvemu,flash MTD device),
+# kept across reboots; /root lives in it as /home/root. jffs2 formats blank
+# or foreign flash itself (it erases what it can't parse, in the background).
+mkdir -p home
+if mount -t jffs2 -o noatime mtd0 home 2>/dev/null; then
+  [ -d home/root ] || { mkdir -m 700 home/root && cp -a /root/. home/root/; }
+  mount --bind home/root root
+else
+  echo "overlay-init: no flash storage; /home is in RAM"
+fi
 pivot_root . rom
 exec chroot . /sbin/init
 S

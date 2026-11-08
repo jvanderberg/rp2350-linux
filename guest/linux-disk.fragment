@@ -38,3 +38,16 @@ CONFIG_BASE_SMALL=y
 CONFIG_INET_TABLE_PERTURB_ORDER=8
 # overlayfs wants xattrs on its tmpfs upper layer
 CONFIG_TMPFS_XATTR=y
+# /home: jffs2 on the rvemu NOR flash device (guest/linux/rvemu-flash.c),
+# the board's 1 MB flash region at 0x10100000. No write buffer (plain
+# bit-writable NOR), no zlib (its deflate workspace is ~270 KiB of vmalloc).
+CONFIG_MTD=y
+CONFIG_MTD_RVEMU_FLASH=y
+CONFIG_JFFS2_FS=y
+# CONFIG_JFFS2_FS_WRITEBUFFER is not set
+CONFIG_JFFS2_COMPRESSION_OPTIONS=y
+# CONFIG_JFFS2_ZLIB is not set
+# CONFIG_JFFS2_LZO is not set
+CONFIG_JFFS2_RTIME=y
+# CONFIG_JFFS2_RUBIN is not set
+CONFIG_JFFS2_CMODE_PRIORITY=y
