@@ -45,9 +45,7 @@ and the root filesystem.
 
 ## Disk guest
 
-- **Root filesystem:** squashfs, LZ4, 16 KB blocks. At 8 MiB the kernel
-  evicts file pages often, and every read-back decompresses a whole block,
-  so the blocks are kept small.
+- **Root filesystem:** squashfs, LZ4, 16 KB blocks.
 - **Boot:** the kernel mounts `/dev/vda` read-only and runs
   `/sbin/overlay-init` (from `post-build-disk.sh`). It mounts a tmpfs
   overlay on top of the squashfs, mounts `/home` (below), pivots into it
@@ -55,30 +53,25 @@ and the root filesystem.
   reboot, and the squashfs stays visible at `/rom`. The firmware's default
   command line for a disk without an initramfs is
   `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`.
-- **BusyBox** is linked statically (`busybox-disk.fragment`), so an applet
-  exec skips musl's dynamic loader (about 0.4 M guest instructions per
-  fork+exec of `/bin/true`). Everything else links against the shared musl.
+- **BusyBox** is linked statically (`busybox-disk.fragment`). Everything
+  else links against the shared musl.
   The `/dev/fd` and `/dev/std*` links are made at build time in
   `/lib/devlinks` and copied by one inittab line.
 - **Init scripts:** only `S02sysctl`, `S02swap` (which does nothing without
-  a swap device) and `S40network`. Every script and command at boot is a
-  fork+exec, so there is no syslogd, klogd, crond, seedrng (the device
-  tree's `rng-seed` seeds the CRNG) or modules script. `dmesg` has the
-  kernel log.
+  a swap device) and `S40network`. There is no syslogd, klogd, crond,
+  seedrng (the device tree's `rng-seed` seeds the CRNG) or modules script.
+  `dmesg` has the kernel log.
 - **Network:** `eth0` is virtio-net, bridged to the board's Wi-Fi radio.
-  `/etc/network/interfaces` starts `udhcpc -b`
-  in the background, so boot doesn't wait for a lease or the Wi-Fi join.
+  `/etc/network/interfaces` starts `udhcpc -b` in the background.
 - **`LANG=C.UTF-8`** in `/etc/profile`, for tmux and friends.
-- **Not included:** vim (its 3.5 MB binary doesn't fit the 8 MiB guest's
-  page cache; `vi` is BusyBox's), strace (Buildroot has none for RV32) and
-  make.
+- **Not included:** vim (`vi` is BusyBox's), strace and make.
 
 ## /home on flash
 
 jffs2 on the board's 1 MB flash region (the `rvemu,flash` device, `mtd0`),
 mounted `noatime` by overlay-init. `/root` is a bind mount of `/home/root`,
-created from the squashfs's `/root` the first time. How to use it, its
-costs and examples are in the top-level README.
+created from the squashfs's `/root` the first time. How to use it is in
+the top-level README.
 
 - jffs2 is log-structured and checksums every node, so a power cut or
   reset loses at most the write in flight. A `write()` is on flash when it
@@ -87,30 +80,16 @@ costs and examples are in the top-level README.
   the background. If the region holds no jffs2 node at all, the mount
   fails, and overlay-init formats it through the driver (`echo 1 >
   /sys/bus/platform/devices/f8000400.flash/format`).
-- Its GC thread (`jffs2_gcd_mtd0`) is SCHED_IDLE (build.sh edits
-  `fs/jffs2/background.c`): after a mount it CRC-checks every node, and
-  that waits for idle time instead of slowing the boot.
-- No compression beyond jffs2's rtime: zlib's deflate workspace is about
-  270 KiB of vmalloc.
-- The device shows 16 KB erase blocks (four 4 KB flash sectors): with
-  4 KB blocks jffs2 needs about 80 KiB more RAM for its per-block tables.
+- Its GC thread (`jffs2_gcd_mtd0`) runs SCHED_IDLE (build.sh edits
+  `fs/jffs2/background.c`).
+- Compression: rtime only.
+- The device shows 16 KB erase blocks (four 4 KB flash sectors).
 - The driver, `linux/rvemu-flash.c`, is copied into the kernel tree by
   build.sh. `/sys/bus/platform/devices/f8000400.flash/stats` reads the
   device's counters: erases, erases skipped (already blank), pages
   programmed, longest stall (us), total stall (ms).
 - Without the device, overlay-init says "no flash storage; /home is in
   RAM" and `/home` is part of the overlay.
-
-Measured on the board:
-
-| | |
-|---|---|
-| Boot to `login:`, steady state | +0.3 s |
-| First boot on blank flash / on garbage (formats) | +1 s / +8.7 s, once |
-| Guest RAM (perf-gate `mem_adj_kb`) | 40 KiB |
-| Writing 256 KB in large writes / in 256-byte writes | about 260 KB/s / 13 KB/s |
-| Longest guest stall: page program / sector erase | 0.5 ms / 51 ms |
-| Wear, one day of typical use (300 shell commands, 20 saves of a 5 KB file, 200 log lines, five 50 KB rewrites) | 36 sector erases at 14% full, 252 at 72% full: 0.14 to 1 erase per sector per day against 100K cycles |
 
 ## Swap
 
@@ -120,7 +99,7 @@ serial is `rvemu-flash-swap`, when the firmware offers one
 (1792 KiB) of swap area, which leaves 1788 KiB of swap after mkswap's
 header, and a last page that holds the device's statistics, which
 `flashswap-stats` prints. The kernel has `CONFIG_SWAP` (on by default with
-`CONFIG_BLOCK`). zram and zswap are left out (see the top-level README).
+`CONFIG_BLOCK`). There is no zram or zswap.
 
 ## C compiler
 
@@ -148,30 +127,24 @@ links on the guest: `cc hello.c && ./a.out`, `tcc -run hello.c`, `cc -c`,
   image in a `ROOTFS_PRE_CMD_HOOK` (only when `BR2_PACKAGE_TCC` is set).
 - **Linking:** dynamic, against `/lib/ld-musl-riscv32-sf.so.1`. There is
   no `libc.a`, so no `-static`.
-- **Memory:** compiling a file takes 0.9–2.8 MB, against about 4 MB
-  available after login. With no swap, a compile that took the last of it
-  would evict the page cache that holds every program's code and stall the
-  guest for minutes. So after every 128 kB it allocates, tcc checks
-  MemAvailable, and below 512 kB it stops with "memory full". Larger
-  programs build one file at a time (`cc -c`).
-- **Size:** 704 KiB of squashfs.
+- **Memory:** after every 128 kB it allocates, tcc checks MemAvailable,
+  and below 512 kB it stops with "memory full" (patch 0007).
 - **Tests:** `br-external/package/tcc/test/board-test.sh` copies the tests
   to the board over the console (`push.py`) and runs them (`run.sh`). The
   tests cover long long, float and double, structs by value, varargs,
   function pointers, a static library, kernel headers and an arithmetic
-  hash that must match a native build. On the board, each compiles in
-  0.2–3.1 s. (The self-host stress test, `test/emu-selfhost.sh`, runs
+  hash that must match a native build. (The self-host stress test, `test/emu-selfhost.sh`, runs
   in the emulator, not on the board: see `../rvemu-rs/README.md`.)
 
 ## Pins
 
 `PINS=1 ./run-build.sh disk` (or `disk-rootfs`, `disk-kernel`) builds the
 disk guest with the board's GPIO, I2C, SPI, PWM and ADC. The pin map, the
-tools, the costs and examples are in the top-level README; the devices are
+tools and examples are in the top-level README; the devices are
 in `../rvemu-rs/README.md`. It adds `linux-pins.fragment` to the kernel and
 `buildroot-pins.fragment` to the root filesystem. Without it,
 `linux-disk.fragment` and `buildroot-disk.defconfig` give a guest with
-none of them, which pays nothing for them. Switching between the two modes
+none of them. Switching between the two modes
 gives a fresh `target/`.
 
 - **Drivers:** `linux/drivers/rvemu/` holds the machine's own drivers,
@@ -203,14 +176,14 @@ gives a fresh `target/`.
 
 Of note in `linux-disk.fragment`:
 
-| Option | Why |
+| Option | For |
 |---|---|
 | `CONFIG_MISC_FILESYSTEMS=y` | the menu squashfs sits under; tinyconfig turns it off |
 | `CONFIG_SQUASHFS_LZ4`, `SQUASHFS_DECOMP_SINGLE` | matches the image; one decompressor buffer |
 | `CONFIG_MTD`, `MTD_RVEMU_FLASH`, `JFFS2_FS` (no write buffer, zlib or lzo) | `/home` on the flash device |
 | `CONFIG_OVERLAY_FS`, `CONFIG_TMPFS_XATTR` | the writable overlay (overlayfs wants xattrs on its upper layer) |
 | `CONFIG_BASE_SMALL=y` | smaller kernel tables, for 8 MiB |
-| `CONFIG_INET_TABLE_PERTURB_ORDER=8` | 1 KiB instead of 256 KiB for RFC 6056 port perturbation |
+| `CONFIG_INET_TABLE_PERTURB_ORDER=8` | a 1 KiB RFC 6056 port perturbation table |
 | `CONFIG_VIRTIO_NET`, `CONFIG_NET`, `UNIX`, `INET`, `PACKET` | Ethernet over virtio; tmux needs AF_UNIX |
 | `EPOLL`, `EVENTFD`, `TIMERFD`, `SIGNALFD`, `INOTIFY_USER`, `SYSVIPC`, `FILE_LOCKING` | what the packages expect |
 
@@ -228,12 +201,3 @@ Of note in `linux-disk.fragment`:
   matters for the translator.
 - The disk kernel builds in its own source tree (`/work/linux-disk-*`):
   kbuild refuses out-of-tree builds from a tree that was built in place.
-
-## Sizes and boot
-
-| | initramfs guest | disk guest | disk guest, `PINS=1` |
-|---|---|---|---|
-| Image (of which text, read from flash on the board) | 2.4 MB (1.6 MB) | 4.1 MB (3.1 MB) | 4.2 MB (3.2 MB) |
-| Root filesystem | 1.2 MB cpio | 5.4 MB squashfs | 5.6 MB squashfs |
-| Boot to `login:` on the board, 348 MHz | 5.2 s (the benchmark) | 10.9 s | 11.2 s |
-| MemTotal after boot | | 7,004 KiB | 6,972 KiB |
