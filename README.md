@@ -20,7 +20,7 @@ Linux rp2350 6.12.116 #29 Sun Nov  8 12:56:58 UTC 2026 riscv32 GNU/Linux
 | [`/home` and `/root` on flash](#home-on-flash) | on | files there are kept across reboots |
 | [C compiler](#c-compiler) | on | `cc`, `tcc -run`, `tcc -ar` |
 | [Swap on flash](#swap) | off | `scripts/pico-shell.sh -w` |
-| [GPIO, I2C, SPI, PWM, ADC](#pins) | off | `PINS=1 guest/run-build.sh disk` |
+| [GPIO, I2C, SPI, PWM, ADC](#pins) | on | `gpioinfo`, `i2cdetect`, MicroPython `machine` |
 
 The guest also has nano, mg, BusyBox `vi`, MicroPython, Lua 5.4, htop,
 tmux, lrzsz, bc, ncdu, lsof and less. Log in as root, no password.
@@ -163,13 +163,7 @@ Swap:          1788         116        1672
 
 ## Pins
 
-A `PINS=1` build of the guest gets the board's pins through the standard
-Linux interfaces. Build it, then load it with `scripts/pico-shell.sh` as
-usual:
-
-```
-cd guest && PINS=1 ./run-build.sh disk
-```
+The guest has the board's pins through the standard Linux interfaces:
 
 | Linux | Board |
 |---|---|

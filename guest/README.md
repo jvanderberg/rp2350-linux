@@ -3,7 +3,6 @@
 The Linux guests for the board, built in Docker:
 
     BOARD_LOCK_OWNER=NAME ./run-build.sh [all|rootfs|kernel|disk|disk-rootfs|disk-kernel]
-    BOARD_LOCK_OWNER=NAME PINS=1 ./run-build.sh disk     # with the board's pins
 
 The first run clones Buildroot 2026.08.1 into `src/buildroot`. Build trees
 live in the Docker volume `rvemu-guest-work`, so later builds are
@@ -22,8 +21,8 @@ What `build.sh` rebuilds by itself, because Buildroot wouldn't:
   build in that tree, so an image never holds another checkout's packages;
 - BusyBox, when `busybox-disk.fragment` differs from the last build's;
 - an external package whose files changed (a new patch or `.mk`);
-- MicroPython, when the C modules it was built with (none without
-  `PINS=1`) differ from the build's.
+- MicroPython, when the C modules it was built with differ from the
+  build's.
 
 ## The two guests
 
@@ -34,10 +33,10 @@ and BusyBox init with a getty on ttyS0. Log in as root, no password.
 | | initramfs guest (`out/`) | disk guest (`out-disk/`) |
 |---|---|---|
 | Stages | `all`, `rootfs`, `kernel` | `disk`, `disk-rootfs`, `disk-kernel` |
-| Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `busybox-disk.fragment`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` (`PINS=1`: + `buildroot-pins.fragment`, `linux-pins.fragment`) |
+| Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `busybox-disk.fragment`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` |
 | Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay; `/home` and `/root` on jffs2 in flash |
-| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`) (`PINS=1`: + libgpiod tools, i2c-tools, spidev_test, MicroPython `machine`, the pin examples) |
-| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, swap, MTD + jffs2 (`PINS=1`: + the pin drivers) |
+| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`), libgpiod tools, i2c-tools, spidev_test, MicroPython `machine`, the pin examples |
+| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, swap, MTD + jffs2, the pin drivers |
 | Used by | the boot benchmark (`scripts/pico-linux.sh`), `pico-shell.sh -i` | `scripts/pico-shell.sh` (default) |
 
 Outputs in each directory: `Image`, `vmlinux`, `System.map`, `linux.config`
@@ -138,14 +137,9 @@ links on the guest: `cc hello.c && ./a.out`, `tcc -run hello.c`, `cc -c`,
 
 ## Pins
 
-`PINS=1 ./run-build.sh disk` (or `disk-rootfs`, `disk-kernel`) builds the
-disk guest with the board's GPIO, I2C, SPI, PWM and ADC. The pin map, the
-tools and examples are in the top-level README; the devices are
-in `../rvemu-rs/README.md`. It adds `linux-pins.fragment` to the kernel and
-`buildroot-pins.fragment` to the root filesystem. Without it,
-`linux-disk.fragment` and `buildroot-disk.defconfig` give a guest with
-none of them. Switching between the two modes
-gives a fresh `target/`.
+The disk guest has the board's GPIO, I2C, SPI, PWM and ADC. The pin map,
+the tools and examples are in the top-level README; the devices are in
+`../rvemu-rs/README.md`.
 
 - **Drivers:** `linux/drivers/rvemu/` holds the machine's own drivers,
   which `build.sh` copies into the kernel tree (`drivers/rvemu`):
@@ -154,9 +148,9 @@ gives a fresh `target/`.
   Each one is off unless its `CONFIG_RVEMU_*` symbol is set, and binds to an
   `rvemu,*` node in the guest's device tree (`pico-shell.sh` adds the
   nodes when the kernel has the drivers).
-- **Kernel options** (`linux-pins.fragment`): `GPIO_CDEV` (v2 only),
+- **Kernel options** (`linux-disk.fragment`): `GPIO_CDEV` (v2 only),
   `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO` without buffers or triggers.
-- **Packages** (`buildroot-pins.fragment`): libgpiod 2 tools (`gpiodetect`,
+- **Packages** (`buildroot-disk.defconfig`): libgpiod 2 tools (`gpiodetect`,
   `gpioinfo`, `gpioget`, `gpioset`, `gpiomon`, ...), i2c-tools,
   `spidev_test`, and two of this repository's (`br-external/package/`):
   - `micropython-machine`: `machine.py` (compiled to
@@ -186,6 +180,8 @@ Of note in `linux-disk.fragment`:
 | `CONFIG_INET_TABLE_PERTURB_ORDER=8` | a 1 KiB RFC 6056 port perturbation table |
 | `CONFIG_VIRTIO_NET`, `CONFIG_NET`, `UNIX`, `INET`, `PACKET` | Ethernet over virtio; tmux needs AF_UNIX |
 | `EPOLL`, `EVENTFD`, `TIMERFD`, `SIGNALFD`, `INOTIFY_USER`, `SYSVIPC`, `FILE_LOCKING` | what the packages expect |
+| `GPIO_CDEV`, `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO`, `RVEMU_*` | the board's pins |
+| no `VT`, `INPUT`, `SERIO`, `HID_SUPPORT` | the board has only the serial console |
 
 ## Configuration notes
 

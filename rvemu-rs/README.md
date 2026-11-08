@@ -36,7 +36,7 @@ guest to `login:` in under a second.
 | `-W` | the swap device (below) on a modelled copy of the board's swap flash (511 sectors), with datasheet-typical erase and program times in its statistics. The guest's init enables it as `/dev/vdb`. |
 | `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N. `RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc` picks which of them go in the device tree. |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
-| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `_etext - _start` from `System.map`, rounded down to a page (3063808 for today's disk kernel). |
+| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `_etext - _start` from `System.map`, rounded down to a page (2998272 for the disk kernel). |
 | `-b FILE` | use this DTB instead of generating one |
 | `-m MB` | guest RAM (default 64) |
 | `-a ARGS` | kernel command line (default `earlycon console=ttyS0`) |
@@ -50,17 +50,16 @@ guest to `login:` in under a second.
 
 `-F`, `-W` and `-G` stand in for the board's flash, swap and pins, so the
 guest side of those features can be tried and tested without the board.
-`-X 3063808` is the disk kernel's text and `-X 3182592` the `PINS=1`
-kernel's. The guest's own
+`-X 2998272` is the disk kernel's text. The guest's own
 examples, on the board, are in the top-level README.
 
-Boot cost, batch to `login:` (77.3 M guest instructions):
+Boot cost, batch to `login:` (72.9 M guest instructions):
 
 ```
 $ ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs \
-    -m 8 -X 3063808 -N -B -u login: >/dev/null
+    -m 8 -X 2998272 -N -B -u login: >/dev/null
 ...
-guest instructions 77291960
+guest instructions 72926879
 ```
 
 `/home` across a power cut (`-F`, `RVEMU_NOR_CUT`): write a file, then cut
@@ -88,7 +87,7 @@ before it is there, and new writes work.
 Swap (`-W`): the guest's init finds the device by its serial and enables it.
 
 ```
-$ ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs -m 8 -X 3063808 -W
+$ ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs -m 8 -X 2998272 -W
 # cat /proc/swaps
 Filename				Type		Size		Used		Priority
 /dev/vdb                                partition	1788		0		-2
@@ -97,11 +96,11 @@ erase_us_max 45000
 program_us_max 700
 ```
 
-Pins (`-G`, the `PINS=1` guest, GP14 jumpered to GP15):
+Pins (`-G`, GP14 jumpered to GP15):
 
 ```
-$ RVEMU_JUMPERS=14-15 ./target/release/rvemu -k ../guest/out-pins/Image \
-    -d ../guest/out-pins/rootfs.squashfs -m 8 -X 3182592 -N -G
+$ RVEMU_JUMPERS=14-15 ./target/release/rvemu -k ../guest/out-disk/Image \
+    -d ../guest/out-disk/rootfs.squashfs -m 8 -X 2998272 -N -G
 # gpioset -c gpiochip0 -t0 GP15=1; gpioget -c gpiochip0 GP14
 "GP14"=active
 # i2cset -y 0 0x50 0x10 0xab; i2cget -y 0 0x50 0x10
@@ -401,8 +400,8 @@ Measured on the board (W25Q128, 348 MHz):
 
 `BoardPins` puts the guest's pin devices on rp235x-hal's drivers; the pin
 map is in the top-level README. `pico-shell.sh` puts the devices in the
-guest's device tree when the kernel has their drivers (a `PINS=1` guest
-build). Nothing on the emulator's hot path looks at them: the pins are
+guest's device tree when the kernel has their drivers (the disk guest's
+kernel). Nothing on the emulator's hot path looks at them: the pins are
 polled for edges only in the firmware's periodic poll (`Platform::poll_pins`,
 every 256 dispatches), and only while a line has an edge interrupt on.
 
