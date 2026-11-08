@@ -194,3 +194,357 @@ Of note in `linux-disk.fragment`:
   matters for the translator.
 - The disk kernel builds in its own source tree (`/work/linux-disk-*`):
   kbuild refuses out-of-tree builds from a tree that was built in place.
+
+## General-purpose native crypto interface
+
+The engine is a stateless primitive service, usable without SSH or Linux.
+`rvaccel::run()` is the Rust entry point and SBI `0x0a000001` is the physical
+buffer interface. The reusable Linux driver is `linux/rvemu-crypto.c`; its
+fixed-width RV32 userspace ABI is `linux/rvemu-crypto.h`. Any adapted program
+can open `/dev/rvemu-crypto` and issue `RVEMU_CRYPTO_RUN`. The Dropbear patch
+is a consumer of that interface, not part of the engine.
+
+Each request supplies operation, input pointer/length, output pointer/capacity,
+parameter pointer/length, initially-zero output length and zero flags.
+Successful calls return the actual output length in the request. The device
+is root-only by default. It uses independent physical input/output/parameter
+buffers per descriptor, serializes shared-descriptor requests, and wipes all
+used buffers after every request. User input/output buffers may overlap.
+Limits are 32 KiB input/output and 4 KiB parameters; unknown operations return
+`EOPNOTSUPP`. Failed signature validation or low-order X25519 inputs return
+`EBADMSG` without copying output back. As with other copy-to-user interfaces,
+a bad destination pointer can cause partial copying on `EFAULT`; callers
+must discard output on any error.
+
+| FID | Operation | Input | Parameters | Output |
+|---:|---|---|---|---|
+| 0 / 1 | Raw LZ4 decode / encode | block | empty | transformed bytes |
+| 2 / 3 | IETF ChaCha20-Poly1305 seal / open | plaintext / ciphertext + tag | key32 + nonce12 + AAD (up to 1024) | ciphertext + tag / plaintext |
+| 4 / 5 | Existing SSH packet seal / open | packet / packet + tag | payload key32 + header key32 + sequence BE64 | transformed packet |
+| 6 | X25519 | peer public key32 (or basepoint) | private scalar32 | shared secret/public key32 |
+| 7 | Ed25519 public-key derivation | empty | private seed32 | public key32 |
+| 8 | Ed25519 sign | arbitrary message | private seed32 | signature64 |
+| 9 | Ed25519 strict verify | arbitrary message | public key32 + signature64 | empty on success |
+| 10 | sntrup761 keypair | empty | fresh random seed32 | public key1158 + secret key1763 |
+| 11 | sntrup761 encapsulate | public key1158 | fresh random seed32 | ciphertext1039 + shared secret32 |
+| 12 | sntrup761 decapsulate | ciphertext1039 | secret key1763 | shared secret32 |
+
+No keys, identities or SSH sessions are retained in the engine. Callers own
+nonce uniqueness and randomness. The KEM consumes a freshly sampled 32-byte
+CSPRNG seed for each keypair/encapsulation; its seeded ChaCha20 generator
+expands that entropy inside the native implementation. Dropbear obtains the
+seeds from its existing `genrandom()`. KEM decapsulation preserves implicit
+rejection: malformed ciphertext produces a fallback secret, not a ciphertext
+validity error. Protocol key confirmation must still reject the mismatch.
+Ed25519 uses pure Ed25519, not Ed25519ph, and strict verification rejects weak
+keys/noncanonical signatures. These are explicit algorithm contracts, not
+protocol policy.
+
+The native implementation pins `x25519-dalek` 2.0.1 and `ed25519-dalek` 2.2.0.
+`vendor/sntrup761` contains [sntrup761 0.4.0](https://github.com/mikelodder7/sntrup761),
+with licenses/archive hash retained. Its local workspace refactor moves large
+scalar temporary arrays into caller-owned storage without changing the
+arithmetic, serialization, sampling or implicit-rejection algorithms.
+Its manifest disables dependency default features so the advertised
+allocation-free `no_std` implementation builds for bare-metal RV32. See its
+`PROVENANCE` and original manifest; tests compare 16 seeded transcripts with
+the untouched upstream implementation. All new runtime dependencies build for
+`riscv32imac-unknown-none-elf` without a C compiler or host OS RNG.
+
+Validation is independent of SSH: `tests/crypto-ioctl-test.c` signs a firmware
+manifest string, performs a KEM exchange, exercises overlapping buffers and
+checks malformed ioctl requests and rejection behavior. `rvaccel` tests use
+[RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html),
+[RFC 8032](https://www.rfc-editor.org/rfc/rfc8032.html), and
+[sntrup761 draft vectors](https://www.ietf.org/archive/id/draft-josefsson-ntruprime-streamlined-00.html).
+`python3 scripts/native-crypto-eval.py` (from `rvemu-rs/`) runs all new native
+operations, known vectors and negative cases in RV32 translator/interpreter
+lockstep, followed by the existing translator regression. Real SSH with one
+native and one original-software endpoint checks wire interoperability in
+both directions.
+
+Applications need an adapter to use this API. This is not yet a Linux Crypto
+API/AF_ALG provider, an OpenSSL provider, a key vault, or a complete TLS engine.
+The old `/dev/rvemu-ssh` packet adapter remains compatible; the new generic
+interface makes the handshake primitives available to other consumers.
+
+## SSH with native packet offload
+
+The separate SSH evaluation guest now exercises the complete path:
+
+```
+Dropbear adapters -> /dev/rvemu-crypto (generic primitives)
+                  -> /dev/rvemu-ssh (existing SSH packet adapter)
+                  -> Linux-owned physical buffers -> SBI -> native crypto engine
+```
+
+The ordinary disk defconfig does not yet install Dropbear. This test builds
+Dropbear 2026.94, the kernel bridge, and a private initramfs; it does not flash
+a board. Both endpoints run inside the emulated guest on loopback, so the
+host network stub needs no TCP forwarding.
+
+**The crypto backend is native emulator code.** The buffer SBI handler calls
+the native crypto libraries directly, outside the Linux guest's interpreter/translator. On
+RP2350 it executes directly on the physical CPU. For translator measurements,
+QEMU runs the whole RV32 firmware as a stand-in for that physical CPU; the
+native crypto does not go through the inner guest translator. The macOS host
+runner instead compiles the backend for the Mac CPU. This is a software
+crypto engine in the emulator, not an added hardware cipher peripheral.
+
+From `rvemu-rs/`:
+
+```sh
+# Build the private kernel/rootfs and run native SSH.
+python3 scripts/ssh-eval.py
+# The same firmware, but Dropbear uses its original software cipher.
+python3 scripts/ssh-eval.py --skip-build --offload off
+# Interoperability: enable only one endpoint.
+python3 scripts/ssh-eval.py --skip-build --offload client
+python3 scripts/ssh-eval.py --skip-build --offload server
+# Prove automatic software fallback when firmware has no extension.
+python3 scripts/ssh-eval.py --skip-build --without-extension
+# Board-like RAM allocation; kernel text modeled as flash (host only).
+python3 scripts/ssh-eval.py --skip-build --memory 8 --xip
+# Actual RV32 translator and host instruction accounting.
+python3 scripts/ssh-eval.py --skip-build --engine jit --offload on --timeout 600
+python3 scripts/ssh-eval.py --skip-build --engine jit --offload off --timeout 600
+# Connection setup ONLY: fresh boot, one TCP connect through authentication.
+python3 scripts/ssh-eval.py --test connection --engine jit --offload on
+python3 scripts/ssh-eval.py --skip-build --test connection --engine jit --offload off
+```
+
+Prerequisites: Docker's `rvemu-guest` image and `rvemu-guest-work` volume
+containing `/work/br`'s musl cross-toolchain, `/work/br/images/rootfs.cpio`,
+and `/work/linux-6.12.116` (produced by `guest/run-build.sh all`). Host runs
+also need Cargo and `dtc`; translator runs need QEMU and the
+`riscv32imac-unknown-none-elf` Rust target. The toolchain/base initramfs are
+cached inputs, not reproduced by this script.
+
+The builder mounts the original build volume read-only and uses a separate
+`rvemu-ssh-eval-work` volume. It enables networking in the private kernel,
+links `guest/linux/rvemu-ssh.c`, verifies Dropbear's tarball against the
+Buildroot 2026.08.1 SHA-256, applies exact edits from
+`guest/tests/dropbear/patch.py`, and assembles the rootfs. Logs, images and
+JSON results live in `rvemu-rs/target/ssh-eval/`; `--skip-build` reuses images.
+The `--offload` setting applies at runtime, keeping the firmware identical
+for on/off comparisons. `--without-extension` deliberately builds different
+firmware for the fallback test only.
+
+The guest generates disposable Ed25519 host/client keys, listens on **guest
+127.0.0.1:2222**, and forces `chacha20-poly1305@openssh.com`. Password auth is
+compiled out. It checks authentication, remote command execution and exit
+status 7, a byte-exact 64 KiB upload/download, a SHA-256-verified 1 MiB stream
+in each direction, and rejection of an unrelated key. `--bulk-mib N` adjusts
+the stream size (1–16); the stream reuses a 64 KiB buffer rather than storing
+megabytes in RAM. Host-key acceptance is automatic for this disposable
+loopback test. No keys are installed in the regular image or host, and no
+host port is opened. It does not test Wi-Fi, interactive PTYs or SFTP.
+
+The harness requires every success marker, the authentication-rejection
+message, and emulator counters. Software mode must make zero native packet
+calls. Native/mixed modes must make more than ten encrypt and decrypt calls,
+so the two negative-interface probes alone cannot produce a false pass.
+The JSON includes guest instruction count, QEMU host instruction count when
+available, simulated idle time, and host wall time. The harness also requires
+less than 60 simulated seconds of idle time; successful bytes alone must not
+hide a connection stalled until rekey. Wall time is a test diagnostic, not RP2350
+latency. Native work is omitted from guest instruction counts, so use QEMU
+**host** counts to compare total execution cost.
+
+### Interface and fallback
+
+`rvemu-ssh.h` defines a fixed-width RV32 ioctl request with source/destination
+user pointers, operation, length, the 64-byte session key and 32-bit packet
+sequence. The root-only misc device validates requests and allocates separate
+contiguous kernel buffers per open descriptor. A mutex serializes requests
+sharing a descriptor. It never hands userspace virtual pointers to SBI.
+The source is copied in, firmware is called, and output is copied to userspace
+only after success. Parameter keys are wiped after each request; data buffers are wiped on errors
+and on close. Successful calls reuse the buffers, avoiding allocation and
+whole-slab wiping for every packet. Buffers
+are limited to 32 KiB; overlapping user buffers work because the kernel owns
+separate input/output copies. Separate opens have separate buffers, and every request supplies its key
+and sequence; sessions share no implicit cipher state.
+
+The existing buffer extension gains FID 4 (SSH seal) and FID 5 (SSH open).
+Parameters are `payload key[32] || header key[32] || sequence[8, big-endian]`.
+The operation implements SSH's separate encrypted length, body counter 1,
+and Poly1305 over encrypted length plus body. The native implementation uses
+RustCrypto's ChaCha20Legacy and Poly1305 primitives, and verifies the complete
+tag in constant time before writing plaintext. It matches the independent
+[SSH specification's worked example](https://www.ietf.org/archive/id/draft-ietf-sshm-chacha20-poly1305-04.html#appendix-A).
+This is a distinct operation from the IETF AEAD hook, which remains available.
+
+Dropbear retains its original cipher state and software implementation. Its
+packet-length lookup stays in software, avoiding an ioctl for four bytes.
+Missing/inaccessible device, unsupported operation, oversized packet or
+allocation failure falls back to software; authentication and unexpected
+interface errors fail the packet. Authentication failure never triggers a
+fallback retry. `RVEMU_SSH_OFFLOAD=0` selects software explicitly; the harness
+sets server and client environments separately for interoperability checks.
+
+Validation includes malformed ioctl commands/pointers/lengths and failed
+packet authentication without modifying the userspace destination, the
+independent wire vector and every-byte ciphertext/tag tampering, synthetic
+SSH packets in translator/interpreter lockstep, and the existing translator
+regression. Both mixed-endpoint configurations and automatic firmware-absent
+fallback have passed real SSH tests. Native SSH plus the 1 MiB streams also
+passes with 8 MiB and flash-backed kernel text. That uses a small test rootfs,
+not the full disk image with every application installed.
+
+### Connection-only benchmark
+
+`--test connection` takes emulator snapshots immediately before Dropbear
+calls `connect_remote()` and when the client accepts authentication success.
+It excludes boot, persistent host/client key generation, client startup
+before the connect call, remote command execution, file transfers and
+teardown. Ephemeral key generation during the handshake is included. Both
+client and server run in the guest, so the measured cost includes both ends.
+A subsequent `true` command verifies the connection but runs after the
+measurement endpoint.
+
+Four checkpoints record connection initiation, TCP completion notification,
+initial NEWKEYS processing, and authentication success. Dropbear starts
+speculative key-exchange computation before processing asynchronous TCP
+completion, so the report deliberately groups setup and key exchange; it
+does **not** label the first interval as pure network/TCP cost.
+
+The independent, root-only `/dev/rvemu-bench` device forwards tags through
+SBI extension `0x0a000002`. Host and QEMU runners snapshot guest instructions,
+native-operation counters and idle ticks at that boundary; QEMU also reads
+the native host instruction counter. Snapshots are printed only after the
+run, outside the measured region. The service is available even without
+`pv-buffers`, allowing software-only firmware to use identical boundaries.
+Other firmware buses do not advertise this measurement service.
+
+Use `connection_samples` and `connection_medians` in the JSON. Boot/session
+totals are separated under `whole_run_diagnostics`. The parser requires all
+four ordered boundaries, monotonic counters, the negotiated KEX name, and
+native seal/open and the expected handshake primitives inside the measured
+window when offload is selected (with endpoint-specific expectations for
+mixed client/server tests).
+Missing markers or a stalled connection fail the benchmark. Host-run wall
+times are diagnostic; QEMU host instruction deltas include native crypto,
+kernel bridge costs and translator execution, but are not RP2350 cycle times.
+
+The default is one connection per fresh boot. `--repeats N` supports up to
+eight within one boot, but later samples retain translator-cache state;
+their median must not be interpreted as a clean crypto-only speed comparison.
+
+Measured first-connection results (32 MiB, identical firmware/rootfs, runtime
+offload toggle, negotiated `sntrup761x25519-sha512`, Ed25519 authentication):
+
+| Measured interval | Guest software host instructions | Native engine host instructions |
+|---|---:|---:|
+| Setup and key exchange | 3,047,195,599 | 362,422,399 |
+| Authentication | 721,723,839 | 21,516,424 |
+| Connection total | 3,768,919,438 | 383,938,823 |
+
+The general-purpose handshake primitives reduce the connection's total host
+instruction count by **89.8% (9.82× fewer instructions)** in this paired run.
+Guest instructions fall from 650,199,005 to 14,258,409. Both connections have
+zero simulated idle ticks inside the measured window. Native counters prove
+four X25519 operations, two Ed25519 signatures, two verifications, one
+sntrup761 keypair, one encapsulation and one decapsulation, in addition to
+nine packet seals and nine opens. Persistent Ed25519 key generation occurs
+outside the connection window.
+
+This measures the combined benefit of native execution and different native
+library implementations; it is not a pure translator-overhead comparison.
+The original packet-only experiment did not improve connection setup because
+its key exchange and signatures remained guest code. Logs/results use the
+`connection-r1` suffix; no network algorithm has been downgraded to obtain
+these savings.
+
+The connection test also passes with firmware lacking the native extension
+and with an 8 MiB XIP-modeled guest. Boundary ABI tests cover unsupported
+hosts/functions, invalid tags, bounded recording and userspace privilege;
+parser tests reject missing/duplicate/reversed markers and incorrect crypto
+path counters (`python3 scripts/test-ssh-measurements.py` from `rvemu-rs/`).
+
+### Event-loop regression found by the test
+
+The original native streaming run passed its byte checks but spent almost
+eight simulated hours idle. A guest PC sample showed timer handling rather
+than cipher work, and a temporary Dropbear timeout diagnostic localized the
+stall to connection shutdown. `channelio()` could drain the last buffered
+output and remove the final client channel **after** `cli_sessionloop()` had
+checked for completion. The following `select()` then waited until the
+eight-hour rekey deadline before checking completion again.
+
+The source patch now invokes the existing client loop handler immediately
+when `channelio()` removes the last channel. This fix applies equally to
+native and software modes. The native test's idle time drops from about
+28,511 seconds to one second. No keepalive or shortened rekey timeout masks
+the problem. The harness's idle-time bound guards against its recurrence.
+
+Native-call counters count attempts, including deliberate boundary-test
+errors outside the connection measurement window. The full integration test
+continues to exercise transfers, failed authentication and shutdown behavior;
+its boot/session totals are not used as connection measurements.
+
+### Native memory and stack budget
+
+Firmware uses `rvaccel::Workspace::run`, with exclusively owned reusable
+storage per emulated CPU. The RV32 workspace is **53,248 bytes (52 KiB)**:
+28,620 bytes of KEM scratch, a 24 KiB execution stack, counters and alignment.
+Large scalar reciprocal, polynomial-product, sampling and encoding arrays
+live in scratch. Separate operation frames prevent small crypto calls from
+inheriting larger operations' local buffers. LZ4's 8 KiB table and remaining
+library temporaries use the dedicated stack. No allocation occurs per call.
+The hosted convenience `rvaccel::run` still allocates scratch on its caller's
+stack; small-stack firmware must use the workspace entry point.
+
+The RV32 trampoline preserves the original stack and ABI, then calls the
+engine on the workspace stack. KEM scratch and the entire execution stack
+are erased before returning. Every call records its stack watermark and
+checks a 256-byte low-water guard. That guard detects budget violations;
+it is not a hardware barrier and does not prevent an overflow. The regression
+suite requires every tested operation to stay below 20 KiB, leaving at least
+4 KiB of the 24 KiB allocation unused.
+
+Release RV32 measurements from `scripts/native-crypto-eval.py` (bytes,
+including dispatch/callback frames, repeated calls and rejection paths):
+
+| Operation | Native execution stack high-water |
+|---|---:|
+| LZ4 decode / encode | 636 / 8,972 |
+| IETF ChaCha20-Poly1305 seal / open | 1,308 / 1,308 |
+| SSH packet seal / open | 868 / 868 |
+| X25519 | 3,320 |
+| Ed25519 public / sign / verify | 4,792 / 4,792 / 8,376 |
+| sntrup761 keypair / encapsulate / decapsulate | 14,716 / 11,164 / 17,788 |
+
+The former shared-stack build measured 30,988 bytes for isolated keypair and
+28,540 for decapsulation with the same measurement wrapper. The new maximum
+is 17,788 bytes, leaving 6,788 bytes in the execution stack. These are observed
+high-water marks for this compiler/profile and test corpus, not a formal bound
+for all builds or inputs. The SSH connection's separate QEMU control-stack
+high-water is now 21,688 bytes, including harness setup.
+
+QEMU reserves independent workspaces for the translator and reference CPU.
+The Pico **shell** feature `pv-buffers` reserves the top **64 KiB of PSRAM**,
+outside both guest RAM and the optional translator backing store; a compile-time
+size check and guest-header bounds check enforce the reservation. Native calls
+use only a small wrapper on core0's normal SRAM stack (64 bytes plus the
+16-byte trampoline frame in the inspected release build). Other bare-metal
+frontends that do not provision a workspace report the extension unavailable.
+The feature remains off by default.
+
+Build without flashing:
+
+```sh
+cd rvemu-rs
+cargo build --release -p rvemu-pico --bin rvemu-pico-shell \
+  --target riscv32imac-unknown-none-elf --features pv-buffers
+python3 scripts/native-crypto-eval.py
+```
+
+`scripts/pico-shell.sh -C` is the explicit deployment option; it enables the
+feature and limits the existing whole-MiB guest packer to 7 MiB. It does not
+install the experimental kernel adapters automatically. The board firmware
+links successfully, with 10,048 bytes remaining for core0's ordinary stack.
+No board was flashed or timed. Actual PSRAM/cache performance, interrupts and
+hardware stack behavior still need an on-device run; QEMU instruction counts
+are not RP2350 cycle measurements. The latest connection and 1 MiB bidirectional
+SSH integration regressions pass with the guarded workspace enabled.

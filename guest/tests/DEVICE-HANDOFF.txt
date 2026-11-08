@@ -1,0 +1,66 @@
+Task: Take over the native emulator crypto work on Josh(2) and TEST ON THE PHYSICAL RP2350 DEVICE. The user explicitly requested a new agent on Josh(2), with instructions to test on device. This includes building/adapting the experimental guest and flashing the test firmware via the repository's device workflow. Preserve unrelated device/user data and local source edits. Do not claim hardware validation from compilation or QEMU. Fix issues encountered and report actual device measurements.
+
+Source handoff:
+Repository: https://github.com/jvanderberg/rp2350-linux
+Handoff branch: handoff/native-crypto-device-test
+Implementation base: 084f4bdfecac4d50cc93d7f7a8ef990feb74099a
+The implementation and this briefing are committed together on the handoff branch.
+Fetch origin/handoff/native-crypto-device-test and use its exact head in the
+receiving agent's checkout. Preserve existing recipient edits; do not reset or
+clean unrelated work. Build caches, compiled images and Docker volumes are not
+included. Selected source-machine measurement results are in
+`guest/tests/native-crypto-workspace-evidence.json`.
+
+Intent/context:
+The user controls emulator/interpreter/translator and guest kernel sources. They wanted native compression/encryption hooks, real SSH as a test, and specifically CONNECTION-ONLY benchmarking. Native means crypto runs directly in host/emulator firmware, outside guest instruction translation. QEMU still emulates the physical RV32 CPU. The API must remain general purpose, not tied to SSH or benchmark-specific keys/messages.
+
+Implemented:
+- rvemu-rs/rvaccel: no_std allocation-free native engine for LZ4 decode/encode, IETF ChaCha20Poly1305 seal/open, OpenSSH packet seal/open, X25519, Ed25519 public/sign/strict verify, sntrup761 keypair/encapsulation/decapsulation. FIDs 0..12 under SBI EID 0x0a000001. Bounded physical input/output/parameter ranges, no overlapping output with inputs, no MMIO/readonly output. MAX_BUFFER=32768, MAX_PARAMS=4096. Preserve all ABI contracts and KEM implicit rejection.
+- guest/linux/rvemu-crypto.[ch]: generic root-only /dev/rvemu-crypto ioctl adapter with kernel-owned staging buffers, validation and erasure. rvemu-ssh.[ch] handles SSH packet API and independent benchmark markers.
+- guest/tests/dropbear/patch.py and *.inc: pinned Dropbear 2026.94 adapters for primitives and packets, original software fallback only when unsupported. Fresh guest-generated random seeds. Preserve the channel-close event-loop fix that avoids an 8-hour simulated idle stall.
+- rvcore native-write notifications and rvjit invalidation maintain correctness even for partial writes on errors. Benchmark snapshots have 13 native counters.
+
+Latest stack fixes:
+- rvaccel/src/workspace.rs: per-CPU caller-owned workspace, 53,248 bytes on RV32. Includes 28,620-byte KEM scratch, 24 KiB private execution stack, counters/alignment. init_at initializes reserved memory in place without a giant return temporary. Exclusive mutable borrowing; no hidden shared workspace/global lock. RV32 assembly trampoline preserves ABI and switches from normal control stack. Stack painted, high-water measured per operation; 256-byte low-water guard checked; whole execution stack erased after calls. Guard is diagnostic, NOT hardware overflow prevention. Native release tests require <=20 KiB usage, giving >=4 KiB margin in the 24 KiB stack.
+- vendor/sntrup761 0.4.0 has explicit borrowed scratch for scalar reciprocal, product, sampling, encoding. Public *_with_workspace methods erase scratch. Arithmetic/serialization/sampling/implicit rejection unchanged. PROVENANCE records modifications. 16 seeded transcript hashes match the untouched upstream crate. Independent RFC/IETF vectors also pass.
+- asymmetric.rs operation functions have separate frames so small primitives do not inherit large temporary storage.
+- Cpu::set_native_workspace transfers exclusive ownership of a workspace. Bare-metal firmware without provisioning reports extension unavailable even if rvcore/pv-buffers was enabled. Hosted fallback convenience run still uses caller stack; small-stack firmware MUST use Workspace::run.
+- QEMU frontend --features pv-buffers reserves separate translator/reference workspaces; host frontend reserves one. scripts/virt.sh translates old rvcore/pv-buffers feature spelling to frontend pv-buffers.
+- Pico shell --features pv-buffers reserves the TOP 64 KiB OF PSRAM, outside guest RAM and optional translator backing store. Compile-time size assertion and guest header RAM_MAX validation. No per-call allocation; ordinary wrapper 64B + trampoline16B in inspected board release disassembly. Final linked core0 SRAM stack 10,048B.
+- scripts/pico-shell.sh -C is opt-in deployment flag; guest packer currently takes whole MiB, so it caps guest to 7 MiB. Feature remains off by default. It DOES NOT automatically install experimental kernel adapters.
+
+Measured RV32 operation stack peaks in bytes:
+LZ4 decode636 encode8972; IETF AEAD seal/open1308; SSH seal/open868;
+X25519 3320; Ed25519 public/sign4792 verify8376;
+sntrup keypair14716 encaps11164 decaps17788.
+Whole QEMU control-stack high-water is21688 including harness setup. Do not mistake this for Pico runtime stack. Private execution stack peak17788 leaves6788 bytes spare. Hardware peak/interrupt behavior still unmeasured.
+
+Validation completed (all pass):
+- cargo test -p rvaccel -p rvcore --features rvcore/pv-buffers,rvcore/pv-pages (from rvemu-rs).
+- cargo test -p rvcore --no-default-features.
+- vendored sntrup unit suite: 19 tests with no defaults and kgen,ecap,dcap,force-scalar.
+- scripts/native-crypto-eval.py: independent RFC7748/RFC8032/IETF decap vectors, malformed inputs and implicit rejection, all 13 operations with large buffers, three repeated uses of each workspace, translator/interpreter lockstep, budget enforcement, firmware-without-workspace rejection, jittest signature56c7e73f.
+- scripts/test-ssh-measurements.py.
+- scripts/ssh-eval.py --engine jit --test connection --offload on|off --skip-build, one fresh boot each.
+- scripts/ssh-eval.py --engine jit --test integration --offload on --skip-build: generic crypto ABI checks, SSH auth, exit status, 64KiB transfer and 1MiB in EACH direction, wrong-key rejection.
+- cargo build --release -p rvemu-pico --bin rvemu-pico-shell --target riscv32imac-unknown-none-elf --features pv-buffers.
+No board flashed or executed by the source agent.
+
+Latest connection-only benchmark (guest loopback both endpoints, default hybrid sntrup761x25519-sha512, Ed25519 auth, chacha20poly1305):
+Native host instructions: setup362422399 auth21516424 total383938823.
+Guest software host instructions: setup3047195599 auth721723839 total3768919438.
+89.8% fewer host instructions (~9.82x); guest instructions14258409 vs650199005; zero simulated idle in measured window. Native counters in connection: 9 packet seals,9 opens,4 X25519,2 signatures,2 verifications,1 KEM keypair,1 encap,1 decap. Persistent key generation excluded. Marker0 before connect,2 NEWKEYS,3 auth success. Exclude boot/commands/transfers/shutdown from connection latency; don't use whole-session counters. Native library differences contribute too, not pure translator overhead.
+
+Build/test resources on SOURCE machine, not presumed on Josh(2):
+Docker image rvemu-guest; rvemu-guest-work volume (/work/br cross toolchain and base initramfs; /work/linux-6.12.116); private rvemu-ssh-eval-work:/eval contains copied experimental kernel and Dropbear. guest/tests/build-ssh-eval.sh reconstructs private test image. Source target/ssh-eval has Image, rootfs.cpio, System.map, Dropbear tarball and logs/results. scripts/ssh-eval.py without --skip-build builds via Docker. Docker mutations used --user0. Linux source was obtained in the private Docker volume although initial work had only emulator checkout. Device may already have board-appropriate kernel/build resources: inspect first.
+
+Next steps/acceptance:
+1. Inspect Josh(2)'s repo instructions, attached board/debug/USB tools, current firmware/build workflow and available kernel sources. Verify correct physical board and preserve current recoverable setup. Do not blindly flash the 32MiB QEMU rootfs: board has8MiB PSRAM, reserves64KiB, packer uses7MiB, flash/XIP split and disk-root workflow matter.
+2. Integrate the generic crypto + benchmark adapters and suitable Dropbear into a BOARD-APPROPRIATE guest (likely disk-root/squashfs), using existing board scripts/layout. Maintain fresh runtime test keys, native/software toggles, same crypto algorithms. User has authorized on-device testing, including necessary normal flashing workflow; ask only if the actual device identity/destructive scope is unresolved.
+3. Boot feature-enabled firmware; prove kernel/device adapter and actual SBI native calls work on the board. Confirm guest/translator cannot touch reserved workspace, PSRAM initialization precedes workspace initialization, and no incompatible Hazard3 atomics are used in PSRAM.
+4. Collect BOTH normal core0/core1 stack usage and native per-operation peaks/guard results under successful and rejected crypto calls and repeated sessions. Add diagnostic plumbing as necessary: Cpu::native_stack_peaks already available; board currently lacks per-operation status reporting. Exercise interrupt/USB/network activity during native operations and check responsiveness/recovery. Ordinary stack and private stack must remain within budgets.
+5. Run standalone generic crypto ABI/vector tests and real SSH authentication, wrong-key rejection, exit-status and bidirectional transfer tests on hardware. Confirm interoperability and fallback.
+6. Benchmark CONNECTION ONLY with native on/off, same configuration and fresh-boot discipline. Report actual elapsed time/cycles on RP2350, not QEMU instruction counts, along with clock settings, guest RAM, algorithms, CPU/PSRAM/cache behavior and workspace overhead. Do not conflate connection setup with bulk throughput.
+7. Fix regressions without SSH-specific hacks or weakened verification; rerun relevant checks. Report concrete hardware evidence, changed files and remaining limitations. Keep hardware fixes on this branch or a branch based on it; preserve unrelated local work. Do not spawn further agents unless asked.
+
+Relevant docs: guest/README.md sections General-purpose native crypto interface, Connection-only benchmark, Native memory and stack budget; rvemu-rs/README.md; vendor/sntrup761/PROVENANCE. They contain full contracts, testing commands, memory layout and measured numbers.

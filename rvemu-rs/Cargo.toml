@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["rvcore", "rvemu", "rvjit", "rvemu-virt", "rvemu-pico"]
+members = ["rvaccel", "rvcore", "rvemu", "rvjit", "rvemu-virt", "rvemu-pico"]
+exclude = ["vendor/sntrup761"]
 # rvemu-virt (QEMU) and rvemu-pico (RP2350) are bare-metal riscv32 only;
 # jittest-guest is a separate workspace built for the guest (rv32ima)
 default-members = ["rvcore", "rvemu", "rvjit"]

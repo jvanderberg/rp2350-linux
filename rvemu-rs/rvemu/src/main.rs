@@ -194,6 +194,8 @@ impl Flash for ModelFlash {
 // ------------------------------------------------------------------ bus
 
 struct HostBus {
+    benchmarks: rvcore::benchmark::Log,
+    benchmark_epoch: Instant,
     plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>, StubPins>,
     interactive: bool,
 }
@@ -207,6 +209,10 @@ impl HostBus {
 }
 
 impl Bus for HostBus {
+    fn benchmark_supported(&self) -> bool { true }
+    fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
+        self.benchmarks.record(cpu, tag, 0, self.benchmark_epoch.elapsed().as_nanos() as u64)
+    }
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
         self.plat.mmio_load(pa, size)
     }
@@ -534,6 +540,7 @@ mod model {
 
 fn report(c: &Cpu, host_s: f64) {
     let s = &c.stats;
+    eprintln!("native buffer calls {:?}", s.native_buffer_calls);
     let op = &s.op;
     let n = c.instret;
     let alu = op[0x13] + op[0x33] + op[0x37] + op[0x17];
@@ -802,7 +809,12 @@ fn run() -> Result<(), String> {
 
     // SAFETY: `ram` outlives `cpu` and is only accessed through it from here on.
     let mut cpu = Box::new(unsafe { Cpu::new(ram.as_mut_ptr(), ram_base, ram_size, ram_base, ram_base + dtb_addr) });
+    #[cfg(feature = "pv-buffers")]
+    cpu.set_native_workspace(Box::leak(Box::new(rvcore::NativeWorkspace::new())));
     if o.model || o.sim.is_some() {
+        if rvcore::NATIVE_BUFFERS {
+            return Err("native buffer calls are not supported by -M/-S; build without pv-buffers".into());
+        }
         cpu.inst.enable_model();
     }
     let mut sim = match &o.sim {
@@ -830,7 +842,8 @@ fn run() -> Result<(), String> {
     if o.io {
         plat = plat.with_io(StubPins::new(), gmem);
     }
-    let mut bus = HostBus { plat, interactive: !o.batch };
+    let mut bus = HostBus { plat, interactive: !o.batch,
+        benchmarks: Default::default(), benchmark_epoch: Instant::now() };
 
     eprintln!(
         "[rvemu] RAM {} MiB, kernel {} bytes, initrd {} bytes @0x{:x}, dtb @0x{:x}",
@@ -892,6 +905,7 @@ fn run() -> Result<(), String> {
         if cpu.privilege == Priv::S { 'S' } else { 'U' }
     );
     report(&cpu, host_s);
+    for point in bus.benchmarks.points() { eprintln!("{point}"); }
     if let Some(s) = &mut sim {
         s.finish(&cpu)?;
     }

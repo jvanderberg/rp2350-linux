@@ -1,0 +1,373 @@
+{
+  "scope": "Source-machine QEMU RV32 results only. No physical-device execution.",
+  "native_vectors": [
+    {
+      "name": "x25519-rfc7748",
+      "mode": 2,
+      "guest_instructions": 788,
+      "host_instructions": 29088330,
+      "native_stack_bytes": 3320,
+      "operation": 6
+    },
+    {
+      "name": "ed25519-rfc8032-public",
+      "mode": 2,
+      "guest_instructions": 788,
+      "host_instructions": 29987562,
+      "native_stack_bytes": 4792,
+      "operation": 7
+    },
+    {
+      "name": "ed25519-rfc8032-sign",
+      "mode": 2,
+      "guest_instructions": 1460,
+      "host_instructions": 49069951,
+      "native_stack_bytes": 4792,
+      "operation": 8
+    },
+    {
+      "name": "ed25519-rfc8032-verify",
+      "mode": 2,
+      "guest_instructions": 98,
+      "host_instructions": 32593242,
+      "native_stack_bytes": 8376,
+      "operation": 9
+    },
+    {
+      "name": "x25519-low-order",
+      "mode": 2,
+      "guest_instructions": 779,
+      "host_instructions": 29084479,
+      "native_stack_bytes": 3320,
+      "operation": 6
+    },
+    {
+      "name": "ed25519-bad-signature",
+      "mode": 2,
+      "guest_instructions": 779,
+      "host_instructions": 32882969,
+      "native_stack_bytes": 8376,
+      "operation": 9
+    },
+    {
+      "name": "sntrup761-keypair",
+      "mode": 2,
+      "guest_instructions": 61457,
+      "host_instructions": 1247728542,
+      "native_stack_bytes": 14716,
+      "operation": 10
+    },
+    {
+      "name": "sntrup761-encap",
+      "mode": 2,
+      "guest_instructions": 22607,
+      "host_instructions": 60439944,
+      "native_stack_bytes": 11164,
+      "operation": 11
+    },
+    {
+      "name": "sntrup761-ietf-decap-0",
+      "mode": 2,
+      "guest_instructions": 788,
+      "host_instructions": 118540201,
+      "native_stack_bytes": 17788,
+      "operation": 12
+    },
+    {
+      "name": "sntrup761-ietf-decap-1",
+      "mode": 2,
+      "guest_instructions": 788,
+      "host_instructions": 118540201,
+      "native_stack_bytes": 17788,
+      "operation": 12
+    },
+    {
+      "name": "sntrup761-implicit-rejection",
+      "mode": 2,
+      "guest_instructions": 788,
+      "host_instructions": 118542344,
+      "native_stack_bytes": 17788,
+      "operation": 12
+    },
+    {
+      "name": "aead-seal-max",
+      "mode": 2,
+      "guest_instructions": 688244,
+      "host_instructions": 190969143,
+      "native_stack_bytes": 1308,
+      "operation": 2
+    },
+    {
+      "name": "aead-open-max",
+      "mode": 2,
+      "guest_instructions": 687908,
+      "host_instructions": 190888271,
+      "native_stack_bytes": 1308,
+      "operation": 3
+    },
+    {
+      "name": "aead-bad-tag-max",
+      "mode": 2,
+      "guest_instructions": 687899,
+      "host_instructions": 182569737,
+      "native_stack_bytes": 1280,
+      "operation": 3
+    },
+    {
+      "name": "ssh-seal-max",
+      "mode": 2,
+      "guest_instructions": 688244,
+      "host_instructions": 190122807,
+      "native_stack_bytes": 868,
+      "operation": 4
+    },
+    {
+      "name": "ssh-open-max",
+      "mode": 2,
+      "guest_instructions": 687908,
+      "host_instructions": 190040445,
+      "native_stack_bytes": 868,
+      "operation": 5
+    },
+    {
+      "name": "lz4-encode-max-bound",
+      "mode": 2,
+      "guest_instructions": 3455,
+      "host_instructions": 13133385,
+      "native_stack_bytes": 8972,
+      "operation": 1
+    },
+    {
+      "name": "lz4-decode-large",
+      "mode": 2,
+      "guest_instructions": 625286,
+      "host_instructions": 164359328,
+      "native_stack_bytes": 636,
+      "operation": 0
+    },
+    {
+      "name": "lz4-decode-max",
+      "mode": 2,
+      "guest_instructions": 688244,
+      "host_instructions": 177967187,
+      "native_stack_bytes": 620,
+      "operation": 0
+    },
+    {
+      "name": "ed25519-sign-max",
+      "mode": 2,
+      "guest_instructions": 1460,
+      "host_instructions": 91888605,
+      "native_stack_bytes": 4792,
+      "operation": 8
+    },
+    {
+      "name": "ed25519-verify-max",
+      "mode": 2,
+      "guest_instructions": 98,
+      "host_instructions": 53916861,
+      "native_stack_bytes": 8376,
+      "operation": 9
+    },
+    {
+      "name": "native-workspace-required",
+      "mode": 2,
+      "guest_instructions": 38,
+      "host_instructions": 10685980
+    },
+    {
+      "name": "jittest-native-crypto",
+      "mode": 2,
+      "guest_instructions": 9541142,
+      "host_instructions": 1613277934
+    }
+  ],
+  "connection": {
+    "on": {
+      "connection_samples": [
+        {
+          "setup_and_key_exchange": {
+            "guest_instructions": 13622821,
+            "host_instructions": 362422399,
+            "host_elapsed_seconds": null,
+            "guest_idle_seconds": 0.0,
+            "native_buffer_calls": [
+              0,
+              0,
+              0,
+              0,
+              5,
+              2,
+              4,
+              0,
+              1,
+              1,
+              1,
+              1,
+              1
+            ]
+          },
+          "authentication": {
+            "guest_instructions": 635588,
+            "host_instructions": 21516424,
+            "host_elapsed_seconds": null,
+            "guest_idle_seconds": 0.0,
+            "native_buffer_calls": [
+              0,
+              0,
+              0,
+              0,
+              4,
+              7,
+              0,
+              0,
+              1,
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "connection": {
+            "guest_instructions": 14258409,
+            "host_instructions": 383938823,
+            "host_elapsed_seconds": null,
+            "guest_idle_seconds": 0.0,
+            "native_buffer_calls": [
+              0,
+              0,
+              0,
+              0,
+              9,
+              9,
+              4,
+              0,
+              2,
+              2,
+              1,
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "connection_medians": {
+        "setup_and_key_exchange": {
+          "guest_instructions": 13622821,
+          "host_instructions": 362422399,
+          "host_elapsed_seconds": null,
+          "guest_idle_seconds": 0.0
+        },
+        "authentication": {
+          "guest_instructions": 635588,
+          "host_instructions": 21516424,
+          "host_elapsed_seconds": null,
+          "guest_idle_seconds": 0.0
+        },
+        "connection": {
+          "guest_instructions": 14258409,
+          "host_instructions": 383938823,
+          "host_elapsed_seconds": null,
+          "guest_idle_seconds": 0.0
+        }
+      }
+    },
+    "off": {
+      "connection_samples": [
+        {
+          "setup_and_key_exchange": {
+            "guest_instructions": 529388459,
+            "host_instructions": 3047195599,
+            "host_elapsed_seconds": null,
+            "guest_idle_seconds": 0.0,
+            "native_buffer_calls": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "authentication": {
+            "guest_instructions": 120810546,
+            "host_instructions": 721723839,
+            "host_elapsed_seconds": null,
+            "guest_idle_seconds": 0.0,
+            "native_buffer_calls": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "connection": {
+            "guest_instructions": 650199005,
+            "host_instructions": 3768919438,
+            "host_elapsed_seconds": null,
+            "guest_idle_seconds": 0.0,
+            "native_buffer_calls": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "connection_medians": {
+        "setup_and_key_exchange": {
+          "guest_instructions": 529388459,
+          "host_instructions": 3047195599,
+          "host_elapsed_seconds": null,
+          "guest_idle_seconds": 0.0
+        },
+        "authentication": {
+          "guest_instructions": 120810546,
+          "host_instructions": 721723839,
+          "host_elapsed_seconds": null,
+          "guest_idle_seconds": 0.0
+        },
+        "connection": {
+          "guest_instructions": 650199005,
+          "host_instructions": 3768919438,
+          "host_elapsed_seconds": null,
+          "guest_idle_seconds": 0.0
+        }
+      }
+    }
+  },
+  "validation": [
+    "RFC7748/RFC8032/IETF known answers and rejection paths",
+    "16 seeded transcript hashes against untouched upstream sntrup761 0.4.0",
+    "Repeated per-CPU workspace reuse and all 13 operations in RV32 lockstep",
+    "Missing-workspace firmware fails closed",
+    "Generic kernel crypto ABI, SSH authentication/exit status/wrong-key rejection, 64 KiB and 1 MiB transfers in each direction",
+    "Pico shell release build with pv-buffers passed; no board run"
+  ]
+}

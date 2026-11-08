@@ -11,3 +11,6 @@ bench = false
 [dependencies]
 rvcore = { path = "../rvcore" }
 rvjit = { path = "../rvjit" }
+
+[features]
+pv-buffers = ["rvcore/pv-buffers"]

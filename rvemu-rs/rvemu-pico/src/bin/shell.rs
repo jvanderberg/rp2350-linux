@@ -71,7 +71,15 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 /// 1 MiB store made the boot slower (9.9 s against 8.0 s; XIP misses 3.7 M
 /// -> 12.7 M). With `STORE_WORDS = (1 << 20) / 4` the guest gets 7 MiB.
 const STORE_WORDS: usize = 0;
-const RAM_MAX: u32 = (8 << 20) - (STORE_WORDS * 4) as u32;
+#[cfg(feature = "pv-buffers")]
+const NATIVE_BYTES: usize = 64 * 1024;
+#[cfg(not(feature = "pv-buffers"))]
+const NATIVE_BYTES: usize = 0;
+#[cfg(feature = "pv-buffers")]
+const NATIVE_BASE: usize = board::PSRAM_CACHED + (8 << 20) - NATIVE_BYTES;
+#[cfg(feature = "pv-buffers")]
+const _: () = assert!(core::mem::size_of::<rvcore::NativeWorkspace>() <= NATIVE_BYTES);
+const RAM_MAX: u32 = (8 << 20) - (STORE_WORDS * 4 + NATIVE_BYTES) as u32;
 const STORE: usize = board::PSRAM_CACHED + RAM_MAX as usize;
 
 /// Root filesystem image in flash, after the 2 MB blob: a squashfs, sized by
@@ -662,6 +670,10 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     let cpu = unsafe {
         let p = (*addr_of_mut!(CPU)).as_mut_ptr();
         let c = Cpu::init(p, h.ram_host() as *mut u8, 0, h.ram_size, 0, dtb);
+        #[cfg(feature = "pv-buffers")]
+        // PSRAM has been initialized and checked. h.valid(RAM_MAX) excludes
+        // this reservation from both guest RAM and the translator store.
+        c.set_native_workspace(rvcore::NativeWorkspace::init_at(NATIVE_BASE as *mut _));
         c.set_readonly_prefix(h.text_len);
         c
     };

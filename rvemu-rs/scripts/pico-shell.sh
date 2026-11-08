@@ -4,7 +4,7 @@
 #   screen /dev/cu.usbmodemrvemu1 115200        (Ctrl-A k to quit)
 # The board goes back to BOOTSEL on `stty -f PORT 1200`, which this script
 # also uses to replace a running shell.
-#   scripts/pico-shell.sh [-m RAM_MB] [-i] [-b] [-w]
+#   scripts/pico-shell.sh [-m RAM_MB] [-i] [-b] [-w] [-C]
 # Default: guest/out-disk, root on a squashfs in flash (nano, tmux,
 # MicroPython, ...; guest/run-build.sh disk). -i: the small initramfs guest in
 # guest/out. -b: (re)build that guest in Docker first (guest/run-build.sh;
@@ -14,8 +14,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/pico-common.sh
-M=8; INITRAMFS=0; BUILD=0; SWAP=0
-while getopts "m:ibw" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; w) SWAP=1;; *) exit 2;; esac; done
+M=8; INITRAMFS=0; BUILD=0; SWAP=0; CRYPTO=0
+while getopts "m:ibwC" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; w) SWAP=1;; C) CRYPTO=1;; *) exit 2;; esac; done
+# -C enables the experimental native buffer engine and reserves the top 64 KiB
+# of PSRAM. The existing guest packer takes whole MiB, so use at most 7 MiB.
+FEATURES=()
+if [ "$CRYPTO" = 1 ]; then
+  FEATURES=(--features pv-buffers)
+  [ "$M" -le 7 ] || M=7
+fi
 if [ $BUILD = 1 ]; then
   if [ $INITRAMFS = 1 ]; then ../guest/run-build.sh all; else ../guest/run-build.sh disk; fi
 fi
@@ -29,7 +36,7 @@ ELF=target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 cargo build -q --release -p rvemu
-cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
+cargo build -q --release -p rvemu-pico --bin rvemu-pico-shell --target riscv32imac-unknown-none-elf "${FEATURES[@]}"
 # the pin devices only for a kernel with their drivers (the disk guest's)
 IO=0; grep -q '^CONFIG_RVEMU_GPIO=y' "$(dirname "$K")/linux.config" 2>/dev/null && IO=1
 NET=1 NOR=1 SWAP=$SWAP IO=$IO pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"

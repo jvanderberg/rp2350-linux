@@ -7,3 +7,6 @@ edition = "2024"
 rvcore = { path = "../rvcore", features = ["instrument"] }
 rvjit = { path = "../rvjit" }
 libc = "0.2"
+
+[features]
+pv-buffers = ["rvcore/pv-buffers"]

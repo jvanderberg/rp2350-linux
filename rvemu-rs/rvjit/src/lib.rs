@@ -1690,6 +1690,17 @@ impl<'m> Jit<'m> {
         if let Some(p) = cpu.smc_page.take() {
             self.invalidate_page(cpu, p);
         }
+        if let Some((lo, hi)) = cpu.take_native_write() {
+            let mut page = lo & !0xFFF;
+            while page < hi {
+                let n = ((page - cpu.ram_base()) >> 12) as usize;
+                if self.code_pages[n >> 3] & (1 << (n & 7)) != 0 {
+                    self.invalidate_page(cpu, page);
+                }
+                let Some(next) = page.checked_add(0x1000) else { break };
+                page = next;
+            }
+        }
         // device writes to guest RAM (always from an interpreted MMIO store)
         while let Some((lo, hi)) = bus.take_dma_write() {
             let mut page = lo & !0xFFF;

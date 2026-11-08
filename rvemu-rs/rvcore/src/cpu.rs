@@ -74,6 +74,9 @@ pub struct TlbEntry {
 
 /// Everything outside the hart: MMIO devices, console, idle policy.
 pub trait Bus {
+    /// Optional host-only measurement service; independent of native crypto.
+    fn benchmark_supported(&self) -> bool { false }
+    fn benchmark_record(&mut self, _cpu: &Cpu, _tag: u32) -> bool { false }
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32>;
     fn mmio_store(&mut self, pa: u32, size: u32, val: u32) -> Result<(), u32>;
     /// Level of the PLIC's S-mode external interrupt output.
@@ -155,6 +158,10 @@ pub struct Cpu {
     /// a write-TLB entry; the first one sets `smc_page`.
     pub code_pages: *const u8,
     pub smc_page: Option<u32>,
+    #[cfg(feature = "pv-buffers")]
+    pub(crate) native_write: Option<(u32, u32)>,
+    #[cfg(feature = "pv-buffers")]
+    pub(crate) native_workspace: *mut rvaccel::Workspace,
 
     pub halt: Option<Halt>,
     pub stats: Stats,
@@ -219,6 +226,8 @@ impl Cpu {
     #[inline(always)]
     fn fresh(ram: *mut u8, ram_base: u32, ram_size: u32, entry: u32) -> Self {
         Cpu {
+            #[cfg(feature = "pv-buffers")]
+            native_workspace: core::ptr::null_mut(),
             x: [0; 32],
             pc: entry,
             jit: JitRegs { budget: 0, exit_pc: 0, exit_info: 0, host_sp: 0, tlb_cur: [0; ACC_N], jc_base: 0, irq_pending: 0 },
@@ -249,10 +258,25 @@ impl Cpu {
             ro_size: 0,
             code_pages: core::ptr::null(),
             smc_page: None,
+            #[cfg(feature = "pv-buffers")]
+            native_write: None,
             halt: None,
             stats: Stats::new(),
             inst: Instrument::new(ram_size),
             tlb: [[[TlbEntry { tag: 0, addend: 0 }; TLB_SIZE]; ACC_N]; MMU_N],
+        }
+    }
+
+    /// Physical output range from a native buffer call, including failed calls.
+    #[inline(always)]
+    pub fn take_native_write(&mut self) -> Option<(u32, u32)> {
+        #[cfg(feature = "pv-buffers")]
+        {
+            self.native_write.take()
+        }
+        #[cfg(not(feature = "pv-buffers"))]
+        {
+            None
         }
     }
 

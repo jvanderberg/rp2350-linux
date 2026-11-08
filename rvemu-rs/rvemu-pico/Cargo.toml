@@ -39,3 +39,6 @@ embassy-time-driver = "0.2.2"
 embassy-futures = "0.1.2"
 embedded-hal = "1.0"
 pio = "0.3"
+
+[features]
+pv-buffers = ["rvcore/pv-buffers"]

@@ -1,0 +1,12 @@
+[package]
+name = "pvbench-guest"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+rvaccel = { path = "../rvaccel" }
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = true
+codegen-units = 1

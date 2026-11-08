@@ -599,3 +599,269 @@ The model accounts for the current design:
 - **A hot-threshold policy barely helps.** The cost is thrashing of hot
   code, not translating cold code once.
 - **A ring of regions beats flush-all** at the same size.
+
+## Experimental native page operations (emulator-only evaluation)
+
+`rvcore/pv-pages` enables an experimental firmware-specific SBI extension,
+**off by default**. This page-only experiment includes no kernel adapter. The later SSH experiment below adds one for SSH packets.
+It tests whether explicit kernel requests could replace translated memory
+loops with native operations. Run without any Linux build artifacts:
+
+```sh
+rustup target add riscv32imac-unknown-none-elf
+cargo test -p rvcore --features pv-pages,instrument
+python3 scripts/pv-pages-eval.py
+```
+
+The script builds the RV32 emulator and runs synthetic guests under QEMU
+with `-icount`, a 326 KiB translation cache, eight regions, and 1024 hash
+buckets and jump-cache entries. It writes the guest binaries, complete logs
+and `results.json` into `target/pv-pages-eval/`. QEMU is required. Each
+QEMU run has a 60-second timeout.
+
+Measured on 2026-11-08, each workload performs 256 operations on 4 KiB pages
+(1 MiB total). The baseline is a 16-word-unrolled RV32 loop, not a Linux
+routine. “Hot” reuses one source/destination; “stream” visits successive
+pages. Counts include setup, validation and emulator summary printing;
+they are QEMU host instructions, **not RP2350 cycles or Linux speedups**.
+
+| Operation | Translated loop | Native SBI | Loop/native instruction ratio |
+|---|---:|---:|---:|
+| Zero, hot | 4,395,507 | 1,086,887 | 4.04 |
+| Zero, stream | 4,484,032 | 1,136,540 | 3.95 |
+| Copy, hot | 8,665,763 | 1,609,856 | 5.38 |
+| Copy, stream | 8,791,979 | 1,659,534 | 5.30 |
+
+This demonstrates a substantial reduction in execution overhead even with
+the existing interpreter fallback for every `ecall`. It does not demonstrate
+translation-cache savings under pressure: these loops are small and do not
+thrash the cache. QEMU does not model the board's shared XIP cache, PSRAM
+latency or SRAM contention; the real memory traffic remains. No whole-system
+speedup can be inferred without measuring how much kernel time these
+operations consume. The buffer experiments below separately evaluate LZ4; CRC hooks remain unmeasured.
+
+An instructive first prototype unconditionally requested code invalidation
+on every destination. It made streaming zeroing *worse* (4,832,984 host
+instructions versus 4,484,032 for the loop), because invalidation scans hash
+buckets and clears the jump cache. The implementation now requests it only
+when the destination has translated code, using the same bitmap as normal
+stores. Checking that bitmap once per page is cheap; invalidating ordinary
+data pages is not.
+
+The experimental ABI uses EID `0x0A000000`, FID 0 for zero and 1 for copy.
+`a0` is a page-aligned guest physical destination; for copy, `a1` is the
+physical source. Success returns SBI `(error=0, value=0)`; an unknown FID
+returns -2 and invalid memory returns -3. Base-extension probing reports
+support only when built with the feature. This ID/interface is provisional.
+A future kernel should probe once and retain its ordinary fallback.
+
+The complete page must be in guest RAM; destination writes cannot touch the
+read-only prefix. The implementation validates both pages before writing,
+uses aligned native word accesses, accepts identical source/destination,
+and clears the LR/SC reservation. It does not translate virtual pointers,
+access MMIO, change PTEs, or replace guest `sfence.vma` requirements. Writes
+to translated pages use the existing SMC notification consumed by the JIT
+after the interpreted call. Instrumented builds record every word's memory
+access, so native work does not disappear from the existing cache model.
+
+The call retires as one guest instruction. Native work adds no artificial
+guest-time ticks, consistent with existing synchronous SBI calls. Interrupts
+are considered again after it returns. This is deterministic between the
+interpreter and translator, but differs from the old loop's timer schedule;
+bounded real-time latency still needs checking on the board. A future kernel
+benchmark cannot require the same instruction counts as an unmodified kernel.
+
+Validation covers feature discovery and disabled fallback, nonzero RAM base,
+full-page contents and surrounding memory, read-only destinations, invalid
+and misaligned addresses, identical-page copy, last-page bounds, read-only
+sources, LR/SC reservation clearing, SMC notification, and user-mode rejection.
+QEMU lockstep checks zero/copy guests and copying over a previously translated
+function (the next call must execute the new instructions). The existing
+jittest binary also passes lockstep with signature `56c7e73f` and selfchecks
+OK. Lockstep compares CPU state; explicit guest checks verify memory results.
+The benchmark samples each destination page and checks every word of the
+last page; the host tests check complete page contents with varied data.
+
+The next useful experiment requires the kernel: hook page clearing/copying,
+count calls during boot and representative application workloads, then
+measure elapsed time on hardware with hooks enabled and disabled. Kernel
+profiling should decide whether decompression, checksums, or another operation
+is worth the next native implementation. The prototype is not yet a validated
+RP2350 firmware feature; code placement, native memory-access behavior and
+interrupt latency still require board validation.
+
+## Experimental LZ4 and authenticated encryption
+
+`rvcore/pv-buffers` adds bounded native LZ4 compression/decompression and
+ChaCha20-Poly1305 sealing/opening. It is disabled by default, independently
+of `pv-pages`. The allocation-free `rvaccel` crate uses `lz4_flex` 0.14.0
+and RustCrypto `chacha20poly1305` 0.10.1. The same wrapper and libraries are
+compiled into the synthetic RV32 guest and native firmware: the comparison
+measures translator overhead, not a different algorithm implementation.
+
+```sh
+rustup target add riscv32im-unknown-none-elf riscv32imac-unknown-none-elf
+cargo test -p rvaccel -p rvcore --features rvcore/pv-pages,rvcore/pv-buffers,instrument
+python3 scripts/pv-buffers-eval.py
+```
+
+The script requires QEMU and the independent C `liblz4` (`brew install lz4`
+on macOS). It builds the separate `pvbench-guest` workspace, writes logs,
+binaries, `results.json` and `footprint.json` to `target/pv-buffers-eval/`,
+and uses the same QEMU/cache configuration as the page benchmark. Each QEMU
+run has a 60-second timeout. All inputs and keys are synthetic public data.
+Repeated crypto calls replay one test case; this is not an example of nonce
+management for real messages.
+
+Measured on 2026-11-08, 16 repetitions per row, with whole-output verification
+after the last repetition. Counts include guest setup, validation, native
+boundary overhead and emulator summary output. As above, these are **QEMU
+host instructions, not hardware timings or application speedups**.
+
+| Workload | Translated | Native | Translated/native ratio |
+|---|---:|---:|---:|
+| LZ4 decode, repeating 16 KiB | 17,572,510 | 8,215,535 | 2.14 |
+| LZ4 decode, pseudorandom 16 KiB | 8,600,372 | 6,249,108 | 1.38 |
+| LZ4 encode, repeating 16 KiB | 10,439,564 | 1,956,039 | 5.34 |
+| LZ4 encode, pseudorandom 16 KiB | 12,543,703 | 7,049,926 | 1.78 |
+| AEAD seal, 64 bytes | 1,168,411 | 257,234 | 4.54 |
+| AEAD open, 64 bytes | 1,194,311 | 254,873 | 4.69 |
+| AEAD seal, 1 KiB | 5,786,554 | 1,592,689 | 3.63 |
+| AEAD open, 1 KiB | 5,793,690 | 1,590,258 | 3.64 |
+| AEAD seal, 16 KiB | 79,011,387 | 22,959,535 | 3.44 |
+| AEAD open, 16 KiB | 78,973,034 | 22,956,910 | 3.44 |
+
+The script also measures 4 KiB LZ4 inputs and malformed-input rejection.
+Pseudorandom LZ4 input is largely incompressible; real squashfs can store such
+blocks uncompressed, so that decode result is a boundary case, not a forecast
+of squashfs performance. Repeating data is the opposite synthetic extreme.
+Actual filesystem blocks and application records remain unmeasured.
+
+The earlier compression/AEAD-only build added buffer support to QEMU with
+page support and increased
+executable sections by 11,644 bytes, read-only sections by 928 bytes, and BSS
+by 32 bytes. This includes two emulated CPU instances and LTO layout effects;
+it is not a Pico linker map. No heap allocator is needed. LZ4 compression
+uses an 8 KiB hash table on the stack for these bounded inputs, plus other
+frames. The complete engine now has a separately reserved execution stack
+and measured per-operation budgets; see the [native memory budget](../guest/README.md#native-memory-and-stack-budget).
+Native library code has not been tuned for SRAM execution on the board.
+
+### Buffer interface and correctness
+
+Provisional firmware-specific EID `0x0A000001`:
+
+- FID 0: decode a raw LZ4 block; FID 1: encode a raw LZ4 block.
+- FID 2: ChaCha20-Poly1305 seal; FID 3: authenticate and open.
+- `a0..a5`: destination PA, destination capacity, source PA, source length,
+  parameters PA, parameters length.
+- Crypto parameters: 32-byte key, 12-byte nonce, then up to 1024 bytes of AAD.
+  Sealed output is ciphertext followed by the full 16-byte authentication tag.
+  LZ4 has no parameters, frame header, or prepended size.
+- Return: SBI `a0=0`, `a1=output length` on success; -2 for unsupported FID,
+  -3 for invalid arguments/ranges, -1 for codec/authentication failure, with
+  `a1=0` on error. Do not consume output on any error.
+
+Source and destination are each limited to 32 KiB. Both must be contiguous
+physical guest RAM; destination must be writable and disjoint from source
+and parameters. Unaligned buffers are accepted. Source and parameters may
+overlap each other because both are read-only. Empty parameters ignore their
+pointer. An incompressible input near the maximum may need more output space
+than this ABI permits and will fail; the benchmark uses at most 16 KiB input.
+
+Bounds and overlap are checked before library entry. A library error can
+leave partial output; authentication failure clears the copied message
+buffer. The whole destination capacity is conservatively reported as dirty
+on library entry, even on failure. The JIT invalidates translated code on
+**every affected page**, checking its bitmap to avoid flushing ordinary data.
+A new range notification complements the existing single-page SMC channel;
+its dispatch path compiles away when buffer support is disabled. Successful
+and failing multi-page decompression over two translated functions are both
+tested in QEMU lockstep, then both functions are called again to verify the
+replacement instructions execute.
+
+Other validation includes:
+
+- C liblz4 compression decoded by the prototype; prototype compression
+  decoded by C liblz4, using repeating and pseudorandom 4/16 KiB buffers.
+- The independent [RFC 8439 section 2.8.2 vector](https://www.rfc-editor.org/rfc/rfc8439.html#section-2.8.2),
+  with exact ciphertext and tag; modified ciphertext, tag, key, nonce and
+  AAD rejection, empty plaintext, and undersized buffers.
+- Invalid addresses, overlap, read-only destinations, oversized lengths,
+  physical-address overflow, cross-page unaligned output, failure dirty-range
+  notification, and user-mode rejection.
+- All benchmark operations and error cases in interpreter/translator lockstep,
+  plus the existing jittest regression with signature `56c7e73f` and selfchecks OK.
+- Feature-disabled tests and RV32 `no_std` compilation with `ram-code` enabled.
+
+Internal native library memory accesses are not traced by the existing
+instruction-driven cache simulator. Host `-M`/`-S` runs reject builds with
+`pv-buffers` rather than report misleading estimates. QEMU `-icount` measures
+the native work directly. Calls still retire one guest instruction and defer
+guest interrupts until return. Maximum-size call latency, PSRAM behavior,
+peak stack usage, hardware side channels and SRAM placement require hardware
+work before deployment.
+
+### Where this could help Linux
+
+LZ4 decoding has the clearest immediate consumer: the existing 16 KiB LZ4
+squashfs filesystem. Compression could serve another workload, but does not
+speed reading a read-only root filesystem. The kernel adapter must account
+for noncontiguous pages; gathering/scattering or extra scratch copies could
+erode the smaller decompression gains. The SSH experiment below adds a kernel adapter for SSH packets; LZ4 is not yet wired into squashfs.
+
+ChaCha20-Poly1305 provides authenticated symmetric encryption, specified in
+[RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html). It fits an RV32 software
+experiment because its cipher core uses additions, XORs and rotations. This
+prototype supplies an operation, not TLS, SSH, disk encryption, key exchange,
+a random generator, or protected key storage. Keys remain guest-owned and
+visible to the emulator. The caller must ensure nonce uniqueness per key,
+manage key lifetime, and implement any protocol/replay rules.
+
+The SSH experiment below uses a dedicated kernel ioctl adapter. A Linux Crypto API adapter could expose operations to other kernel consumers.
+User-space crypto libraries would not automatically benefit: they need an
+explicit adapter (for example an appropriate kernel crypto interface or a
+separate supported library path). That introduces syscall and buffer-management
+costs absent from the SBI-only benchmark, particularly for 64-byte records.
+AES-GCM and standalone hash acceleration have not been evaluated. The SSH
+consumer below now exercises native key exchange and signatures as well as
+packet crypto through a general-purpose primitive interface.
+
+## Real SSH with native packet offload
+
+`scripts/ssh-eval.py` now exercises a patched Dropbear, a kernel ioctl bridge,
+and native SSH packet encryption/decryption, with a software fallback. It
+checks real key authentication, encrypted file/stream transfers, mixed native
+and software endpoints, and native-call counters. See [the SSH evaluation
+instructions](../guest/README.md#ssh-with-native-packet-offload) for build and
+on/off comparison commands. SSH uses new FIDs 4/5 with 64-byte key material
+and an 8-byte sequence nonce; FIDs 2/3 remain the distinct IETF AEAD operation.
+The guest test also fixes and guards against a final-channel shutdown stall
+exposed by faster encryption. This is a loopback evaluation, not board SSH
+deployment.
+
+For **connection setup alone**, use `--test connection --engine jit` and
+compare `--offload on` with `--offload off`. Counter snapshots cover the
+connect call through authentication success, excluding boot, persistent-key
+generation, commands and teardown. Results live under `connection_samples`;
+whole-run counters are separate diagnostics. With native X25519, Ed25519 and
+sntrup761 primitives, the first-connection test uses 0.384 billion total host
+instructions versus 3.769 billion for guest software: **89.8% fewer**.
+
+The native engine is protocol-independent: `rvaccel::Workspace::run()` and buffer SBI
+FIDs 6–12 implement key agreement, signatures and KEM operations. Linux
+exposes them through `/dev/rvemu-crypto` using `guest/linux/rvemu-crypto.h`;
+Dropbear is one adapter. See the [generic ABI](../guest/README.md#general-purpose-native-crypto-interface)
+for byte layouts, fallback, randomness ownership and independent tests.
+
+"Native" means the crypto libraries run directly as emulator firmware,
+**outside guest translation**. QEMU emulates that firmware's physical CPU for
+these measurements. Each emulated CPU now owns a reusable 52 KiB workspace,
+including a guarded 24 KiB execution stack. The largest measured operation
+uses 17,788 bytes. The Pico shell's optional `pv-buffers` feature reserves
+64 KiB of PSRAM outside guest RAM for this workspace, so crypto does not use
+its roughly 10 KiB SRAM control stack for large temporaries. Build with
+`--features pv-buffers`; `scripts/pico-shell.sh -C` is the explicit flashing
+option (7 MiB guest limit). Bare-metal frontends without a workspace leave
+the ABI unavailable. See the [stack measurements and validation](../guest/README.md#native-memory-and-stack-budget).
+The board build passes; no on-device execution or timing is claimed.
