@@ -143,6 +143,7 @@ mismatch.
 |---|---|---|
 | 0x10000000 | firmware (`rvemu-pico-shell` or `rvemu-pico-linux`) | `picotool load -x` |
 | 0x10100000 | the guest's `/home`, 1 MB (jffs2) | the firmware (`rvemu-pico/src/flash.rs`) |
+| 0x10200000 | swap, 511 sectors up to 0x103FEFFF (contents never persist) | `rvemu-pico-shell`, with `pico-shell.sh -w` |
 | 0x103FF000 | Wi-Fi settings, 4 KB (`"WIFI"`, lengths, SSID, passphrase) | `scripts/pico-wifi.sh` |
 | 0x10400000 | guest blob, at most 2 MB: `RVLY` header, the kernel after its text, initramfs, DTB | `pack-guest.py` via `pico-common.sh` |
 | 0x10600000 | root filesystem (squashfs) | `pico-common.sh` `load_disk` |
@@ -154,6 +155,50 @@ block of host addresses: read-only kernel text from flash, then 8 MiB of
 PSRAM. The guest sees 11.1 MB of RAM. Each load script keeps a hash of what
 it wrote under `rvemu-rs/target/` and skips writes when nothing changed
 (`FORCE_BLOB=1` forces them).
+
+## Swap
+
+`scripts/pico-shell.sh -w` gives the guest 1792 KiB of swap on the board's
+flash (0x10200000-0x103FEFFF), and its init enables it. Without `-w` the
+guest has no swap device and pays nothing. The design is in
+[rvemu-rs/README.md](rvemu-rs/README.md#flash-swap-rvcoresrcswapdevrs-rvemu-picosrcswap_flashrs).
+zram and zswap are left out of the kernel: with only about 3.7 MB free,
+anything that keeps swapped pages in RAM takes it from the page cache that
+holds program text, and the guest thrashes on squashfs reads instead.
+
+Workload: tmux with four panes and htop; Lua holding a 1.7 MB table
+(idle); MicroPython building a 15,000-string list and a 5,000-entry dict
+in a 1 MB heap; then a Lua loop. On the board:
+
+| Swap | Finishes | Wall time | Echo latency p50 / p95 / max |
+|---|---|---|---|
+| none | no: hung, over 240 s | | 17 ms / 7.7 s / 44 s |
+| flash (`-w`) | yes | 149 s | 24 / 161 / 688 ms |
+| zram, lz4, 4 MB | no: hung, over 300 s | | 26 ms / 98 ms / 28 s |
+| zswap in front of flash | no: hung, over 300 s | | 27 ms / 99 ms / 29 s |
+
+- **More memory.** With tmux and htop running, a Lua table of 40,000
+  strings (2.3 MB) builds in 17 guest seconds with flash swap. Without
+  swap, 20,000 (1.2 MB) is the most that builds: 40,000 doesn't finish in
+  200 s, and the console stops answering.
+- **Latency.** Typed-key echo while swapping: p50 21-26 ms, p95 150-177 ms,
+  max about 0.8 s. While idle erases run: 15-39 ms (15 ms baseline). One
+  request stalls the guest for at most one erase and its writes: the
+  slowest of about 1,750 erases took 50 ms (datasheet maximum 400 ms).
+- **Flash traffic.** The mixed run wrote 597 pages in 149 s, about 0.9 MB
+  a minute while thrashing, and stalled the guest for 25 s of it in erases
+  and programs.
+- **Wear.** One erase per page written, plus 1 in 8 for wear levelling.
+  At that rate (4.5 erases/s) the region's 51 M erases (511 sectors x 100K
+  cycles) last 131 days of continuous thrashing, or about 9 years at an
+  hour of it a day.
+- **Cost of `-w`.** About 32 KiB of guest RAM (the device's slab and
+  virtqueue, plus the 4 KiB page for the map), and 1.8 s more boot for
+  mkswap and swapon. That's why it's opt-in. Without `-w`: no guest RAM,
+  no SRAM beyond the erase/program routine.
+- **zram's cost.** 16 KiB of kernel (zram and zswap: 20 KiB) before any
+  pages are stored, and in the mixed run zram needed 2.06 MB of RAM to hold
+  2.5 MB of swapped pages (2:1 compression, then zsmalloc's overhead; Mac).
 
 ## Results (on the board, 348 MHz)
 

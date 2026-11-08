@@ -13,6 +13,7 @@ pub mod instrument;
 mod mmu;
 pub mod nor;
 mod sbi;
+pub mod swapdev;
 pub mod virtio;
 
 pub use cpu::*;

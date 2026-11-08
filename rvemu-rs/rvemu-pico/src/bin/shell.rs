@@ -31,7 +31,8 @@ use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
 use rvcore::nor::NorFlash;
-use rvcore::virtio::{Disk as _, FRAME_MAX, GuestMem, MemDisk, NetLink};
+use rvcore::swapdev::FlashSwap;
+use rvcore::virtio::{Disk as _, FRAME_MAX, GuestMem, MemDisk, NetLink, VirtioBlk};
 use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, TIMEBASE_HZ};
 use rvjit::{JcEntry, Jit, JitMem};
 use usb_device::class_prelude::UsbBusAllocator;
@@ -52,6 +53,9 @@ mod wifi;
 
 #[path = "../flash.rs"]
 mod flash;
+#[path = "../swap_flash.rs"]
+mod swap_flash;
+use swap_flash::SwapFlash;
 use wifi::{Creds, RadioPins};
 
 #[unsafe(link_section = ".start_block")]
@@ -195,6 +199,22 @@ static mut CHAIN_LOG: [u32; REGIONS * 128] = [0; REGIONS * 128];
 static mut STORE_EPOCHS: [u8; (GUEST_MAX >> 12) as usize] = [0; (GUEST_MAX >> 12) as usize];
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 static mut USB_BUS: MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> = MaybeUninit::uninit();
+/// Sectors kept free for bursts of swap writes: 448 of the 511 are swap.
+const SWAP_SPARE: u32 = 63;
+/// With the swap device (`pico-shell.sh -w`), its backend (about 2.2 KB of
+/// tables) lives in the top page of guest RAM, which that DTB reserves
+/// (`rvemu -D -W`). Without it, swap costs no SRAM and no guest RAM.
+const SWAP_TABLES: usize = 0x1000;
+const _: () = assert!(core::mem::size_of::<FlashSwap<SwapFlash>>() <= SWAP_TABLES);
+
+/// Whether the guest's DTB has the swap device's node.
+fn dtb_has_swap(h: &BlobHeader) -> bool {
+    const NODE: &[u8] = b"virtio@f8000600";
+    // SAFETY: the header was validated, so the DTB lies inside the blob,
+    // in mapped flash.
+    let dtb = unsafe { core::slice::from_raw_parts((BLOB_ADDR + h.dtb_off as usize) as *const u8, h.dtb_len as usize) };
+    dtb.windows(NODE.len()).any(|w| w == NODE)
+}
 
 /// How long the radio may take to come up (and the guest wait for its MAC).
 const RADIO_BRING_UP_MS: u32 = 5000;
@@ -274,7 +294,7 @@ impl NetLink for RingLink {
 }
 
 struct PicoBus {
-    plat: Platform<RingConsole, MemDisk, RingLink, BoardNor>,
+    plat: Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>>,
     sys_hz: u32,
     /// The last `core1::events()` acted on.
     seen: u32,
@@ -330,6 +350,16 @@ impl Bus for PicoBus {
         let ticks = cpu.stimecmp - now;
         let wait = (ticks.saturating_mul(hz) / u64::from(TIMEBASE_HZ)).min(hz / 10);
         let t0 = board::mcycle64();
+        // Erase one dirty swap sector (about 45 ms) unless the guest wakes
+        // within 2 ms. Erasing stalls everything, so idle time is the place.
+        let mut erased = false;
+        if wait >= hz / 500
+            && let Some(w) = &mut self.plat.swap
+            && w.disk.wants_erase()
+        {
+            w.disk.idle_erase();
+            erased = true;
+        }
         while board::mcycle64() - t0 < wait {
             if core1::events() != self.seen {
                 self.poll();
@@ -341,6 +371,12 @@ impl Bus for PicoBus {
         if cpu.stimecmp == u64::MAX {
             return; // no timer armed: keep waiting for input
         }
+        // an erase can outlast the wait: keep guest time with wall time
+        let ticks = if erased {
+            ticks.max((board::mcycle64() - t0) * u64::from(TIMEBASE_HZ) / hz)
+        } else {
+            ticks
+        };
         cpu.time_skip += ticks;
         cpu.stats.idle_ticks += ticks;
     }
@@ -531,6 +567,18 @@ fn main() -> ! {
     } else {
         rprintln!("[rvemu-pico] the DTB has no rng-seed to fill from the TRNG");
     }
+    // The swap device, only when the DTB has it; after `load`, which clears
+    // guest RAM. Writes start at a different sector each boot, which spreads
+    // erases over the region across boots.
+    let swap_on = dtb_has_swap(&h) && h.dtb_len as usize <= 0x10000 - SWAP_TABLES;
+    if swap_on {
+        let at = (h.ram_host() + h.ram_size as usize - SWAP_TABLES) as *mut FlashSwap<SwapFlash>;
+        // SAFETY: the top page of guest RAM (PSRAM, page aligned), reserved
+        // from the guest by its DTB and above the DTB itself.
+        let swap = unsafe { FlashSwap::init_at(at, SwapFlash::new(sys_hz), SWAP_SPARE) };
+        swap.set_head(board::mcycle64() as u32);
+        bus.plat.swap = Some(VirtioBlk::new(swap, gmem));
+    }
     // SAFETY: CPU and the translator tables are used only from here on.
     let cpu = unsafe {
         let p = (*addr_of_mut!(CPU)).as_mut_ptr();
@@ -559,11 +607,12 @@ fn main() -> ! {
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
     rprintln!(
-        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB; console on USB",
+        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
         h.ram_size >> 10,
         CODE_WORDS * 4 / 1024,
         STORE_WORDS * 4 / 1024,
-        disk_kib
+        disk_kib,
+        if swap_on { "on" } else { "off" }
     );
     jit_loop(&mut jit, cpu, &mut bus);
     let why = match cpu.halt {

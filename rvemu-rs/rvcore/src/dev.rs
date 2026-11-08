@@ -7,7 +7,7 @@ use crate::cpu::exc;
 use crate::nor::{NOR_BASE, NOR_SIZE, NoNor, NorDev, NorFlash};
 use crate::virtio::{
     Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE,
-    VirtioBlk, VirtioNet,
+    VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ, VirtioBlk, VirtioNet,
 };
 
 pub const PLIC_BASE: u32 = 0xF000_0000;
@@ -188,26 +188,33 @@ impl Uart {
     }
 }
 
-/// UART + PLIC (+ disk, + network, + flash) wired together, generic over
-/// the host console, disk, network link and flash.
-pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet, F: NorFlash = NoNor> {
+/// UART + PLIC (+ disk, + network, + flash, + swap) wired together, generic
+/// over the host console, disk, network link, flash and swap backend.
+pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet, F: NorFlash = NoNor, W: Disk = NoDisk> {
     pub uart: Uart,
     pub plic: Plic,
     pub con: C,
     pub blk: Option<VirtioBlk<D>>,
     pub net: Option<VirtioNet<N>>,
     pub nor: Option<NorDev<F>>,
+    pub swap: Option<VirtioBlk<W>>,
 }
 
-impl<C: Console, D: Disk, N: NetLink, F: NorFlash> Platform<C, D, N, F> {
+impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk> Platform<C, D, N, F, W> {
     /// UART and PLIC only.
     pub fn new(con: C) -> Self {
-        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, nor: None }
+        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, nor: None, swap: None }
     }
 
     /// Add the NOR flash device at `NOR_BASE` on `flash`, copying to and from `mem`.
     pub fn with_nor(mut self, flash: F, mem: GuestMem) -> Self {
         self.nor = Some(NorDev::new(flash, mem));
+        self
+    }
+
+    /// Add a writable virtio block device for swap at `VIRTIO_SWAP_BASE`.
+    pub fn with_swap(mut self, disk: W, mem: GuestMem) -> Self {
+        self.swap = Some(VirtioBlk::new(disk, mem));
         self
     }
 
@@ -244,6 +251,9 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash> Platform<C, D, N, F> {
         if let Some(r) = self.net.as_mut().and_then(|n| n.take_dma_write()) {
             return Some(r);
         }
+        if let Some(r) = self.swap.as_mut().and_then(|w| w.take_dma_write()) {
+            return Some(r);
+        }
         self.nor.as_mut().and_then(|f| f.take_dma_write())
     }
 
@@ -272,6 +282,11 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash> Platform<C, D, N, F> {
             && pa.wrapping_sub(NOR_BASE) < NOR_SIZE
         {
             return f.load(pa - NOR_BASE, size);
+        }
+        if let Some(w) = &mut self.swap
+            && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
+        {
+            return w.load(pa - VIRTIO_SWAP_BASE, size);
         }
         Err(exc::LOAD_FAULT)
     }
@@ -305,6 +320,19 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash> Platform<C, D, N, F> {
             && pa.wrapping_sub(NOR_BASE) < NOR_SIZE
         {
             return f.store(pa - NOR_BASE, size, v);
+        }
+        if let Some(w) = &mut self.swap
+            && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
+        {
+            // Only its own register stores change the swap device's line
+            // (requests complete in the queue notify; the guest acks with
+            // InterruptACK), so it stays out of `update_irqs`, which runs
+            // after every MMIO access and must stay small enough to inline
+            // into the SRAM interpreter.
+            let r = w.store(pa - VIRTIO_SWAP_BASE, size, v);
+            self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
+            self.update_irqs();
+            return r;
         }
         Err(exc::STORE_FAULT)
     }

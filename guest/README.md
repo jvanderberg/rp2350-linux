@@ -87,6 +87,12 @@ and the root filesystem.
   On the board the NIC is bridged to the Wi-Fi radio. On the Mac, `rvemu -N`
   gives a stub LAN (see `rvemu-rs/README.md`).
 - **`LANG=C.UTF-8`** in `/etc/profile`, for tmux and friends.
+- **Swap:** `/etc/init.d/S02swap` runs mkswap and swapon on the virtio disk
+  whose serial is `rvemu-flash-swap`, when the firmware offers one
+  (`pico-shell.sh -w`, `rvemu -W`). Its last page holds the device's
+  statistics, which `flashswap-stats` prints. The kernel has `CONFIG_SWAP`
+  (on by default with `CONFIG_BLOCK`); zram and zswap are left out (see the
+  top-level README).
 - **Not included:** vim (its 3.5 MB binary doesn't fit the 8 MiB guest's
   page cache; `vi` is BusyBox's) and strace (Buildroot has none for RV32).
 

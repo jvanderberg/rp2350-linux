@@ -4,16 +4,17 @@
 #   screen /dev/cu.usbmodemrvemu1 115200        (Ctrl-A k to quit)
 # The board goes back to BOOTSEL on `stty -f PORT 1200`, which this script
 # also uses to replace a running shell.
-#   scripts/pico-shell.sh [-m RAM_MB] [-i] [-b]
+#   scripts/pico-shell.sh [-m RAM_MB] [-i] [-b] [-w]
 # Default: guest/out-disk, root on a squashfs in flash (nano, tmux,
 # MicroPython, ...; guest/run-build.sh disk). -i: the small initramfs guest in
 # guest/out. -b: (re)build that guest in Docker first (guest/run-build.sh;
-# incremental once the first Buildroot build is done).
+# incremental once the first Buildroot build is done). -w: give the guest
+# the flash swap device (/dev/vdb, 1792 KiB in 0x10200000-0x103FEFFF).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/pico-common.sh
-M=8; INITRAMFS=0; BUILD=0
-while getopts "m:ib" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; *) exit 2;; esac; done
+M=8; INITRAMFS=0; BUILD=0; SWAP=0
+while getopts "m:ibw" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; w) SWAP=1;; *) exit 2;; esac; done
 if [ $BUILD = 1 ]; then
   if [ $INITRAMFS = 1 ]; then ../guest/run-build.sh all; else ../guest/run-build.sh disk; fi
 fi
@@ -28,7 +29,7 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 cargo build -q --release -p rvemu
 cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
-NET=1 NOR=1 pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
+NET=1 NOR=1 SWAP=$SWAP pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
 ensure_bootsel "$ELF"
 keep_wifi
 load_text "$T/text.bin"

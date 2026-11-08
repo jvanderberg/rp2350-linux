@@ -7,9 +7,13 @@ use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use rvcore::dev::{Console, PLIC_BASE, PLIC_SIZE, Platform, UART_BASE, UART_IRQ, UART_SIZE};
-use rvcore::virtio::{GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE};
 use norfile::FileNor;
 use rvcore::nor::{NOR_BASE, NOR_SIZE};
+use rvcore::swapdev::{CHUNK, Flash, FlashSwap, PAGE};
+use rvcore::virtio::{
+    GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE, VIRTIO_SWAP_BASE,
+    VIRTIO_SWAP_IRQ,
+};
 use stubnet::StubNet;
 use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, Priv, TIMEBASE_HZ};
 
@@ -133,10 +137,62 @@ impl Console for TermConsole {
     }
 }
 
+// ------------------------------------------------------------------ swap
+
+/// The board's swap region (0x10200000-0x103FEFFF) as host memory, with
+/// W25Q128 datasheet-typical erase and program times on a 348 MHz cycle
+/// count, so the swap statistics estimate what the board would stall.
+struct ModelFlash {
+    data: Vec<u8>,
+    cycles: u64,
+}
+
+const SWAP_SECTORS: u32 = 511;
+/// Sectors kept free for bursts of writes (the board's choice too).
+const SWAP_SPARE: u32 = 63;
+const MODEL_HZ: u32 = 348_000_000;
+/// With -W, the guest's top page of RAM is reserved (the board's swap map).
+const SWAP_TABLES_SIZE: u32 = 0x1000;
+
+impl ModelFlash {
+    fn new() -> Self {
+        // old contents: every sector needs an erase before its first use
+        ModelFlash { data: vec![0; SWAP_SECTORS as usize * PAGE], cycles: 0 }
+    }
+}
+
+impl Flash for ModelFlash {
+    fn sectors(&self) -> u32 {
+        SWAP_SECTORS
+    }
+    fn erase(&mut self, sector: u32) -> bool {
+        let o = sector as usize * PAGE;
+        self.data[o..o + PAGE].fill(0xFF);
+        self.cycles += u64::from(MODEL_HZ) * 45 / 1000;
+        true
+    }
+    fn program(&mut self, off: u32, data: &[u8; CHUNK]) -> bool {
+        for (f, &d) in self.data[off as usize..off as usize + CHUNK].iter_mut().zip(data) {
+            *f &= d; // NOR: programming only clears bits
+        }
+        self.cycles += u64::from(MODEL_HZ) * 7 / 10_000;
+        true
+    }
+    fn read(&self, off: u32, buf: &mut [u8]) {
+        buf.copy_from_slice(&self.data[off as usize..off as usize + buf.len()]);
+    }
+    fn cycles(&self) -> u64 {
+        self.cycles
+    }
+    fn hz(&self) -> u32 {
+        MODEL_HZ
+    }
+}
+
 // ------------------------------------------------------------------ bus
 
 struct HostBus {
-    plat: Platform<TermConsole, MemDisk, StubNet, FileNor>,
+    plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>>,
     interactive: bool,
 }
 
@@ -173,6 +229,10 @@ impl Bus for HostBus {
         self.poll();
         if cpu.sip_value(self) & cpu.sie != 0 {
             return;
+        }
+        // as the board does: erase a dirty swap sector while the guest idles
+        if let Some(w) = &mut self.plat.swap {
+            w.disk.idle_erase();
         }
         let now = cpu.time();
         if cpu.stimecmp <= now {
@@ -229,10 +289,12 @@ struct DtsOpts<'a> {
     net: bool,
     /// NOR flash (`rvemu,flash`) at NOR_BASE
     nor: bool,
+    /// swap virtio-blk at VIRTIO_SWAP_BASE, and the top RAM page reserved
+    swap: bool,
 }
 
 fn make_dts(o: &DtsOpts) -> String {
-    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor } = *o;
+    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap } = *o;
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -262,6 +324,25 @@ fn make_dts(o: &DtsOpts) -> String {
       compatible = "rvemu,flash";
       reg = <0x{NOR_BASE:x} 0x{NOR_SIZE:x}>;
     }};
+"#
+        );
+    }
+    // the swap device, and the top page of RAM kept from the guest: the
+    // board keeps the swap map there (rvemu-pico-shell, SWAP_TABLES_SIZE)
+    let mut reserved = String::new();
+    if swap {
+        virtio += &node(VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ);
+        let at = ram_base + ram_size - SWAP_TABLES_SIZE;
+        reserved = format!(
+            r#"  reserved-memory {{
+    #address-cells = <1>;
+    #size-cells = <1>;
+    ranges;
+    swap-tables@{at:x} {{
+      reg = <0x{at:x} 0x{SWAP_TABLES_SIZE:x}>;
+      no-map;
+    }};
+  }};
 "#
         );
     }
@@ -300,7 +381,7 @@ fn make_dts(o: &DtsOpts) -> String {
     device_type = "memory";
     reg = <0x{ram_base:x} 0x{ram_size:x}>;
   }};
-  soc {{
+{reserved}  soc {{
     #address-cells = <1>;
     #size-cells = <1>;
     compatible = "simple-bus";
@@ -449,6 +530,8 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  answers ARP and ping (the guest is 52:54:00:12:34:56)
   -F FILE        NOR flash device (the board's /home region, 1 MB) backed by
                  FILE, created blank if missing; with -D, any FILE adds the node
+  -W             swap device (/dev/vdb in the disk guest): the board's flash
+                 swap on a modelled 2 MB flash, statistics in its last page
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size (default 64)
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only
@@ -484,6 +567,7 @@ struct Opts {
     nor: Option<String>,
     bootargs_set: bool,
     net: bool,
+    swap: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -506,6 +590,7 @@ fn parse_args() -> Result<Opts, String> {
         nor: None,
         bootargs_set: false,
         net: false,
+        swap: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -533,6 +618,7 @@ fn parse_args() -> Result<Opts, String> {
             "-d" => o.disk = Some(val()?),
             "-N" => o.net = true,
             "-F" => o.nor = Some(val()?),
+            "-W" => o.swap = true,
             "-u" => o.until = Some(val()?),
             "-n" => o.max_insns = val()?.parse().map_err(|_| "bad -n")?,
             "-M" => o.model = true,
@@ -588,6 +674,7 @@ fn run() -> Result<(), String> {
         disk: o.disk.is_some(),
         net: o.net,
         nor: o.nor.is_some(),
+        swap: o.swap,
     });
     if o.dump_dts {
         print!("{dts}");
@@ -639,6 +726,9 @@ fn run() -> Result<(), String> {
     }
     if let Some(path) = &o.nor {
         plat = plat.with_nor(FileNor::open(path)?, gmem);
+    }
+    if o.swap {
+        plat = plat.with_swap(FlashSwap::new(ModelFlash::new(), SWAP_SPARE), gmem);
     }
     let mut bus = HostBus { plat, interactive: !o.batch };
 
