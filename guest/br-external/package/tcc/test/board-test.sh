@@ -25,20 +25,9 @@ start=$(date +%s)
 ./push.py "$W/t.tgz" /tmp/t.tgz
 "$CMD" -- 'cd /tmp && gunzip -c t.tgz | tar xf - && rm t.tgz && ls tcc-test | wc -l'
 echo "board-test: copied in $(($(date +%s) - start)) s"
-# run.sh runs as a background job of the console's (interactive) shell, so in
-# its own process group, into /tmp/tcc-test/log, which is polled: its output
-# comes back even when the deadline stops it
+# On a timeout board-cmd prints what has arrived and interrupts run.sh
 start=$(date +%s)
-deadline=$((start + ${TCC_TEST_MAX_S:-600}))
-"$CMD" -- "cd /tmp/tcc-test && { sh run.sh ${1:-} > log 2>&1 < /dev/null & echo \$! > pid; }"
-until "$CMD" -- 'grep -q "^tcc tests:" /tmp/tcc-test/log' > /dev/null; do
-	if (($(date +%s) >= deadline)); then
-		echo "board-test: deadline reached, stopping run.sh"
-		"$CMD" -- "kill -9 -\$(cat /tmp/tcc-test/pid); true" > /dev/null
-		break
-	fi
-	sleep 15
-done
-"$CMD" -- 'cat /tmp/tcc-test/log'
-echo "board-test: ran in $(($(date +%s) - start)) s (wall, from the Mac)"
-"$CMD" -- 'grep -q "^tcc tests: .* 0 failed" /tmp/tcc-test/log'
+rc=0
+"$CMD" --timeout "${TCC_TEST_MAX_S:-600}" -- "sh /tmp/tcc-test/run.sh ${1:-}" || rc=$?
+echo "board-test: ran in $(($(date +%s) - start)) s (wall, from the Mac), rc $rc"
+exit "$rc"
