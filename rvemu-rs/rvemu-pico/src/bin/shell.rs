@@ -417,9 +417,10 @@ fn main() -> ! {
         ),
         status: Status { next: 0, period: u64::from(sys_hz) * u64::from(STATUS_S) },
     });
-    // Self-test of the guard that flash writes use.
+    // Self-test of what flash writes use.
     let t0 = board::mcycle64();
-    drop(core1::park());
+    core1::park();
+    core1::unpark();
     rprintln!("core1 running; park/unpark took {} cycles", board::mcycle64() - t0);
     let con = RingConsole { wait_cycles: ms(1000) };
     let disk = flash_disk();

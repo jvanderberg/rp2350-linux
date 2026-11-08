@@ -16,8 +16,8 @@
 //! there; `#[unsafe(link_section = ".data.core1")]` puts any other function
 //! there. `scripts/check-core1.py` checks the result.
 //!
-//! Flash erase and program stall XIP: wrap them in `park()`, which holds
-//! core1 in an SRAM spin loop until the guard drops.
+//! Flash erase and program stall XIP: bracket them with `park()` and
+//! `unpark()`, which hold core1 in an SRAM spin loop meanwhile.
 //!
 //! Between passes core1 sleeps in `wfi` until something happens: a USB
 //! interrupt, the radio's PIO interrupt, a doorbell from core0
@@ -282,14 +282,13 @@ static PARK_REQ: AtomicBool = AtomicBool::new(false);
 static PARK_ACK: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// core1 held in an SRAM loop (never touching flash) until this drops.
-pub struct Parked(());
-
-/// core0: park core1, for flash erase and program. Waits until core1 is
-/// parked (at most one pass of its service loop). Don't nest.
+/// core0: park core1 in an SRAM loop (it never touches flash there), for
+/// flash erase and program; `unpark` lets it go. Waits until core1 is
+/// parked (at most one pass of its service loop). Don't nest. The pair
+/// fits storage's `flash::Parker { park, unpark }`. Always true.
 #[unsafe(link_section = ".data.core1")]
 #[inline(never)]
-pub fn park() -> Parked {
+pub fn park() -> bool {
     if RUNNING.load(Ordering::Acquire) {
         PARK_REQ.store(true, Ordering::Release);
         notify_core1();
@@ -297,18 +296,17 @@ pub fn park() -> Parked {
             core::hint::spin_loop();
         }
     }
-    Parked(())
+    true
 }
 
-impl Drop for Parked {
-    #[unsafe(link_section = ".data.core1")]
-    #[inline(never)]
-    fn drop(&mut self) {
-        if RUNNING.load(Ordering::Acquire) {
-            PARK_REQ.store(false, Ordering::Release);
-            while PARK_ACK.load(Ordering::Acquire) {
-                core::hint::spin_loop();
-            }
+/// core0: end `park`.
+#[unsafe(link_section = ".data.core1")]
+#[inline(never)]
+pub fn unpark() {
+    if RUNNING.load(Ordering::Acquire) {
+        PARK_REQ.store(false, Ordering::Release);
+        while PARK_ACK.load(Ordering::Acquire) {
+            core::hint::spin_loop();
         }
     }
 }

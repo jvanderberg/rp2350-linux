@@ -194,8 +194,9 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
   `#[unsafe(link_section = ".data.core1")]`. `scripts/check-core1.py` lists
   every call or address from there into flash, and fails on any that isn't
   a cold path (panics, RTT formatting, BOOTSEL, the radio firmware upload).
-- **Flash writes.** Erasing or programming flash stalls XIP. `core1::park()`
-  returns a guard that holds core1 in an SRAM loop until it drops.
+- **Flash writes.** Erasing or programming flash stalls XIP.
+  `core1::park()` holds core1 in an SRAM loop until `core1::unpark()`; the
+  pair fits `flash::Parker`.
 - **Memory.** core1's code is about 55 KB in `.core1_text`. Its service
   slot is 7 KiB, its stack 5 KiB, the console rings 16 KiB, and the frame
   rings 6 KiB in SRAM8/9.
