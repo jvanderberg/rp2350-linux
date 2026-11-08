@@ -1,20 +1,22 @@
 //! The board's pins as guest devices: GPIO, two I2C buses, SPI, PWM and the
-//! ADC, in guest MMIO 0xF8001000-0xF8002FFF on PLIC inputs 8-11.
+//! ADC, in guest MMIO 0xF8001000-0xF8002FFF (only GPIO interrupts: PLIC 8).
 //!
-//! | Device | Address | IRQ | Guest driver |
+//! | Device | Address | IRQ | Guest driver (guest/linux/drivers/rvemu) |
 //! |---|---|---|---|
-//! | GPIO | 0xF8001000 | 8 | `rvemu,gpio` (guest/linux/drivers/rvemu) |
-//! | I2C0, I2C1 | 0xF8001200, 0xF8001400 | 9, 10 | virtio-i2c |
-//! | SPI0 | 0xF8001600 | 11 | `sifive,spi0` + spidev |
+//! | GPIO | 0xF8001000 | 8 | `rvemu,gpio` |
+//! | I2C0, I2C1 | 0xF8001200, 0xF8001400 | | `rvemu,i2c` |
+//! | SPI0 | 0xF8001600 | | `rvemu,spi` + spidev |
 //! | PWM | 0xF8001800 | | `rvemu,pwm` |
 //! | ADC | 0xF8001A00 | | `rvemu,adc` (IIO) |
 //!
-//! The models here only keep register state; the host's `Pins` does the I/O
-//! (rp235x-hal drivers on the board, a simulated board on the Mac). Every
-//! operation completes synchronously, inside the guest's register access.
+//! The models keep register state; the host's `Pins` does the I/O (the
+//! rp235x-hal drivers on the board, a simulated board on the Mac). Every
+//! operation completes synchronously, inside the guest's register write:
+//! I2C and SPI read their messages from guest RAM and write the replies
+//! there, so neither needs a queue, an interrupt or a guest thread.
 
 use crate::cpu::exc;
-use crate::virtio::{CHAIN_MAX, DESC_F_WRITE, Desc, GuestMem, Kick, NO_DESC, Transport};
+use crate::virtio::GuestMem;
 
 pub const IO_BASE: u32 = 0xF800_1000;
 pub const IO_SIZE: u32 = 0x2000;
@@ -22,11 +24,9 @@ pub const GPIO_BASE: u32 = 0xF800_1000;
 pub const GPIO_SIZE: u32 = 0x200;
 pub const GPIO_IRQ: u32 = 8;
 pub const I2C_BASE: [u32; 2] = [0xF800_1200, 0xF800_1400];
-pub const I2C_SIZE: u32 = 0x200;
-pub const I2C_IRQ: [u32; 2] = [9, 10];
+pub const I2C_SIZE: u32 = 0x100;
 pub const SPI_BASE: u32 = 0xF800_1600;
 pub const SPI_SIZE: u32 = 0x100;
-pub const SPI_IRQ: u32 = 11;
 pub const PWM_BASE: u32 = 0xF800_1800;
 pub const PWM_SIZE: u32 = 0x100;
 pub const ADC_BASE: u32 = 0xF800_1A00;
@@ -34,10 +34,11 @@ pub const ADC_SIZE: u32 = 0x100;
 
 /// GPIO lines (the RP2350B's GP0-GP47); PWM channel N is GPIO N.
 pub const NGPIO: u32 = 48;
-/// The SPI controller's FIFO depth (DT `sifive,fifo-depth`).
-pub const SPI_FIFO: usize = 32;
-/// The SPI controller's input clock (DT fixed-clock): SCK = this / 2(div + 1).
-pub const SPI_CLOCK_HZ: u32 = 100_000_000;
+/// PWM channels: up to GP39, the last free pin (GP40-GP47 are the ADC's).
+/// Fewer than 48 also keeps the guest's PWM table in one 4 KiB slab.
+pub const NPWM: u32 = 40;
+/// The fastest SPI clock the guest may ask for.
+pub const SPI_MAX_HZ: u32 = 50_000_000;
 /// ADC channels: 0-7 are GP40-GP47, 8 the temperature sensor.
 pub const ADC_CHANNELS: u32 = 9;
 
@@ -146,6 +147,16 @@ pub enum I2cOp<'a> {
     Write(&'a [u8]),
 }
 
+/// Why an I2C transaction failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum I2cError {
+    /// The address was not acknowledged.
+    Nack,
+    /// Anything else (a data NACK, arbitration, a message the controller
+    /// can't do).
+    Bus,
+}
+
 /// One PWM channel: period and duty in ns.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Pwm {
@@ -172,13 +183,14 @@ pub trait Pins {
     /// Called on every device poll: make it cheap when nothing happened.
     fn gpio_edges(&mut self) -> u64;
     /// One transaction (repeated starts between the messages) with the
-    /// device at 7-bit `addr` on `bus`; false on a NACK or a bus error.
-    fn i2c(&mut self, bus: usize, addr: u8, ops: &mut [I2cOp<'_>]) -> bool;
-    /// Full-duplex SPI: send `buf` and replace it with what came back, at
-    /// `hz` (or the nearest rate below), in mode `mode` (CPOL << 1 | CPHA).
+    /// device at 7-bit `addr` on `bus`.
+    fn i2c(&mut self, bus: usize, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError>;
+    /// Full-duplex SPI, MSB first: send `buf` and replace it with what came
+    /// back, at `hz` (or the nearest rate below), in mode `mode`
+    /// (CPOL << 1 | CPHA).
     fn spi_transfer(&mut self, hz: u32, mode: u8, buf: &mut [u8]);
-    /// Drive the SPI chip select to `high`.
-    fn spi_cs(&mut self, high: bool);
+    /// Drive the SPI chip select (active low) to active or not.
+    fn spi_cs(&mut self, active: bool);
     /// Configure PWM on pin `n` (only for valid pins) and return what the
     /// hardware does instead (`period_ns` 0: not possible).
     fn pwm_set(&mut self, n: u32, pwm: Pwm) -> Pwm;
@@ -200,11 +212,11 @@ impl Pins for NoPins {
     fn gpio_edges(&mut self) -> u64 {
         0
     }
-    fn i2c(&mut self, _bus: usize, _addr: u8, _ops: &mut [I2cOp<'_>]) -> bool {
-        false
+    fn i2c(&mut self, _bus: usize, _addr: u8, _ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
+        Err(I2cError::Nack)
     }
     fn spi_transfer(&mut self, _hz: u32, _mode: u8, _buf: &mut [u8]) {}
-    fn spi_cs(&mut self, _high: bool) {}
+    fn spi_cs(&mut self, _active: bool) {}
     fn pwm_set(&mut self, _n: u32, _pwm: Pwm) -> Pwm {
         Pwm::default()
     }
@@ -278,328 +290,197 @@ impl Gpio {
     }
 }
 
+// ------------------------------------------------------------------ DMA
+
+/// Guest RAM the devices wrote, for `take_dma_write`.
+struct Dirty {
+    r: [(u32, u32); 8],
+    n: usize,
+}
+
+impl Dirty {
+    fn note(&mut self, pa: u64, len: usize) {
+        let (lo, hi) = (pa as u32, (pa + len as u64) as u32);
+        let n = self.n;
+        match self.r[..n].iter().position(|&(a, b)| lo <= b && a <= hi).or((n == self.r.len()).then_some(n - 1)) {
+            Some(i) => self.r[i] = (self.r[i].0.min(lo), self.r[i].1.max(hi)),
+            None => {
+                self.r[n] = (lo, hi);
+                self.n += 1;
+            }
+        }
+    }
+    fn take(&mut self) -> Option<(u32, u32)> {
+        self.n = self.n.checked_sub(1)?;
+        Some(self.r[self.n])
+    }
+}
+
 // ------------------------------------------------------------------ I2C
 
-const DEVICE_I2C: u32 = 34;
-/// Each message takes three descriptors; Linux allows 42 per transfer.
-const I2C_QUEUE: u32 = 128;
-/// Messages run as one transaction; longer groups are refused.
-const I2C_GROUP: usize = 16;
-const I2C_F_ZERO_LENGTH: u32 = 1;
-const I2C_FLAGS_FAIL_NEXT: u32 = 1;
-const I2C_FLAGS_M_RD: u32 = 2;
+/// Messages in one transfer, at most (Linux's i2c-dev allows 42).
+pub const I2C_MSGS: usize = 16;
+const I2C_RESULT_NACK: u32 = 1 << 31;
 
-/// One parsed request: the message and where its status byte goes.
-#[derive(Clone, Copy)]
-struct I2cReq {
-    head: u16,
+/// `rvemu,i2c`: MSGS (0x00) is the guest physical address of a table of
+/// 16-byte messages { u16 addr, u16 flags (bit 0 read), u32 len, u32 buf,
+/// u32 0 }; writing their number to NMSGS (0x04) runs them as one transfer
+/// and RESULT (0x08) is then the number done, plus bit 31 when the address
+/// wasn't acknowledged. Consecutive messages to one address are one
+/// transaction, with repeated starts.
+#[derive(Default)]
+struct I2c {
+    msgs: u32,
+    result: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct I2cMsg {
     addr: u8,
     read: bool,
-    buf: Desc,
-    status: u64,
-    ok: bool,
-    fail_next: bool,
+    buf: u64,
+    len: usize,
 }
 
-/// virtio-i2c: one request queue; each message is out header, buffer (none
-/// for a zero-length message), status. A group of messages chained by
-/// FAIL_NEXT is one transaction.
-struct VirtioI2c {
-    bus: usize,
-    t: Transport,
-}
-
-impl VirtioI2c {
-    fn new(bus: usize, mem: GuestMem) -> Self {
-        VirtioI2c { bus, t: Transport::new(mem, DEVICE_I2C, &[I2C_QUEUE], I2C_F_ZERO_LENGTH) }
+impl I2c {
+    fn load(&self, off: u32) -> u32 {
+        match off {
+            0x00 => self.msgs,
+            0x08 => self.result,
+            _ => 0,
+        }
     }
 
-    fn load(&mut self, off: u32, size: u32) -> Result<u32, u32> {
-        if off >= 0x100 {
-            return Ok(0); // no config space
+    fn store(&mut self, bus: usize, off: u32, v: u32, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
+        match off {
+            0x00 => self.msgs = v,
+            0x04 => self.result = Self::run(bus, u64::from(self.msgs), v as usize, mem, dirty, pins),
+            _ => {}
         }
-        if size != 4 {
-            return Err(exc::LOAD_FAULT);
-        }
-        Ok(self.t.load(off))
     }
 
-    fn store(&mut self, off: u32, size: u32, v: u32, pins: &mut impl Pins) -> Result<(), u32> {
-        if off >= 0x100 {
-            return Ok(());
+    fn run(bus: usize, tab: u64, n: usize, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) -> u32 {
+        if n == 0 || n > I2C_MSGS {
+            return 0;
         }
-        if size != 4 {
-            return Err(exc::STORE_FAULT);
-        }
-        if let Kick::Notify(0) = self.t.store(off, v) {
-            while self.t.peek_avail(0).is_some() {
-                self.group(pins);
+        let mut m = [I2cMsg::default(); I2C_MSGS];
+        for (k, msg) in m[..n].iter_mut().enumerate() {
+            let e = tab + 16 * k as u64;
+            let (Some(a), Some(len), Some(buf)) = (mem.u32(e), mem.u32(e + 4), mem.u32(e + 8)) else { return 0 };
+            *msg = I2cMsg { addr: (a & 0x7F) as u8, read: a >> 16 & 1 != 0, buf: u64::from(buf), len: len as usize };
+            if a & 0xFF80 != 0 {
+                return 0; // 10-bit addresses aren't offered
             }
         }
-        Ok(())
-    }
-
-    fn parse(&self, head: u16) -> I2cReq {
-        let mut c = [NO_DESC; CHAIN_MAX];
-        let n = self.t.chain(0, head, &mut c);
-        let mut r = I2cReq { head, addr: 0, read: false, buf: NO_DESC, status: 0, ok: false, fail_next: false };
-        if !(2..=3).contains(&n) || c[0].len < 8 || c[n - 1].flags & DESC_F_WRITE == 0 {
-            return r;
-        }
-        let (Some(addr), Some(flags)) = (self.t.mem.u16(c[0].addr), self.t.mem.u32(c[0].addr + 4)) else { return r };
-        r.addr = (addr >> 1) as u8 & 0x7F;
-        r.read = flags & I2C_FLAGS_M_RD != 0;
-        r.fail_next = flags & I2C_FLAGS_FAIL_NEXT != 0;
-        r.status = c[n - 1].addr;
-        if n == 3 {
-            r.buf = c[1];
-            // a read buffer is device-writable, a write buffer isn't
-            if (r.buf.flags & DESC_F_WRITE != 0) != r.read {
-                return r;
-            }
-        }
-        r.ok = true;
-        r
-    }
-
-    /// Take the next group of messages off the queue and run it.
-    fn group(&mut self, pins: &mut impl Pins) {
-        let mut reqs = [I2cReq { head: 0, addr: 0, read: false, buf: NO_DESC, status: 0, ok: false, fail_next: false };
-            I2C_GROUP];
-        let mut n = 0;
-        while let Some(head) = self.t.avail_nth(0, n as u16) {
-            reqs[n] = self.parse(head);
-            n += 1;
-            if !reqs[n - 1].fail_next || n == I2C_GROUP {
-                break;
-            }
-        }
-        let reqs = &reqs[..n];
-        // runs to one address are one transaction each; a failure fails
-        // the rest of the group
         let mut done = 0;
-        let mut ok = reqs.len() < I2C_GROUP || !reqs[n - 1].fail_next;
-        while ok && done < n {
-            let addr = reqs[done].addr;
-            let end = reqs[done..].iter().position(|r| r.addr != addr).map_or(n, |k| done + k);
-            ok = self.run(addr, &reqs[done..end], pins);
-            if ok {
-                done = end;
+        while done < n {
+            let addr = m[done].addr;
+            let end = m[done..n].iter().position(|x| x.addr != addr).map_or(n, |k| done + k);
+            let mut ops: [I2cOp<'_>; I2C_MSGS] = core::array::from_fn(|_| I2cOp::Write(&[]));
+            for (op, x) in ops.iter_mut().zip(&m[done..end]) {
+                *op = if x.len == 0 {
+                    if x.read { I2cOp::Read(&mut []) } else { I2cOp::Write(&[]) }
+                } else if x.read {
+                    let Some(p) = mem.range_mut(x.buf, x.len) else { return done as u32 };
+                    dirty.note(x.buf, x.len);
+                    // SAFETY: in guest RAM (checked); the driver's buffer.
+                    I2cOp::Read(unsafe { core::slice::from_raw_parts_mut(p, x.len) })
+                } else {
+                    let Some(p) = mem.range(x.buf, x.len) else { return done as u32 };
+                    // SAFETY: as above.
+                    I2cOp::Write(unsafe { core::slice::from_raw_parts(p, x.len) })
+                };
+            }
+            match pins.i2c(bus, addr, &mut ops[..end - done]) {
+                Ok(()) => done = end,
+                Err(I2cError::Nack) => return done as u32 | I2C_RESULT_NACK,
+                Err(I2cError::Bus) => return done as u32,
             }
         }
-        for (i, r) in reqs.iter().enumerate() {
-            let good = i < done;
-            let mut written = 1;
-            if r.ok && r.read {
-                // even a failed read may have written part of the buffer
-                self.t.note_dirty(r.buf.addr, r.buf.len as usize);
-                if good {
-                    written += r.buf.len;
-                }
-            }
-            self.t.dma_write(r.status, &[if good { 0 } else { 1 }]);
-            self.t.push_used(0, r.head, written);
-        }
-    }
-
-    /// One transaction to `addr`.
-    fn run(&mut self, addr: u8, reqs: &[I2cReq], pins: &mut impl Pins) -> bool {
-        let mut ops: [I2cOp<'_>; I2C_GROUP] = core::array::from_fn(|_| I2cOp::Write(&[]));
-        for (op, r) in ops.iter_mut().zip(reqs) {
-            if !r.ok {
-                return false;
-            }
-            let len = r.buf.len as usize;
-            *op = if r.read {
-                let Some(p) = self.t.mem.range_mut(r.buf.addr, len) else { return false };
-                // SAFETY: in guest RAM (checked); the buffer is the driver's
-                // and nothing else touches it during the request.
-                I2cOp::Read(unsafe { core::slice::from_raw_parts_mut(p, len) })
-            } else if len == 0 {
-                I2cOp::Write(&[])
-            } else {
-                let Some(p) = self.t.mem.range(r.buf.addr, len) else { return false };
-                // SAFETY: as above.
-                I2cOp::Write(unsafe { core::slice::from_raw_parts(p, len) })
-            };
-        }
-        pins.i2c(self.bus, addr, &mut ops[..reqs.len()])
+        n as u32
     }
 }
 
 // ------------------------------------------------------------------ SPI
 
-const SPI_CSMODE_AUTO: u32 = 0;
-const SPI_CSMODE_HOLD: u32 = 2;
-const SPI_FMT_ENDIAN: u32 = 1 << 2;
-const SPI_FMT_DIR: u32 = 1 << 3;
-const SPI_TXDATA_FULL: u32 = 1 << 31;
-const SPI_RXDATA_EMPTY: u32 = 1 << 31;
-const SPI_IP_TXWM: u32 = 1;
-const SPI_IP_RXWM: u32 = 2;
+const SPI_MODE_LSB_FIRST: u32 = 8;
+/// Bytes moved per backend transfer.
+const SPI_CHUNK: usize = 64;
 
-/// The SiFive SPI controller's registers (Linux `spi-sifive`), one chip
-/// select. Transmitted bytes wait in the FIFO and go out in one transfer
-/// when the driver looks for the result (RXDATA, IP, IE) or ends the
-/// message (CSMODE), or when the FIFO is full.
+/// `rvemu,spi`: TX (0x00) and RX (0x04) guest physical buffers (0: zeros
+/// out, nothing in), LEN (0x08), HZ (0x0c), MODE (0x10: Linux SPI_CPHA,
+/// SPI_CPOL, SPI_LSB_FIRST), CS (0x14: 1 active) and GO (0x18), which runs
+/// the transfer.
+#[derive(Default)]
 struct Spi {
-    sckdiv: u32,
-    sckmode: u32,
-    csid: u32,
-    csdef: u32,
-    csmode: u32,
-    delay: [u32; 2],
-    fmt: u32,
-    txmark: u32,
-    rxmark: u32,
-    ie: u32,
-    tx: [u8; SPI_FIFO],
-    ntx: usize,
-    rx: [u8; SPI_FIFO],
-    rx_head: usize,
-    nrx: usize,
+    tx: u32,
+    rx: u32,
+    len: u32,
+    hz: u32,
+    mode: u32,
+    cs: u32,
 }
 
 impl Spi {
-    fn new() -> Self {
-        Spi {
-            sckdiv: 3,
-            sckmode: 0,
-            csid: 0,
-            csdef: 1,
-            csmode: SPI_CSMODE_AUTO,
-            delay: [0x1_0001, 1],
-            fmt: 8 << 16,
-            txmark: 0,
-            rxmark: 0,
-            ie: 0,
-            tx: [0; SPI_FIFO],
-            ntx: 0,
-            rx: [0; SPI_FIFO],
-            rx_head: 0,
-            nrx: 0,
-        }
-    }
-
-    fn ip(&self) -> u32 {
-        let tx = if (self.ntx as u32) < self.txmark { SPI_IP_TXWM } else { 0 };
-        let rx = if self.nrx as u32 > self.rxmark { SPI_IP_RXWM } else { 0 };
-        tx | rx
-    }
-
-    fn irq_line(&self) -> bool {
-        self.ip() & self.ie != 0
-    }
-
-    fn cs_active(&self) -> bool {
-        self.csdef & 1 == 0
-    }
-
-    /// Clock out the bytes waiting in the FIFO.
-    fn flush(&mut self, pins: &mut impl Pins) {
-        if self.ntx == 0 {
-            return;
-        }
-        let mut buf = self.tx;
-        let buf = &mut buf[..self.ntx];
-        self.ntx = 0;
-        let lsb = self.fmt & SPI_FMT_ENDIAN != 0;
-        if lsb {
-            buf.iter_mut().for_each(|b| *b = b.reverse_bits());
-        }
-        let hz = SPI_CLOCK_HZ / (2 * (self.sckdiv + 1));
-        let auto = self.csmode == SPI_CSMODE_AUTO && self.csid == 0;
-        if auto {
-            pins.spi_cs(self.cs_active());
-        }
-        pins.spi_transfer(hz, self.sckmode as u8, buf);
-        if auto {
-            pins.spi_cs(!self.cs_active());
-        }
-        if self.fmt & SPI_FMT_DIR != 0 {
-            return; // transmit only: nothing goes to the receive FIFO
-        }
-        for &b in buf.iter() {
-            if self.nrx < SPI_FIFO {
-                self.rx[(self.rx_head + self.nrx) % SPI_FIFO] = if lsb { b.reverse_bits() } else { b };
-                self.nrx += 1;
-            }
-        }
-    }
-
-    fn load(&mut self, off: u32, pins: &mut impl Pins) -> u32 {
+    fn load(&self, off: u32) -> u32 {
         match off {
-            0x00 => self.sckdiv,
-            0x04 => self.sckmode,
-            0x10 => self.csid,
-            0x14 => self.csdef,
-            0x18 => self.csmode,
-            0x28 => self.delay[0],
-            0x2c => self.delay[1],
-            0x40 => self.fmt,
-            0x48 => {
-                if self.ntx == SPI_FIFO {
-                    SPI_TXDATA_FULL
-                } else {
-                    0
-                }
-            }
-            0x4c => {
-                self.flush(pins);
-                if self.nrx == 0 {
-                    return SPI_RXDATA_EMPTY;
-                }
-                let b = self.rx[self.rx_head];
-                self.rx_head = (self.rx_head + 1) % SPI_FIFO;
-                self.nrx -= 1;
-                u32::from(b)
-            }
-            0x50 => self.txmark,
-            0x54 => self.rxmark,
-            0x70 => self.ie,
-            0x74 => {
-                self.flush(pins);
-                self.ip()
-            }
+            0x00 => self.tx,
+            0x04 => self.rx,
+            0x08 => self.len,
+            0x0c => self.hz,
+            0x10 => self.mode,
+            0x14 => self.cs,
             _ => 0,
         }
     }
 
-    fn store(&mut self, off: u32, v: u32, pins: &mut impl Pins) {
+    fn store(&mut self, off: u32, v: u32, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
         match off {
-            0x00 => self.sckdiv = v & 0xFFF,
-            0x04 => self.sckmode = v & 3,
-            0x10 => self.csid = v,
+            0x00 => self.tx = v,
+            0x04 => self.rx = v,
+            0x08 => self.len = v,
+            0x0c => self.hz = v.clamp(1, SPI_MAX_HZ),
+            0x10 => self.mode = v & 0xB,
             0x14 => {
-                // one chip select: the probe finds CSDEF's single bit
-                self.csdef = v & 1;
-                if self.csmode != SPI_CSMODE_HOLD {
-                    pins.spi_cs(!self.cs_active());
-                }
+                self.cs = v & 1;
+                pins.spi_cs(self.cs != 0);
             }
-            0x18 => {
-                self.flush(pins);
-                self.csmode = v & 3;
-                let hold = self.csmode == SPI_CSMODE_HOLD && self.csid == 0;
-                pins.spi_cs(if hold { self.cs_active() } else { !self.cs_active() });
-            }
-            0x28 => self.delay[0] = v,
-            0x2c => self.delay[1] = v,
-            0x40 => self.fmt = v,
-            0x48 => {
-                if self.ntx == SPI_FIFO {
-                    self.flush(pins);
-                }
-                self.tx[self.ntx] = v as u8;
-                self.ntx += 1;
-            }
-            0x50 => self.txmark = v & 0xFF,
-            0x54 => self.rxmark = v & 0xFF,
-            0x70 => {
-                self.flush(pins);
-                self.ie = v & 3;
-            }
+            0x18 => self.go(mem, dirty, pins),
             _ => {}
+        }
+    }
+
+    fn go(&mut self, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
+        let (len, tx, rx) = (self.len as usize, u64::from(self.tx), u64::from(self.rx));
+        if (tx != 0 && mem.range(tx, len).is_none()) || (rx != 0 && mem.range_mut(rx, len).is_none()) {
+            return;
+        }
+        let lsb = self.mode & SPI_MODE_LSB_FIRST != 0;
+        let mut at = 0;
+        while at < len {
+            let n = (len - at).min(SPI_CHUNK);
+            let mut buf = [0u8; SPI_CHUNK];
+            if tx != 0 {
+                // SAFETY: in guest RAM (checked above).
+                unsafe { core::ptr::copy_nonoverlapping(mem.range(tx + at as u64, n).unwrap(), buf.as_mut_ptr(), n) };
+            }
+            let buf = &mut buf[..n];
+            if lsb {
+                buf.iter_mut().for_each(|b| *b = b.reverse_bits());
+            }
+            pins.spi_transfer(self.hz, (self.mode & 3) as u8, buf);
+            if lsb {
+                buf.iter_mut().for_each(|b| *b = b.reverse_bits());
+            }
+            if rx != 0 {
+                let p = mem.range_mut(rx + at as u64, n).unwrap();
+                // SAFETY: as above.
+                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), p, n) };
+            }
+            at += n;
+        }
+        if rx != 0 && len != 0 {
+            dirty.note(rx, len);
         }
     }
 }
@@ -628,7 +509,7 @@ impl PwmDev {
             }
             0x10 => pins.pwm_valid() as u32,
             0x14 => (pins.pwm_valid() >> 32) as u32,
-            0x18 => NGPIO,
+            0x18 => NPWM,
             _ => 0,
         }
     }
@@ -661,8 +542,10 @@ impl PwmDev {
 /// Every device in IO_BASE..IO_BASE + IO_SIZE, on the host's `Pins`.
 pub struct Io<P: Pins> {
     pub pins: P,
+    mem: GuestMem,
+    dirty: Dirty,
     gpio: Gpio,
-    i2c: [VirtioI2c; 2],
+    i2c: [I2c; 2],
     spi: Spi,
     pwm: PwmDev,
 }
@@ -671,32 +554,27 @@ impl<P: Pins> Io<P> {
     pub fn new(pins: P, mem: GuestMem) -> Self {
         Io {
             pins,
+            mem,
+            dirty: Dirty { r: [(0, 0); 8], n: 0 },
             // the RP2350's pads come out of reset pulled down
             gpio: Gpio { line: [Line { pull_down: true, ..Line::default() }; NGPIO as usize], pend: 0 },
-            i2c: [VirtioI2c::new(0, mem), VirtioI2c::new(1, mem)],
-            spi: Spi::new(),
+            i2c: [I2c::default(), I2c::default()],
+            spi: Spi { hz: 1_000_000, ..Spi::default() },
             pwm: PwmDev { sel: 0, staged: Pwm::default(), ch: [Pwm::default(); NGPIO as usize] },
         }
     }
 
-    /// The device at `pa` and the offset in it.
-    fn at(pa: u32) -> (u32, u32) {
-        let off = pa - IO_BASE;
-        (off & !0x1FF, off & 0x1FF)
-    }
-
     pub fn load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
-        let (dev, off) = Self::at(pa);
-        let pins = &mut self.pins;
-        if let Some(k) = I2C_BASE.iter().position(|&b| b - IO_BASE == dev) {
-            return self.i2c[k].load(off, size);
-        }
         if size != 4 {
             return Err(exc::LOAD_FAULT);
         }
-        Ok(match dev + IO_BASE {
-            GPIO_BASE => self.gpio.load(off, pins),
-            SPI_BASE => self.spi.load(off, pins),
+        let (dev, off) = (pa & !0x1FF, pa & 0xFF);
+        let pins = &mut self.pins;
+        Ok(match dev {
+            GPIO_BASE => self.gpio.load(pa & 0x1FF, pins),
+            b if b == I2C_BASE[0] => self.i2c[0].load(off),
+            b if b == I2C_BASE[1] => self.i2c[1].load(off),
+            SPI_BASE => self.spi.load(off),
             PWM_BASE => self.pwm.load(off, pins),
             ADC_BASE if off < 4 * ADC_CHANNELS => pins.adc(off / 4).map_or(1 << 31, u32::from),
             _ => 0,
@@ -704,17 +582,16 @@ impl<P: Pins> Io<P> {
     }
 
     pub fn store(&mut self, pa: u32, size: u32, v: u32) -> Result<(), u32> {
-        let (dev, off) = Self::at(pa);
-        let pins = &mut self.pins;
-        if let Some(k) = I2C_BASE.iter().position(|&b| b - IO_BASE == dev) {
-            return self.i2c[k].store(off, size, v, pins);
-        }
         if size != 4 {
             return Err(exc::STORE_FAULT);
         }
-        match dev + IO_BASE {
-            GPIO_BASE => self.gpio.store(off, v, pins),
-            SPI_BASE => self.spi.store(off, v, pins),
+        let (dev, off) = (pa & !0x1FF, pa & 0xFF);
+        let (pins, mem, dirty) = (&mut self.pins, &self.mem, &mut self.dirty);
+        match dev {
+            GPIO_BASE => self.gpio.store(pa & 0x1FF, v, pins),
+            b if b == I2C_BASE[0] => self.i2c[0].store(0, off, v, mem, dirty, pins),
+            b if b == I2C_BASE[1] => self.i2c[1].store(1, off, v, mem, dirty, pins),
+            SPI_BASE => self.spi.store(off, v, mem, dirty, pins),
             PWM_BASE => self.pwm.store(off, v, pins),
             _ => {}
         }
@@ -726,17 +603,12 @@ impl<P: Pins> Io<P> {
         self.gpio.poll(&mut self.pins);
     }
 
-    /// (PLIC input, level) of each device that interrupts.
-    pub fn irq_lines(&self) -> [(u32, bool); 4] {
-        [
-            (GPIO_IRQ, self.gpio.pend != 0),
-            (I2C_IRQ[0], self.i2c[0].t.int_status != 0),
-            (I2C_IRQ[1], self.i2c[1].t.int_status != 0),
-            (SPI_IRQ, self.spi.irq_line()),
-        ]
+    /// The GPIO controller's interrupt line (PLIC `GPIO_IRQ`).
+    pub fn irq_line(&self) -> bool {
+        self.gpio.pend != 0
     }
 
     pub fn take_dma_write(&mut self) -> Option<(u32, u32)> {
-        self.i2c[0].t.take_dma_write().or_else(|| self.i2c[1].t.take_dma_write())
+        self.dirty.take()
     }
 }

@@ -9,7 +9,7 @@
 //! - PWM: the RP2350's slice arithmetic at 150 MHz.
 //! - ADC: the temperature sensor reads 27 degC; GP40+N reads 400 * N + 100.
 
-use rvcore::periph::{FREE_PINS, I2cOp, Line, NGPIO, Pins, Pwm, pwm_timing};
+use rvcore::periph::{FREE_PINS, I2cError, I2cOp, Line, NGPIO, Pins, Pwm, pwm_timing};
 
 const CLK_HZ: u32 = 150_000_000;
 const EEPROM_ADDR: u8 = 0x50;
@@ -92,9 +92,9 @@ impl Pins for StubPins {
         std::mem::take(&mut self.edges)
     }
 
-    fn i2c(&mut self, bus: usize, addr: u8, ops: &mut [I2cOp<'_>]) -> bool {
+    fn i2c(&mut self, bus: usize, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
         if bus != 0 || addr != EEPROM_ADDR {
-            return false;
+            return Err(I2cError::Nack);
         }
         for op in ops.iter_mut() {
             match op {
@@ -115,12 +115,12 @@ impl Pins for StubPins {
                 }
             }
         }
-        true
+        Ok(())
     }
 
     fn spi_transfer(&mut self, _hz: u32, _mode: u8, _buf: &mut [u8]) {}
 
-    fn spi_cs(&mut self, _high: bool) {}
+    fn spi_cs(&mut self, _active: bool) {}
 
     fn pwm_set(&mut self, _n: u32, pwm: Pwm) -> Pwm {
         match pwm_timing(CLK_HZ, pwm.period_ns, pwm.duty_ns) {

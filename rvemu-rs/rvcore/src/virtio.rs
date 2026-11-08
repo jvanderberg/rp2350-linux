@@ -30,14 +30,14 @@ const BLK_QUEUE: u32 = 16;
 const NET_RX_QUEUE: u32 = 16;
 const NET_TX_QUEUE: u32 = 32;
 /// Longest descriptor chain followed (the largest queue).
-pub(crate) const CHAIN_MAX: usize = 32;
+const CHAIN_MAX: usize = 32;
 const NQUEUES: usize = 2;
 
 /// VIRTIO_F_VERSION_1 is feature bit 32: bit 0 of the high word.
 const F_HI_VERSION_1: u32 = 1;
 
 const DESC_F_NEXT: u16 = 1;
-pub(crate) const DESC_F_WRITE: u16 = 2;
+const DESC_F_WRITE: u16 = 2;
 
 const BLK_F_RO: u32 = 1 << 5;
 const BLK_T_IN: u32 = 0;
@@ -176,7 +176,7 @@ impl GuestMem {
         unsafe { ptr::copy_nonoverlapping(p, b.as_mut_ptr(), N) };
         Some(b)
     }
-    pub(crate) fn u16(&self, pa: u64) -> Option<u16> {
+    fn u16(&self, pa: u64) -> Option<u16> {
         self.read::<2>(pa).map(u16::from_le_bytes)
     }
     pub(crate) fn u32(&self, pa: u64) -> Option<u32> {
@@ -210,24 +210,24 @@ struct Queue {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct Desc {
-    pub(crate) addr: u64,
-    pub(crate) len: u32,
-    pub(crate) flags: u16,
+struct Desc {
+    addr: u64,
+    len: u32,
+    flags: u16,
 }
 
-pub(crate) const NO_DESC: Desc = Desc { addr: 0, len: 0, flags: 0 };
+const NO_DESC: Desc = Desc { addr: 0, len: 0, flags: 0 };
 const DIRTY_MAX: usize = 8;
 
 /// What a register store asks of the device.
-pub(crate) enum Kick {
+enum Kick {
     None,
     Notify(u32),
 }
 
 /// The virtio-mmio registers and virtqueues, shared by the devices.
-pub(crate) struct Transport {
-    pub(crate) mem: GuestMem,
+struct Transport {
+    mem: GuestMem,
     device_id: u32,
     nqueues: usize,
     /// QueueNumMax of each queue
@@ -240,7 +240,7 @@ pub(crate) struct Transport {
     drv_features_sel: u32,
     queue_sel: u32,
     q: [Queue; NQUEUES],
-    pub(crate) int_status: u32,
+    int_status: u32,
     config_generation: u32,
     /// Guest RAM written since the last `take_dma_write`, as [lo, hi)
     /// ranges. Kept apart, not merged into one span: a request's data and
@@ -251,7 +251,7 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    pub(crate) fn new(mem: GuestMem, device_id: u32, sizes: &[u32], features_lo: u32) -> Self {
+    fn new(mem: GuestMem, device_id: u32, sizes: &[u32], features_lo: u32) -> Self {
         let mut qmax = [0; NQUEUES];
         qmax[..sizes.len()].copy_from_slice(sizes);
         Transport {
@@ -290,7 +290,7 @@ impl Transport {
         self.q.get_mut(self.queue_sel as usize).filter(|_| (self.queue_sel as usize) < n)
     }
 
-    pub(crate) fn load(&self, off: u32) -> u32 {
+    fn load(&self, off: u32) -> u32 {
         let q = self.q.get(self.queue_sel as usize).filter(|_| (self.queue_sel as usize) < self.nqueues);
         match off {
             0x000 => MAGIC,
@@ -307,7 +307,7 @@ impl Transport {
         }
     }
 
-    pub(crate) fn store(&mut self, off: u32, v: u32) -> Kick {
+    fn store(&mut self, off: u32, v: u32) -> Kick {
         let lo = |old: u64| (old & !0xFFFF_FFFF) | v as u64;
         let hi = |old: u64| (old & 0xFFFF_FFFF) | (v as u64) << 32;
         match off {
@@ -354,26 +354,20 @@ impl Transport {
     }
 
     /// Next available descriptor chain head on queue `qi`, without taking it.
-    pub(crate) fn peek_avail(&self, qi: usize) -> Option<u16> {
-        self.avail_nth(qi, 0)
-    }
-
-    /// The `k`th available chain head on queue `qi` after the next one to
-    /// take (0: that one), without taking any.
-    pub(crate) fn avail_nth(&self, qi: usize, k: u16) -> Option<u16> {
+    fn peek_avail(&self, qi: usize) -> Option<u16> {
         if !self.queue_live(qi) {
             return None;
         }
         let q = &self.q[qi];
         let avail_idx = self.mem.u16(q.avail + 2)?;
-        if avail_idx.wrapping_sub(q.last_avail) <= k {
+        if q.last_avail == avail_idx {
             return None;
         }
-        self.mem.u16(q.avail + 4 + 2 * (q.last_avail.wrapping_add(k) as u64 % q.num as u64))
+        self.mem.u16(q.avail + 4 + 2 * (q.last_avail as u64 % q.num as u64))
     }
 
     /// Return chain `head` on queue `qi` with `written` bytes, and interrupt.
-    pub(crate) fn push_used(&mut self, qi: usize, head: u16, written: u32) {
+    fn push_used(&mut self, qi: usize, head: u16, written: u32) {
         let q = self.q[qi];
         // used ring: flags, idx, then { id: u32, len: u32 }[num]
         if let Some(used_idx) = self.mem.u16(q.used + 2) {
@@ -389,7 +383,7 @@ impl Transport {
     }
 
     /// The descriptor chain at `head` on queue `qi` into `chain`; its length.
-    pub(crate) fn chain(&self, qi: usize, head: u16, chain: &mut [Desc; CHAIN_MAX]) -> usize {
+    fn chain(&self, qi: usize, head: u16, chain: &mut [Desc; CHAIN_MAX]) -> usize {
         let q = &self.q[qi];
         let mut n = 0;
         let mut i = head;
@@ -412,7 +406,7 @@ impl Transport {
         }
     }
 
-    pub(crate) fn note_dirty(&mut self, pa: u64, len: usize) {
+    fn note_dirty(&mut self, pa: u64, len: usize) {
         let (lo, hi) = (pa as u32, (pa + len as u64) as u32);
         let live = &mut self.dirty[..self.ndirty];
         // touching an existing range (or no room left): widen it
@@ -427,7 +421,7 @@ impl Transport {
     }
 
     /// Write `data` into guest RAM at `pa`, noting it for `take_dma_write`.
-    pub(crate) fn dma_write(&mut self, pa: u64, data: &[u8]) -> bool {
+    fn dma_write(&mut self, pa: u64, data: &[u8]) -> bool {
         let ok = self.mem.write(pa, data);
         if ok {
             self.note_dirty(pa, data.len());
@@ -435,7 +429,7 @@ impl Transport {
         ok
     }
 
-    pub(crate) fn take_dma_write(&mut self) -> Option<(u32, u32)> {
+    fn take_dma_write(&mut self) -> Option<(u32, u32)> {
         self.ndirty = self.ndirty.checked_sub(1)?;
         Some(self.dirty[self.ndirty])
     }

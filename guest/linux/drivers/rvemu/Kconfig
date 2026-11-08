@@ -24,3 +24,17 @@ config RVEMU_ADC
 	help
 	  The rvemu machine's ADC: the RP2350B's ADC inputs GP40-GP47 and its
 	  temperature sensor.
+
+config RVEMU_I2C
+	bool "rvemu I2C controllers"
+	depends on I2C && OF
+	help
+	  The rvemu machine's I2C controllers: the RP2350's I2C0 and I2C1,
+	  driven synchronously by the emulator.
+
+config RVEMU_SPI
+	bool "rvemu SPI controller"
+	depends on SPI_MASTER && OF
+	help
+	  The rvemu machine's SPI controller: the RP2350's SPI0, driven
+	  synchronously by the emulator.

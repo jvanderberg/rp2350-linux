@@ -289,7 +289,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
 }
 
 /// The board's pins (`-G`, rvcore::periph): root-level nodes (aliases fixing
-/// the bus numbers, the SPI controller's clock) and the devices on the soc.
+/// the bus numbers) and the devices on the soc.
 fn io_nodes() -> (String, String) {
     use rvcore::periph::*;
     // RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc: only these (for measuring)
@@ -313,55 +313,36 @@ fn io_nodes() -> (String, String) {
 "#
         );
     }
-    for k in 0..2 {
+    for (k, base) in I2C_BASE.into_iter().enumerate() {
         if !want(&format!("i2c{k}")) {
             continue;
         }
-        let (base, irq) = (I2C_BASE[k], I2C_IRQ[k]);
         aliases += &format!("    i2c{k} = &i2c{k};\n");
         soc += &format!(
-            r#"    virtio@{base:x} {{
-      compatible = "virtio,mmio";
+            r#"    i2c{k}: i2c@{base:x} {{
+      compatible = "rvemu,i2c";
       reg = <0x{base:x} 0x{I2C_SIZE:x}>;
-      interrupts = <{irq}>;
-      interrupt-parent = <&plic0>;
-      i2c{k}: i2c {{
-        compatible = "virtio,device22";
-        #address-cells = <1>;
-        #size-cells = <0>;
-      }};
+      #address-cells = <1>;
+      #size-cells = <0>;
     }};
 "#
         );
     }
     if want("spi") {
         aliases += "    spi0 = &spi0;\n";
-        root += &format!(
-            r#"  spiclk: clock-spi {{
-    compatible = "fixed-clock";
-    #clock-cells = <0>;
-    clock-frequency = <{SPI_CLOCK_HZ}>;
-  }};
-"#
-        );
         soc += &format!(
             r#"    spi0: spi@{SPI_BASE:x} {{
-      compatible = "sifive,spi0";
+      compatible = "rvemu,spi";
       reg = <0x{SPI_BASE:x} 0x{SPI_SIZE:x}>;
-      interrupts = <{SPI_IRQ}>;
-      interrupt-parent = <&plic0>;
-      clocks = <&spiclk>;
-      sifive,fifo-depth = <{SPI_FIFO}>;
       #address-cells = <1>;
       #size-cells = <0>;
       spidev@0 {{
         compatible = "rohm,dh2228fv";
         reg = <0>;
-        spi-max-frequency = <{max}>;
+        spi-max-frequency = <{SPI_MAX_HZ}>;
       }};
     }};
-"#,
-            max = SPI_CLOCK_HZ / 2
+"#
         );
     }
     if want("pwm") {

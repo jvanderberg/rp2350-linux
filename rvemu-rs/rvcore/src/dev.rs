@@ -4,7 +4,7 @@
 //! the network link and the pins.
 
 use crate::cpu::exc;
-use crate::periph::{IO_BASE, IO_SIZE, Io, NoPins, Pins};
+use crate::periph::{GPIO_IRQ, IO_BASE, IO_SIZE, Io, NoPins, Pins};
 use crate::virtio::{
     Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE,
     VirtioBlk, VirtioNet,
@@ -237,9 +237,7 @@ impl<C: Console, D: Disk, N: NetLink, P: Pins> Platform<C, D, N, P> {
         }
         if let Some(io) = &mut self.io {
             io.poll();
-            for (irq, high) in io.irq_lines() {
-                self.plic.set_level(irq, high);
-            }
+            self.plic.set_level(GPIO_IRQ, io.irq_line());
         }
     }
 
