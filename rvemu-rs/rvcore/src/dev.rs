@@ -229,9 +229,6 @@ impl<C: Console, D: Disk, N: NetLink, W: Disk> Platform<C, D, N, W> {
         if let Some(b) = &self.blk {
             self.plic.set_level(VIRTIO_IRQ, b.irq_line());
         }
-        if let Some(w) = &self.swap {
-            self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
-        }
         if let Some(n) = &mut self.net {
             n.poll();
             self.plic.set_level(VIRTIO_NET_IRQ, n.irq_line());
@@ -305,7 +302,13 @@ impl<C: Console, D: Disk, N: NetLink, W: Disk> Platform<C, D, N, W> {
         if let Some(w) = &mut self.swap
             && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
         {
+            // Only its own register stores change the swap device's line
+            // (requests complete in the queue notify; the guest acks with
+            // InterruptACK), so it stays out of `update_irqs`, which runs
+            // after every MMIO access and must stay small enough to inline
+            // into the SRAM interpreter.
             let r = w.store(pa - VIRTIO_SWAP_BASE, size, v);
+            self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
             self.update_irqs();
             return r;
         }
