@@ -229,8 +229,14 @@ impl BoardPins {
     }
 }
 
-/// One I2C transaction on `bus`, as `Pins::i2c` describes.
-fn i2c_run<B: embedded_hal::i2c::I2c>(bus: &mut B, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
+/// One I2C transaction on `bus` (its controller's registers: `regs`), as
+/// `Pins::i2c` describes.
+fn i2c_run<B: embedded_hal::i2c::I2c>(
+    bus: &mut B,
+    regs: &pac::i2c0::RegisterBlock,
+    addr: u8,
+    ops: &mut [I2cOp<'_>],
+) -> Result<(), I2cError> {
     use embedded_hal::i2c::{Error as _, ErrorKind, NoAcknowledgeSource};
     let map = |e: B::Error| match e.kind() {
         ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address | NoAcknowledgeSource::Unknown) => I2cError::Nack,
@@ -250,7 +256,19 @@ fn i2c_run<B: embedded_hal::i2c::I2c>(bus: &mut B, addr: u8, ops: &mut [I2cOp<'_
             I2cOp::Write(b) => Operation::Write(b),
         };
     }
-    bus.transaction(addr, &mut eops[..n]).map_err(map)
+    let r = bus.transaction(addr, &mut eops[..n]).map_err(map);
+    // rp235x-hal 0.4 checks for an abort only while a write waits for FIFO
+    // room: a write that fits returns Ok after the STOP even when the address
+    // was not acknowledged, and leaves the abort set for the next transfer.
+    // Read (and clear) it here, as the pico-sdk does after its STOP.
+    let abrt = regs.ic_tx_abrt_source().read();
+    if abrt.bits() != 0 {
+        regs.ic_clr_tx_abrt().read();
+        if r.is_ok() {
+            return Err(if abrt.abrt_7b_addr_noack().bit_is_set() { I2cError::Nack } else { I2cError::Bus });
+        }
+    }
+    r
 }
 
 impl Pins for BoardPins {
@@ -320,7 +338,13 @@ impl Pins for BoardPins {
     }
 
     fn i2c(&mut self, bus: usize, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
-        if bus == 0 { i2c_run(&mut self.i2c0, addr, ops) } else { i2c_run(&mut self.i2c1, addr, ops) }
+        // SAFETY: shared reads of the registers of controllers that are ours
+        // (`i2c0`, `i2c1`); i2c_run uses them only between HAL calls
+        if bus == 0 {
+            i2c_run(&mut self.i2c0, unsafe { &*pac::I2C0::ptr() }, addr, ops)
+        } else {
+            i2c_run(&mut self.i2c1, unsafe { &*pac::I2C1::ptr() }, addr, ops)
+        }
     }
 
     fn spi_transfer(&mut self, hz: u32, mode: u8, buf: &mut [u8]) {

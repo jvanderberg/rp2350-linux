@@ -181,7 +181,9 @@ map is in the top-level README.
   interrupt is never taken.
 - **I2C.** `hal::I2C` at 100 kHz with the pads' pull-ups. The controller
   can't send an address without data, so a zero-length write (i2cdetect's
-  probe) becomes a one-byte read.
+  probe) becomes a one-byte read. rp235x-hal 0.4 reports no NACK for a
+  write short enough to fit the FIFO, so the firmware reads the abort
+  status after each transaction.
 - **SPI.** `hal::spi::Spi`, 8-bit frames; the clock rate and mode change
   per transfer. Chip select GP17 is a GPIO, held for the whole message.
 - **PWM.** The slice and channel that reach the pin, with the divider and
