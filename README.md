@@ -50,32 +50,21 @@ lines starting with `$` on the Mac the board is plugged into.
 ## Quickstart
 
 ```sh
-# Every script that touches the board or the guest build takes a lock in
-# your name (see "Sharing the board").
 export BOARD_LOCK_OWNER=$USER
 
 # 1. Build the guest into guest/out-disk (Docker).
-cd guest && ./run-build.sh disk && cd ..
+cd guest && ./run-build.sh disk && cd ../rvemu-rs
 
-# 2. Take the board.
-cd rvemu-rs
+# 2. Store the Wi-Fi network in the board's flash (asks for the passphrase).
 ../rp2350/tools/board-lock acquire $USER -l 120
-
-# 3. Store the Wi-Fi network in the board's flash (asks for the passphrase).
 scripts/pico-wifi.sh "My Network"
 
-# 4. Load the guest and the firmware over USB, and boot.
+# 3. Load the guest and the firmware over USB, and boot.
 #    -b rebuilds the guest first, -w adds swap.
 scripts/pico-shell.sh
 
-# 5. Connect. Log in as root, no password. Ctrl-A k quits screen.
+# 4. Connect. Log in as root, no password. Ctrl-A k quits screen.
 screen /dev/cu.usbmodemrvemu1 115200
-
-# Or run one command without a terminal (screen must be closed):
-../rp2350/tools/board-cmd.py 'free; ifconfig eth0'
-
-# 6. Done: let the next user have the board.
-../rp2350/tools/board-lock release $USER
 ```
 
 `pico-shell.sh` refuses to run while another program (`screen`, say) has
@@ -245,59 +234,11 @@ Never write 0x103FF000 with picotool or SWD: it holds the Wi-Fi
 passphrase. `pico-shell.sh` writes only the regions whose contents changed
 (`FORCE_BLOB=1` writes them all).
 
-## Sharing the board
-
-The board and the guest-build Docker volume are shared by several
-checkouts, so both are behind `rp2350/tools/board-lock`:
-
-```sh
-rp2350/tools/board-lock status                    # who holds what, who waits
-rp2350/tools/board-lock run NAME -- CMD...        # wait your turn, run, release
-rp2350/tools/board-lock acquire NAME [-l MIN] [-w MIN]   # hold across commands
-rp2350/tools/board-lock renew NAME; rp2350/tools/board-lock release NAME
-```
-
-- The board lock covers picotool, the console port and SWD. `pico-*.sh`,
-  `perf-gate.sh`, `run-riscv.sh` and `board-cmd.py` refuse to run unless
-  `BOARD_LOCK_OWNER` holds it (`board-lock run` sets it for its command).
-- A lease (20 min by default) that isn't renewed expires, and the next in
-  line gets the lock. `run` renews it while its command runs.
-- `guest/run-build.sh` takes the `guest-build` lock itself, and refuses to
-  start while you hold the board.
-- `rp2350/tools/board-cmd.py COMMAND` runs one command in the board's shell
-  and prints its output. `rp2350/tools/boot-wait.py` waits for `login:`.
-
-**Example:**
-
-```
-$ rp2350/tools/board-lock run docs -- bash -c '
-    cd rvemu-rs && scripts/pico-shell.sh &&
-    ../rp2350/tools/boot-wait.py "$(cat ~/.cache/rp2350-board/last-launch)" &&
-    ../rp2350/tools/board-cmd.py "uname -r; cat /proc/swaps"'
-...
-pico-shell.sh: Linux is booting; console: screen /dev/cu.usbmodemrvemu1 115200
-10.92
-6.12.116
-Filename				Type		Size		Used		Priority
-```
-
-## Performance gate
-
-`rvemu-rs/scripts/perf-gate.sh` boots the board, times a fixed workload,
-checks the memory left and checksums every file in the root filesystem.
-It fails if anything is slower, uses more memory or reads back wrong
-compared with `~/.cache/rp2350-board/perf-baseline.json`. It needs
-`guest/out` and `guest/out-disk` built.
-
-```sh
-rp2350/tools/board-lock run NAME -- rvemu-rs/scripts/perf-gate.sh -n "my change"
-```
-
 ## Layout
 
 | Path | What |
 |---|---|
 | `guest/` | the Linux guest: kernel config, root filesystem, the guest's own drivers and packages ([README](guest/README.md)) |
 | `rvemu-rs/` | the emulator and the board firmware, and the scripts that build, load and test them ([README](rvemu-rs/README.md)) |
-| `rp2350/` | board support and the host tools (`board-lock`, `board-cmd.py`, `boot-wait.py`) ([README](rp2350/README.md)) |
+| `rp2350/` | board support and host tools ([README](rp2350/README.md)) |
 | `rvemu/` | the C reference emulator ([README](rvemu/README.md)) |
