@@ -6,9 +6,9 @@ PSRAM and translated code is in SRAM.
 
 | Crate | |
 |---|---|
-| `rvcore/` | `no_std` core: hart state, interpreter, soft TLB and Sv32 walk, built-in SBI, 16550 UART, PLIC, the virtio-mmio devices (`virtio.rs`) and the NOR flash device (`nor.rs`). The `instrument` feature adds host-only statistics (unique-code bitmaps, an XIP cache model) and needs `alloc`. `ram-code` puts the hot paths in SRAM on the board. |
+| `rvcore/` | `no_std` core: hart state, interpreter, soft TLB and Sv32 walk, built-in SBI, 16550 UART, PLIC, the virtio-mmio devices (`virtio.rs`), the NOR flash device (`nor.rs`), the pin devices (`periph.rs`) and the flash swap backend (`swapdev.rs`). The `instrument` feature adds host-only statistics (unique-code bitmaps, an XIP cache model) and needs `alloc`. `ram-code` puts the hot paths in SRAM on the board. |
 | `rvjit/` | `no_std` block translator, RV32IMA guest code to RV32 host code |
-| `rvemu/` | Mac host: loads the guest, generates the device tree (needs `dtc`), terminal console, statistics, RP2350 timing model (`-M`), cache-policy simulator (`-S`) |
+| `rvemu/` | Mac host: loads the guest, generates the device tree (needs `dtc`), terminal console, statistics, RP2350 timing model (`-M`), cache-policy simulator (`-S`), and stand-ins for the board's flash (`norfile.rs`), swap flash and pins (`stubpins.rs`) |
 | `rvemu-virt/` | bare-metal build for `qemu-system-riscv32 -M virt`: interpreter, translator or lockstep |
 | `rvemu-pico/` | the board firmwares (below) |
 | `jittest-guest/` | bare-metal S-mode test guest for the translator (separate workspace) |
@@ -18,6 +18,10 @@ skipped idle time, so a run is repeatable instruction for instruction. That
 is what lockstep testing and the board-against-Mac comparisons rely on.
 
 ## Mac host
+
+The Mac host runs the interpreter (rvjit emits RV32 code, so the
+translator runs only on the board and under QEMU, below). It boots the disk
+guest to `login:` in under a second.
 
     cargo build --release
     ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs -m 8   # Ctrl-A x quits
@@ -29,10 +33,11 @@ is what lockstep testing and the board-against-Mac comparisons rely on.
 | `-i FILE` | initramfs (cpio) |
 | `-d FILE` | disk image for the read-only virtio-blk device. Without `-i`, the default command line roots on it: `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`. |
 | `-F FILE` | the NOR flash device (the board's 1 MB `/home` region), backed by FILE, which is created blank (0xFF) if missing and written through, so `/home` persists across runs. `RVEMU_NOR_CUT=N` simulates a power cut: the N-th program or erase is applied halfway and the emulator exits. |
-| `-W` | the swap device (below) on a modelled copy of the board's 2 MB swap flash, with datasheet-typical erase and program times in its statistics |
+| `-W` | the swap device (below) on a modelled copy of the board's swap flash (511 sectors), with datasheet-typical erase and program times in its statistics. The guest's init enables it as `/dev/vdb`. |
 | `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N. `RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc` picks which of them go in the device tree. |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
-| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board |
+| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `_etext - _start` from `System.map`, rounded down to a page (3063808 for today's disk kernel). |
+| `-b FILE` | use this DTB instead of generating one |
 | `-m MB` | guest RAM (default 64) |
 | `-a ARGS` | kernel command line (default `earlycon console=ttyS0`) |
 | `-u STRING` / `-n COUNT` | stop when the console prints STRING, or after COUNT instructions |
@@ -40,6 +45,89 @@ is what lockstep testing and the board-against-Mac comparisons rely on.
 | `-M` | RP2350 timing model |
 | `-D` | print the generated device tree and exit (the board scripts use this) |
 | `-S FILE -J OUT [-C CORPUS]` | cache-policy simulator (below) |
+
+### The board's devices on the Mac
+
+`-F`, `-W` and `-G` stand in for the board's flash, swap and pins, so the
+guest side of those features can be tried and tested without the board.
+These were run with the integrate/all guests (`-X 3063808` is the disk
+kernel's text, `-X 3182592` the `PINS=1` kernel's). The guest's own
+examples, on the board, are in the top-level README.
+
+Boot cost, batch to `login:` (77.3 M guest instructions with the static
+BusyBox; 109.5 M before it):
+
+```
+$ ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs \
+    -m 8 -X 3063808 -N -B -u login: >/dev/null
+...
+guest instructions 77291960
+```
+
+`/home` across a power cut (`-F`, `RVEMU_NOR_CUT`): write a file, then cut
+the power during a burst of writes, then check.
+
+```
+$ R="./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs -m 8 -F /tmp/home.img"
+$ $R          # head -c 50000 /dev/urandom > /home/keep; md5sum /home/keep > /home/keep.md5; sync
+$ RVEMU_NOR_CUT=300 $R
+# for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do head -c 8000 /dev/urandom > /home/f$i; done
+[rvemu] RVEMU_NOR_CUT: power cut at flash operation 300
+$ $R
+# dmesg | grep jffs2
+[    0.268287] jffs2: version 2.2. © 2001-2006 Red Hat, Inc.
+[    1.757180] jffs2: jffs2_scan_inode_node(): CRC failed on node at 0x000e0f44: Read 0xffffffff, calculated 0xd3998a4c
+# ls /home; md5sum -c /home/keep.md5
+f1        f2        f4        f6        f8        keep      root
+f10       f3        f5        f7        f9        keep.md5
+/home/keep: OK
+```
+
+The half-written node fails its CRC and is skipped; everything written
+before it is there, and new writes work.
+
+Swap (`-W`): the guest's init finds the device by its serial and enables it.
+
+```
+$ ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs -m 8 -X 3063808 -W
+# cat /proc/swaps
+Filename				Type		Size		Used		Priority
+/dev/vdb                                partition	1788		0		-2
+# flashswap-stats | grep -E "erase_us_max|program_us_max"
+erase_us_max 45000
+program_us_max 700
+```
+
+Pins (`-G`, the `PINS=1` guest, GP14 jumpered to GP15):
+
+```
+$ RVEMU_JUMPERS=14-15 ./target/release/rvemu -k ../guest/out-pins/Image \
+    -d ../guest/out-pins/rootfs.squashfs -m 8 -X 3182592 -N -G
+# gpioset -c gpiochip0 -t0 GP15=1; gpioget -c gpiochip0 GP14
+"GP14"=active
+# i2cset -y 0 0x50 0x10 0xab; i2cget -y 0 0x50 0x10
+0xab
+# cd /usr/share/examples/pins; ./gpio-edge 20 4 | tail -1; ./spi-xfer 12 34 56
+4 of 4 edges
+tx: 12 34 56
+rx: 12 34 56
+# micropython -c "from machine import I2C; i=I2C(0); print([hex(a) for a in i.scan()]); i.writeto_mem(0x50, 0x20, b'abc'); print(i.readfrom_mem(0x50, 0x20, 3))"
+['0x50']
+b'abc'
+```
+
+An input jumpered to a line that is still an output reads that output,
+even after the program that drove it exits (the line keeps its
+direction): `gpio-edge 14` then sees no edges. Use a free line.
+
+tcc's memory check (no swap, `/tmp` holding 3.4 MB):
+
+```
+# grep MemAvailable /proc/meminfo
+MemAvailable:        820 kB
+# cc -o big big.c          # 3,000 one-line functions
+tcc: memory full (508 kB left for the system)
+```
 
 `scripts/compare.sh [Image] [initrd]` boots the C reference (`../rvemu`) and
 this emulator on the same guest, and requires identical console output and
@@ -179,13 +267,26 @@ counters.
 - `-c` uses `-icount` for exact host-instruction counts.
 - `-I` takes keyboard input.
 - `RVEMU_CODE_KB`, `RVEMU_NJC`, `RVEMU_REGIONS` and `RVEMU_NBUCKETS` at
-  build time size the tables. `384`, `1024`, `8` and `1024` match
-  rvemu-pico.
+  build time size the tables (the default buckets: 16384). For board-like
+  numbers use `RVEMU_CODE_KB=326 RVEMU_NJC=1024 RVEMU_REGIONS=8
+  RVEMU_NBUCKETS=1024` with `-c`.
 
 With the disk guest, lockstep matches through boot to `login:` (2,517,290
 events). With rvemu-pico's table sizes, that boot takes 20.9 host
 instructions per guest instruction under `-icount`, and translation is 7.8 of
-them.
+them. (Both measured before the speed work; `RVEMU_CODE_KB=384` is
+feat/speed's cache, the board now has 326.)
+
+tcc's self-host stress test runs here too:
+`../guest/br-external/package/tcc/test/emu-selfhost.sh` boots the disk
+guest under QEMU with the translator and `-m 11` (about the board's
+MemTotal) and runs tcc's tests plus a stress case: tcc builds itself from
+its sources one file at a time, then builds itself again with the result,
+and the two binaries must be identical. With the sources and objects in
+`/tmp` taking about 2 MB of RAM, the first build stops at "memory full"
+after about 80 s, and the guest stays responsive while it runs (the
+longest 10 s monitor step was 15.9 s, against 198 s without tcc's memory
+check).
 
 ## On the RP2350 (`rvemu-pico/`)
 
@@ -201,32 +302,40 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 ### rvemu-pico-shell
 
 - **Two cores.** core0 runs only the guest. core1 does all the I/O: the
-  USB console and the Wi-Fi radio (below).
+  USB console and the Wi-Fi radio ([core1](#core1-rvemu-picosrccore1rs)).
+  `main` only runs the guest: a non-inlined `setup()` builds the devices
+  in place in statics (`BUS`, `JIT`), so their construction doesn't sit
+  on core0's stack.
 - **Memory.** Guest RAM is the 8 MB PSRAM, preceded by the kernel text in
   flash (`guest_blob.rs`; flash map in the top-level README). The translator
-  has a `CODE_KIB` code cache in SRAM (330 KiB; core1 takes the rest), in a
-  ring of 8 regions. It
-  has no PSRAM backing store, because that traffic would share the 16 KB XIP
+  has a `CODE_KIB` code cache in SRAM (326 KiB; core1's code, slot, stack
+  and rings take most of the rest), in a ring of 8 regions. It has no PSRAM
+  backing store, because that traffic would share the 16 KB XIP
   cache with guest RAM.
-- **Console** (`usbcon.rs`). Output waits in a 16 KB ring while no terminal
+- **Console** (`usbcon.rs`, on core1). Output waits in a 16 KB ring while no terminal
   is open, keeping the newest bytes, so a late `screen` shows the end of the
   boot log. With a terminal open nothing is lost: when the ring is full the
   guest waits for the terminal. Input goes into a 256-byte ring, and USB is
   read only while it has room.
 - **Idle.** While the guest idles in WFI, core0 waits in real time until the
   next timer deadline (at most 100 ms per wait), then skips guest time ahead.
-  Console input or a received frame ends the wait at once.
+  Console input or a received frame (core1's event word) or a pin edge ends
+  the wait at once. With swap on, an idle wait first erases one dirty swap
+  sector if the guest won't wake within 2 ms.
 - **BOOTSEL.** Opening the port at 1200 baud and closing it reboots into
   BOOTSEL. So does the SWD request in `rp2350-board::bootsel_if_requested`.
 - **Disk.** The squashfs is read through flash's uncached, non-allocating
   XIP alias, so disk reads don't evict guest RAM from the XIP cache.
 - **Entropy.** The DTB's `rng-seed` is overwritten with 32 bytes from the
-  TRNG before the guest starts.
+  TRNG before the guest starts (health-checked, von Neumann debiased; RTT
+  says so). The patch looks for the fixed `DTB_RNG_SEED` bytes, so a DTB
+  made without `rvemu -D` keeps whatever seed it had.
 
 ### Flash writes (`rvemu-pico/src/flash.rs`)
 
 The one module that erases or programs flash at run time: the `/home`
-device uses it, and so does swap.
+device (`BoardNor` in `shell.rs`) uses it, and so does swap
+(`swap_flash.rs`).
 - **Regions.** Only `STORAGE` (0x10100000-0x101FFFFF) and `SWAP`
   (0x10200000-0x103FEFFF) are writable. Anything else is refused: the
   firmware, the Wi-Fi sector, the blob, the squashfs and the kernel text.
@@ -235,7 +344,7 @@ device uses it, and so does swap.
   region, from anywhere, PSRAM included; copied a page at a time into SRAM),
   `read` and `is_erased` through the uncached alias, and `stats`.
 - **Stopping XIP.** Each sector erase or page program is one critical
-  section: interrupts masked, core 1 parked (`park_core1`), then an SRAM
+  section: interrupts masked, core 1 parked (`core1::park()`), then an SRAM
   function saves the QMI window settings (the 348 MHz flash timing and the
   PSRAM's QPI setup), the QSPI pads and XIP_CTRL, calls the bootrom's
   `connect_internal_flash`, `flash_exit_xip` and erase or program, and
@@ -250,9 +359,9 @@ device uses it, and so does swap.
 
 ### Flash swap (`rvcore/src/swapdev.rs`, `rvemu-pico/src/swap_flash.rs`)
 
-With `pico-shell.sh -w` the guest gets `/dev/vdb`, 1792 KiB of swap in the
-flash region 0x10200000-0x103FEFFF, and its init (`/etc/init.d/S02swap`)
-runs mkswap and swapon. Without `-w` the DTB has no node: the guest pays
+With `pico-shell.sh -w` the guest gets `/dev/vdb` (`/dev/vda` with `-i`,
+which has no root disk) in the flash region 0x10200000-0x103FEFFF, and its
+init (`/etc/init.d/S02swap`) runs mkswap and swapon: 1788 KiB of swap. Without `-w` the DTB has no node: the guest pays
 nothing, and the firmware never erases or writes the region. With it the
 guest gives up 4 KiB of RAM plus the device's own kernel cost.
 
@@ -275,15 +384,16 @@ guest gives up 4 KiB of RAM plus the device's own kernel cost.
   them (about 0.1 ms).
 - **Zero pages** take no flash. Data is stored inverted, so zero runs are
   erased flash and their 256-byte program operations are skipped.
-- **Flash access.** Erase (20h) and page program (02h) go through the QMI's
-  direct mode from SRAM, polling the status register until done. Reads use
-  the uncached XIP alias, so no cache maintenance is needed. Everything
-  stalls during an erase or program: the firmware and the kernel text run
-  from flash, and guest RAM is PSRAM on the same QMI.
+- **Flash access.** Erases and page programs go through `flash.rs`
+  (above), which parks core1 and invalidates only the lines it changed.
+  Reads use the uncached XIP alias, so no cache maintenance is needed.
+  Everything stalls during an erase or program: the firmware and the kernel
+  text run from flash, and guest RAM is PSRAM on the same QMI.
 - **Statistics.** The device's last page reads back as text: counters,
   erase/program/request times. `flashswap-stats` in the guest prints it.
 
-Measured on the board (W25Q128, 348 MHz):
+Measured on the board (W25Q128, 348 MHz; *feat/swap*, when it still had
+its own QMI routine):
 
 | | |
 |---|---|
@@ -376,8 +486,16 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   every call or address from there into flash, and fails on any that isn't
   a cold path (panics, RTT formatting, BOOTSEL, the radio firmware upload).
 - **Flash writes.** Erasing or programming flash stalls XIP.
-  `core1::park()` holds core1 in an SRAM loop until `core1::unpark()`; the
-  pair fits `flash::Parker`.
+  `core1::park()` holds core1 in an SRAM loop until `core1::unpark()`;
+  `flash.rs` calls the pair around every erase and program.
+- **Checking it.** After any change to what core1 calls:
+
+  ```
+  $ cargo build --release -p rvemu-pico --target riscv32imac-unknown-none-elf
+  $ scripts/check-core1.py target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell
+  ...
+  check-core1: 274 flash targets, 0 not known to be cold
+  ```
 - **Memory.** core1's code is about 55 KB in `.core1_text`. Its service
   slot is 7 KiB, its stack 5 KiB, the console rings 16 KiB, and the frame
   rings 6 KiB in SRAM8/9.
@@ -427,11 +545,14 @@ Mac for the reference, and compares every board run.
 | `scripts/virt.sh` | the bare-metal build under QEMU |
 | `scripts/compare.sh` | C reference against Rust |
 | `scripts/sim.py` | board time for cache policies simulated by `rvemu -S` |
-| `scripts/check-core1.py [ELF]` | references from core1's SRAM code into XIP flash (fails on any outside cold paths) |
+| `scripts/check-core1.py [ELF]` | references from core1's SRAM code into XIP flash (fails on any outside cold paths); run it after any change to what core1 calls |
+| `scripts/perf-gate.sh [-n LABEL] [-B] [-s]` | the on-device performance and stability gate (top-level README) |
 | `scripts/pico-common.sh` | shared by the `pico-*` scripts: BOOTSEL, `load_at` with change stamps, `pack_guest`, the flash addresses |
 
 `../rp2350/tools/board-cmd.py COMMAND` runs a command in the board's shell
-over the USB console and prints its output.
+over the USB console and prints its output, and `../rp2350/tools/boot-wait.py`
+waits for `login:`. Every board script needs the board lock
+(`../rp2350/tools/board-lock`, top-level README).
 
 Notes:
 - picotool needs `-t bin` for files with unknown extensions, and `-t elf`
