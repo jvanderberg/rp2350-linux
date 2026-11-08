@@ -496,9 +496,12 @@ The hosted convenience `rvaccel::run` still allocates scratch on its caller's
 stack; small-stack firmware must use the workspace entry point.
 
 The RV32 trampoline preserves the original stack and ABI, then calls the
-engine on the workspace stack. KEM scratch and the entire execution stack
-are erased before returning. Every call records its stack watermark and
-checks a 256-byte low-water guard. That guard detects budget violations;
+engine on the workspace stack. Between calls the execution stack holds a
+paint pattern; after each call the first word that differs from it is the
+call's exact high-water mark, and the stack is repainted from there up, which
+erases everything the call left on it. KEM scratch is erased by the KEM
+operations. Every call records its stack watermark and checks a 256-byte
+low-water guard. That guard detects budget violations;
 it is not a hardware barrier and does not prevent an overflow. The regression
 suite requires every tested operation to stay below 20 KiB, leaving at least
 4 KiB of the 24 KiB allocation unused.
@@ -540,11 +543,45 @@ cargo build --release -p rvemu-pico --bin rvemu-pico-shell \
 python3 scripts/native-crypto-eval.py
 ```
 
-`scripts/pico-shell.sh -C` is the explicit deployment option; it enables the
-feature and limits the existing whole-MiB guest packer to 7 MiB. It does not
-install the experimental kernel adapters automatically. The board firmware
-links successfully, with 10,048 bytes remaining for core0's ordinary stack.
-No board was flashed or timed. Actual PSRAM/cache performance, interrupts and
-hardware stack behavior still need an on-device run; QEMU instruction counts
-are not RP2350 cycle measurements. The latest connection and 1 MiB bidirectional
-SSH integration regressions pass with the guarded workspace enabled.
+`scripts/pico-shell.sh -C` enables the feature on the board and limits the
+guest to 7 MiB. It loads whatever guest it is given; the kernel adapters and
+Dropbear are in the board crypto guest below.
+
+### On the board
+
+`tests/build-board-crypto.sh` builds the board crypto guest into
+`guest/out-crypto`: the disk guest's kernel with `rvemu-crypto`, `rvemu-ssh`
+and `rvemu-bench`, and the disk guest's squashfs plus Dropbear and the test
+tools (`crypto-vectors`, `crypto-ioctl-test`, `ssh-ioctl-test`,
+`ssh-board-test`, `rvemu-bench-report`). It needs the disk guest's build
+(`./run-build.sh disk`). From the repository root:
+
+```sh
+mkdir -p guest/out-crypto
+curl -fsSL -o guest/out-crypto/dropbear.tar.bz2 \
+  https://matt.ucc.asn.au/dropbear/releases/dropbear-2026.94.tar.bz2
+python3 rvemu-rs/scripts/board-crypto-vectors.py guest/out-crypto/crypto-vectors.bin
+docker volume create rvemu-board-crypto-work
+docker run --rm --user 0 -v rvemu-guest-work:/work:ro -v rvemu-board-crypto-work:/eval \
+  -v "$PWD:/repo:ro" -v "$PWD/guest/out-crypto:/out" rvemu-guest \
+  bash /repo/guest/tests/build-board-crypto.sh
+```
+
+`rvemu-rs/scripts/pico-crypto-test.py` loads it with
+`pico-shell.sh -C -d ../guest/out-crypto`, logs in on the USB console and
+runs the tests on the board. Close any terminal on the console port first.
+Results and the console transcript go to `rvemu-rs/target/pico-crypto/`.
+
+| Command | Runs on the board |
+|---|---|
+| `pico-crypto-test.py vectors` | the ABI tests, every vector three times on one descriptor, and each operation's cycle cost |
+| `pico-crypto-test.py ssh` | `ssh-board-test integration` with both endpoints native, both software, and each one alone |
+| `pico-crypto-test.py connection -n 3` | one SSH connection per fresh boot, alternately native and software, timed from connect to authentication |
+| `pico-crypto-test.py responsive` | ping over Wi-Fi and console round trips while native operations run in a loop |
+| `pico-crypto-test.py remote` | the Mac's OpenSSH logging in to Dropbear on the board over Wi-Fi, native and software |
+
+`ssh-board-test` keeps its keys and authorized_keys in `/run` and writes
+nothing to flash. On the board, `rvemu-bench-report` prints the benchmark
+points (core0 cycles, instructions, XIP cache counters), the native call
+counts, the native stack peaks, whether the native stack is erased, and
+both cores' stack depth on the console.

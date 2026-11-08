@@ -36,3 +36,5 @@ pub const DTB_RNG_SEED: [u8; 32] = *b"rvemu: fixed DTB rng-seed bytes!";
 
 #[cfg(feature = "pv-buffers")]
 pub use rvaccel::Workspace as NativeWorkspace;
+#[cfg(feature = "pv-buffers")]
+pub use rvaccel::STACK_BYTES as NATIVE_STACK_BYTES;

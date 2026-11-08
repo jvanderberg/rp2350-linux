@@ -23,18 +23,10 @@ impl core::fmt::Display for Point {
     }
 }
 
+#[derive(Default)]
 pub struct Log {
     points: [Point; 32],
     len: usize,
-}
-
-impl Default for Log {
-    fn default() -> Self {
-        Self {
-            points: [Point::default(); 32],
-            len: 0,
-        }
-    }
 }
 
 impl Log {
@@ -52,6 +44,9 @@ impl Log {
         };
         self.len += 1;
         true
+    }
+    pub fn clear(&mut self) {
+        self.len = 0;
     }
     pub fn points(&self) -> &[Point] {
         &self.points[..self.len]

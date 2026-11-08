@@ -14,4 +14,7 @@ struct rvemu_ssh_request {
 };
 #define RVEMU_SSH_CRYPT _IOW('R', 0x40, struct rvemu_ssh_request)
 #define RVEMU_BENCH_POINT _IOW('R', 0x41, __u32)
+/* Firmware prints its recorded points and diagnostics on the console and
+ * clears them; returns the number of points printed. */
+#define RVEMU_BENCH_REPORT _IO('R', 0x43)
 #endif

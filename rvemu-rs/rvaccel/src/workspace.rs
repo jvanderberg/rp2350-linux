@@ -1,7 +1,5 @@
 //! Caller-owned native execution memory. No guest pointers or global lock.
 use crate::{OP_COUNT, run_inner};
-#[cfg(target_arch = "riscv32")]
-use zeroize::Zeroize;
 
 // Kept separate from the emulator's small control stack. Sized by RV32 tests.
 pub const STACK_BYTES: usize = 24 * 1024;
@@ -15,9 +13,18 @@ const PAINT: u32 = 0x51ac51ac;
 /// uses its own 24 KiB stack; a low-water guard detects budget regressions.
 /// The guard is diagnostic, not hardware memory protection. No unwinding
 /// across the assembly stack switch is supported (firmware uses panic=abort).
+///
+/// Between calls the whole stack holds the paint pattern. After a call the
+/// first word that differs from it, counted from the bottom, is the call's
+/// exact high-water mark; repainting from there to the top erases what the
+/// call left on the stack. The cost is a read of the untouched part and a
+/// write of the used part, not three passes over all 24 KiB (on the board the
+/// workspace is in PSRAM, behind the 16 KB XIP cache).
 pub struct Workspace {
     stack: [u32; STACK_BYTES / 4],
     peaks: [usize; OP_COUNT],
+    /// The stack is painted (false after `new`/`init_at`: zeroed).
+    painted: bool,
     kem: sntrup761::Workspace,
 }
 impl Workspace {
@@ -25,6 +32,7 @@ impl Workspace {
         Self {
             stack: [0; STACK_BYTES / 4],
             peaks: [0; OP_COUNT],
+            painted: false,
             kem: sntrup761::Workspace::new(),
         }
     }
@@ -33,8 +41,8 @@ impl Workspace {
     /// `place` must be aligned, writable for Self, exclusively owned for the returned
     /// lifetime, and disjoint from guest RAM and all live stacks.
     pub unsafe fn init_at<'a>(place: *mut Self) -> &'a mut Self {
-        // All fields, including vendored KEM scratch, are integer arrays.
-        // Zero is valid for the entire representation.
+        // All fields, including vendored KEM scratch, are integer arrays or
+        // a bool. Zero is valid for the entire representation.
         unsafe {
             core::ptr::write_bytes(place, 0, 1);
             &mut *place
@@ -42,6 +50,17 @@ impl Workspace {
     }
     pub fn stack_peaks(&self) -> &[usize; OP_COUNT] {
         &self.peaks
+    }
+    /// Between calls: whether the execution stack holds nothing an operation
+    /// left there (all paint, or all zero before the first call).
+    pub fn stack_erased(&self) -> bool {
+        #[cfg(target_arch = "riscv32")]
+        {
+            let fill = if self.painted { PAINT } else { 0 };
+            self.stack.iter().all(|&w| w == fill)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        true
     }
     pub fn run(
         &mut self,
@@ -55,7 +74,10 @@ impl Workspace {
         }
         #[cfg(target_arch = "riscv32")]
         {
-            self.stack.fill(PAINT);
+            if !self.painted {
+                paint(&mut self.stack);
+                self.painted = true;
+            }
             let mut call = Call {
                 fid,
                 src,
@@ -79,8 +101,9 @@ impl Workspace {
                 "native buffer stack guard exhausted"
             );
             self.peaks[fid as usize] = self.peaks[fid as usize].max(STACK_BYTES - 4 * untouched);
-            // Also erase library temporaries outside the explicit arithmetic workspace.
-            self.stack.zeroize();
+            // Erase library temporaries outside the explicit arithmetic
+            // workspace: every word below `untouched` still holds the paint.
+            paint(&mut self.stack[untouched..]);
             call.result
         }
         #[cfg(not(target_arch = "riscv32"))]
@@ -91,6 +114,17 @@ impl Default for Workspace {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Overwrite `words` with the paint pattern; volatile, so the erasure of
+/// dead stack contents is never optimized away.
+#[cfg(target_arch = "riscv32")]
+fn paint(words: &mut [u32]) {
+    for w in words.iter_mut() {
+        // SAFETY: a valid, exclusively borrowed word.
+        unsafe { core::ptr::write_volatile(w, PAINT) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(target_arch = "riscv32")]

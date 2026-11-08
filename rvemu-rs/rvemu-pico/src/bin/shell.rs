@@ -79,6 +79,12 @@ const NATIVE_BYTES: usize = 0;
 const NATIVE_BASE: usize = board::PSRAM_CACHED + (8 << 20) - NATIVE_BYTES;
 #[cfg(feature = "pv-buffers")]
 const _: () = assert!(core::mem::size_of::<rvcore::NativeWorkspace>() <= NATIVE_BYTES);
+/// The benchmark log (`Bench`) sits in the same reservation, after the
+/// workspace.
+#[cfg(feature = "pv-buffers")]
+const BENCH_BASE: usize = (NATIVE_BASE + core::mem::size_of::<rvcore::NativeWorkspace>()).next_multiple_of(16);
+#[cfg(feature = "pv-buffers")]
+const _: () = assert!(BENCH_BASE + core::mem::size_of::<Bench>() <= NATIVE_BASE + NATIVE_BYTES);
 const RAM_MAX: u32 = (8 << 20) - (STORE_WORDS * 4 + NATIVE_BYTES) as u32;
 const STORE: usize = board::PSRAM_CACHED + RAM_MAX as usize;
 
@@ -316,6 +322,61 @@ struct PicoBus {
     sys_hz: u32,
     /// The last `core1::events()` acted on.
     seen: u32,
+    #[cfg(feature = "pv-buffers")]
+    bench: &'static mut Bench,
+}
+
+/// XIP cache counters (hits, accesses; 32 bits, any write clears both).
+#[cfg(feature = "pv-buffers")]
+const XIP_CTR_HIT: usize = 0x400c_800c;
+#[cfg(feature = "pv-buffers")]
+const XIP_CTR_ACC: usize = 0x400c_8010;
+
+/// The board's side of the guest's benchmark points (SBI 0x0a000002): each
+/// point's cycle and instruction counters and the XIP cache's, kept in the
+/// PSRAM reservation and printed on the console only when the guest asks
+/// (`benchmark_report`), outside any measured interval. XIP counts are
+/// accumulated into 64 bits at every `poll` (about every millisecond).
+#[cfg(feature = "pv-buffers")]
+struct Bench {
+    log: rvcore::benchmark::Log,
+    host: [[u64; 4]; 32],
+    xip_hit: u64,
+    xip_acc: u64,
+}
+
+#[cfg(feature = "pv-buffers")]
+impl Bench {
+    #[inline]
+    fn sample_xip(&mut self) {
+        // SAFETY: XIP counter registers; a write clears the one written (the
+        // few accesses between the reads and the writes are lost).
+        unsafe {
+            let hit = core::ptr::read_volatile(XIP_CTR_HIT as *const u32);
+            let acc = core::ptr::read_volatile(XIP_CTR_ACC as *const u32);
+            core::ptr::write_volatile(XIP_CTR_HIT as *mut u32, 0);
+            core::ptr::write_volatile(XIP_CTR_ACC as *mut u32, 0);
+            self.xip_hit += u64::from(hit);
+            self.xip_acc += u64::from(acc);
+        }
+    }
+}
+
+/// `core::fmt::Write` onto the guest console's output ring.
+#[cfg(feature = "pv-buffers")]
+struct ConWriter<'a>(&'a mut RingConsole);
+
+#[cfg(feature = "pv-buffers")]
+impl core::fmt::Write for ConWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for b in s.bytes() {
+            if b == b'\n' {
+                self.0.putc(b'\r');
+            }
+            self.0.putc(b);
+        }
+        Ok(())
+    }
 }
 
 impl PicoBus {
@@ -331,10 +392,68 @@ impl PicoBus {
         }
         // GPIO edges (only lines the guest armed; one register read otherwise)
         self.plat.poll_pins();
+        #[cfg(feature = "pv-buffers")]
+        self.bench.sample_xip();
     }
 }
 
 impl Bus for PicoBus {
+    #[cfg(feature = "pv-buffers")]
+    fn benchmark_supported(&self) -> bool {
+        true
+    }
+    /// `host` is core0's cycle count, `ns` the same in nanoseconds.
+    #[cfg(feature = "pv-buffers")]
+    #[inline(never)]
+    fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
+        let cycles = board::mcycle64();
+        let instret = board::minstret64();
+        self.bench.sample_xip();
+        let n = self.bench.log.points().len();
+        let ns = u64::try_from(u128::from(cycles) * 1_000_000_000 / u128::from(self.sys_hz)).unwrap_or(u64::MAX);
+        if !self.bench.log.record(cpu, tag, cycles, ns) {
+            return false;
+        }
+        self.bench.host[n] = [cycles, instret, self.bench.xip_hit, self.bench.xip_acc];
+        true
+    }
+    /// The points so far, the native operations' stack peaks and both
+    /// cores' stack depth, on the console; then an empty log.
+    #[cfg(feature = "pv-buffers")]
+    #[inline(never)]
+    fn benchmark_report(&mut self, cpu: &Cpu) -> Option<u32> {
+        use core::fmt::Write as _;
+        let b = &mut *self.bench;
+        let n = b.log.points().len();
+        let mut w = ConWriter(&mut self.plat.con);
+        let _ = writeln!(w, "\nbenchmark board sys_hz={} points={}", self.sys_hz, n);
+        for (p, h) in b.log.points().iter().zip(b.host.iter()) {
+            let _ = writeln!(w, "{p}");
+            let _ = writeln!(
+                w,
+                "benchmark board tag={} cycles={} host_instret={} xip_hit={} xip_acc={}",
+                p.tag, h[0], h[1], h[2], h[3]
+            );
+        }
+        let _ = writeln!(w, "native buffer calls {:?}", cpu.stats.native_buffer_calls);
+        if let Some(peaks) = cpu.native_stack_peaks() {
+            let _ = writeln!(w, "native stack peaks {:?} of {} B", peaks, rvaccel_stack_bytes());
+        }
+        if let Some(erased) = cpu.native_stack_erased() {
+            let _ = writeln!(w, "native stack erased {erased}");
+        }
+        let (lo, hi) = core0_stack();
+        let _ = writeln!(
+            w,
+            "firmware stack use: core0 {} of {} B, core1 {} of {} B",
+            core1::painted_stack_used(lo, hi),
+            hi - lo,
+            core1::stack_used(),
+            core1::STACK_BYTES
+        );
+        b.log.clear();
+        Some(n as u32)
+    }
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
         self.plat.mmio_load(pa, size)
     }
@@ -641,7 +760,19 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     let gmem = GuestMem { ptr: h.ram_host() as *mut u8, base: 0, size: h.ram_size, ro: h.text_len };
     // SAFETY: written once, here, before anything borrows it.
     let bus = unsafe {
-        (*addr_of_mut!(BUS)).write(PicoBus { plat: Platform::new(con), sys_hz, seen: core1::events().wrapping_sub(1) })
+        (*addr_of_mut!(BUS)).write(PicoBus {
+            plat: Platform::new(con),
+            sys_hz,
+            seen: core1::events().wrapping_sub(1),
+            // PSRAM is up (psram_init above); the reservation is outside
+            // guest RAM (h.valid(RAM_MAX)) and used by nothing else.
+            #[cfg(feature = "pv-buffers")]
+            bench: {
+                let at = BENCH_BASE as *mut Bench;
+                core::ptr::write_bytes(at, 0, 1);
+                &mut *at
+            },
+        })
     };
     add_devices(bus, board_pins, disk, gmem, ms(RADIO_BRING_UP_MS));
 
@@ -733,3 +864,8 @@ pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 2] = [
     hal::binary_info::rp_cargo_bin_name!(),
     hal::binary_info::rp_program_description!(c"rvemu: interactive Linux, console on USB"),
 ];
+
+#[cfg(feature = "pv-buffers")]
+fn rvaccel_stack_bytes() -> usize {
+    rvcore::NATIVE_STACK_BYTES
+}

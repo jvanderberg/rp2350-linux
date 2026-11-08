@@ -11,6 +11,11 @@ impl Cpu {
     pub fn native_stack_peaks(&self) -> Option<&[usize; rvaccel::OP_COUNT]> {
         unsafe { self.native_workspace.as_ref().map(|w| w.stack_peaks()) }
     }
+    /// Whether the workspace's execution stack is erased (see
+    /// `rvaccel::Workspace::stack_erased`); `None` without a workspace.
+    pub fn native_stack_erased(&self) -> Option<bool> {
+        unsafe { self.native_workspace.as_ref().map(|w| w.stack_erased()) }
+    }
     pub(crate) fn native_buffers_supported(&self) -> bool {
         !self.native_workspace.is_null() || !cfg!(target_os = "none")
     }

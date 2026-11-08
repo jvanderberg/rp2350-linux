@@ -120,6 +120,11 @@ static long rvemu_bench_ioctl(struct file *file, unsigned int cmd, unsigned long
 {
     __u32 tag;
     struct sbiret r;
+    if (cmd == RVEMU_BENCH_REPORT) {
+        r = sbi_ecall(0x0a000002, 1, 0, 0, 0, 0, 0, 0);
+        if (r.error) return r.error == SBI_ERR_NOT_SUPPORTED ? -EOPNOTSUPP : -EIO;
+        return r.value;
+    }
     if (cmd != RVEMU_BENCH_POINT) return -ENOTTY;
     if (copy_from_user(&tag, (void __user *)arg, sizeof(tag))) return -EFAULT;
     if (tag > 3) return -EINVAL;

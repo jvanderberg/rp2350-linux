@@ -52,10 +52,19 @@ impl Cpu {
         let mut val = 0u32;
         match eid {
             crate::benchmark::EXT => {
-                if !bus.benchmark_supported() || fid != 0 {
+                if !bus.benchmark_supported() {
                     err = ERR_NOT_SUPPORTED;
-                } else if !bus.benchmark_record(self, a0) {
-                    err = ERR_INVALID_PARAM;
+                } else if fid == 0 {
+                    if !bus.benchmark_record(self, a0) {
+                        err = ERR_INVALID_PARAM;
+                    }
+                } else if fid == 1 {
+                    match bus.benchmark_report(self) {
+                        Some(n) => val = n,
+                        None => err = ERR_NOT_SUPPORTED,
+                    }
+                } else {
+                    err = ERR_NOT_SUPPORTED;
                 }
             }
             #[cfg(feature = "pv-buffers")]

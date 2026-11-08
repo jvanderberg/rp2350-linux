@@ -4,18 +4,19 @@
 #   screen /dev/cu.usbmodemrvemu1 115200        (Ctrl-A k to quit)
 # The board goes back to BOOTSEL on `stty -f PORT 1200`, which this script
 # also uses to replace a running shell.
-#   scripts/pico-shell.sh [-m RAM_MB] [-i] [-b] [-w] [-C]
+#   scripts/pico-shell.sh [-m RAM_MB] [-i] [-b] [-w] [-C] [-d DIR]
 # Default: guest/out-disk, root on a squashfs in flash (nano, tmux,
 # MicroPython, ...; guest/run-build.sh disk). -i: the small initramfs guest in
 # guest/out. -b: (re)build that guest in Docker first (guest/run-build.sh;
 # incremental once the first Buildroot build is done). -w: give the guest
 # the flash swap device in 0x10200000-0x103FEFFF (/dev/vdb, or /dev/vda with
-# -i; 1788 KiB of swap).
+# -i; 1788 KiB of swap). -d DIR: a disk guest other than guest/out-disk
+# (DIR has its Image, System.map, linux.config and rootfs.squashfs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/pico-common.sh
-M=8; INITRAMFS=0; BUILD=0; SWAP=0; CRYPTO=0
-while getopts "m:ibwC" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; w) SWAP=1;; C) CRYPTO=1;; *) exit 2;; esac; done
+M=8; INITRAMFS=0; BUILD=0; SWAP=0; CRYPTO=0; GUEST=../guest/out-disk
+while getopts "m:ibwCd:" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; w) SWAP=1;; C) CRYPTO=1;; d) GUEST=$OPTARG;; *) exit 2;; esac; done
 # -C enables the experimental native buffer engine and reserves the top 64 KiB
 # of PSRAM. The existing guest packer takes whole MiB, so use at most 7 MiB.
 FEATURES=()
@@ -29,7 +30,7 @@ fi
 if [ $INITRAMFS = 1 ]; then
   K=../guest/out/Image; I=../guest/out/rootfs.cpio
 else
-  K=../guest/out-disk/Image; I=-; DISK=../guest/out-disk/rootfs.squashfs
+  K=$GUEST/Image; I=-; DISK=$GUEST/rootfs.squashfs
   [ -f "$DISK" ] || { echo "pico-shell.sh: no $DISK (cd guest && ./run-build.sh disk), or use -i"; exit 1; }
 fi
 ELF=target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell

@@ -77,6 +77,9 @@ pub trait Bus {
     /// Optional host-only measurement service; independent of native crypto.
     fn benchmark_supported(&self) -> bool { false }
     fn benchmark_record(&mut self, _cpu: &Cpu, _tag: u32) -> bool { false }
+    /// Optional: print the recorded points and host diagnostics, then clear
+    /// the log. `None`: not provided (the SBI call fails NOT_SUPPORTED).
+    fn benchmark_report(&mut self, _cpu: &Cpu) -> Option<u32> { None }
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32>;
     fn mmio_store(&mut self, pa: u32, size: u32, val: u32) -> Result<(), u32>;
     /// Level of the PLIC's S-mode external interrupt output.

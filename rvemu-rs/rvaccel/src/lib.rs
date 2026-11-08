@@ -23,7 +23,7 @@ pub const OP_COUNT: usize = 13;
 mod asymmetric;
 mod ssh;
 mod workspace;
-pub use workspace::Workspace;
+pub use workspace::{STACK_BYTES, Workspace};
 
 /// Raw LZ4 blocks, or IETF ChaCha20-Poly1305 ciphertext with appended tag.
 /// IETF AEAD parameters are key[32] || nonce[12] || AAD[0..1024].

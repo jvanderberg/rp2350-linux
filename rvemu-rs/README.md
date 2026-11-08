@@ -863,5 +863,5 @@ uses 17,788 bytes. The Pico shell's optional `pv-buffers` feature reserves
 its roughly 10 KiB SRAM control stack for large temporaries. Build with
 `--features pv-buffers`; `scripts/pico-shell.sh -C` is the explicit flashing
 option (7 MiB guest limit). Bare-metal frontends without a workspace leave
-the ABI unavailable. See the [stack measurements and validation](../guest/README.md#native-memory-and-stack-budget).
-The board build passes; no on-device execution or timing is claimed.
+the ABI unavailable. See the [stack measurements and validation](../guest/README.md#native-memory-and-stack-budget)
+and the [board tests](../guest/README.md#on-the-board).

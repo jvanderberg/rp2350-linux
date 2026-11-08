@@ -29,6 +29,11 @@ impl Bus for BenchBus {
     fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
         self.log.record(cpu, tag, 123, 456)
     }
+    fn benchmark_report(&mut self, _: &Cpu) -> Option<u32> {
+        let n = self.log.points().len() as u32;
+        self.log.clear();
+        Some(n)
+    }
 }
 fn call(c: &mut Cpu, b: &mut BenchBus, eid: u32, fid: u32, arg: u32) -> (i32, u32) {
     c.pc = BASE;
@@ -48,7 +53,7 @@ fn benchmark_discovery_bounds_and_privilege() {
     assert_eq!(call(&mut c, &mut b, EXT, 0, 0).0, -2);
     b.enabled = true;
     assert_eq!(call(&mut c, &mut b, 0x10, 3, EXT), (0, 1));
-    assert_eq!(call(&mut c, &mut b, EXT, 1, 0).0, -2);
+    assert_eq!(call(&mut c, &mut b, EXT, 2, 0).0, -2);
     assert_eq!(call(&mut c, &mut b, EXT, 0, 4).0, -3);
     assert!(b.log.points().is_empty());
     c.stats.native_buffer_calls[4] = 7;
@@ -65,8 +70,12 @@ fn benchmark_discovery_bounds_and_privilege() {
     }
     assert_eq!(call(&mut c, &mut b, EXT, 0, 0).0, -3);
     assert_eq!(b.log.points().len(), 32);
+    // report hands back the count and empties the log for the next run
+    assert_eq!(call(&mut c, &mut b, EXT, 1, 0), (0, 32));
+    assert!(b.log.points().is_empty());
+    assert_eq!(call(&mut c, &mut b, EXT, 0, 0).0, 0);
     c.privilege = Priv::U;
     call(&mut c, &mut b, EXT, 0, 0);
     assert_eq!(c.scause, 8); // userspace ECALL traps to Linux, never the host service
-    assert_eq!(b.log.points().len(), 32);
+    assert_eq!(b.log.points().len(), 1);
 }
