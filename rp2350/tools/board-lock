@@ -77,8 +77,12 @@ try_acquire() {
   fi
   first=$( [ -f "$q" ] && head -1 "$q" | cut -d' ' -f1 || true)
   if [ -z "$h" ] && [ -n "$first" ] && [ "$first" != "$o" ]; then
-    # free, but someone queued before us: join the queue
-    grep -q "^$o " "$q" || echo "$o $t" >> "$q"
+    # free, but someone queued before us: join the queue, or keep our place
+    if grep -q "^$o " "$q"; then
+      awk -v o="$o" -v t="$t" '$1==o{$2=t} {print}' "$q" > "$q.tmp" && mv "$q.tmp" "$q"
+    else
+      echo "$o $t" >> "$q"
+    fi
     unmutex; return 1
   fi
   local since=$t
