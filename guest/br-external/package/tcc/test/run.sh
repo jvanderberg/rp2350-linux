@@ -51,23 +51,32 @@ cc -run hello.c > run.out 2>&1; cp hello.expect run.expect; check run
 rm -f a.out; cc hello.c && ./a.out > aout.out 2>&1; cp hello.expect aout.expect; check aout
 
 if [ "$1" = selfhost ]; then
-	cd tcc-src || exit 1
-	# build CC OUT: tcc from its sources one file at a time, as its
-	# Makefile does (as one unit, tcc needs ~3 MB more than the guest has)
+	# tcc's source comes as tcc-src.tgz; each file is unpacked only while it
+	# is compiled, and the first build's objects go once tcc2 is linked:
+	# /tmp is RAM, and the compiler needs 2-2.6 MB of its own
+	rm -f hello ll fp misc arith gpio lib a.out ./*.o libvec.a
+	mkdir -p tcc-src && cd tcc-src || exit 1
+	tar xzf ../tcc-src.tgz config.h tcc.h tcctok.h libtcc.h elf.h stab.h \
+		stab.def dwarf.h tcclib.h riscv64-tok.h
+	# build CC OUT: tcc one file at a time, as its Makefile does (as one
+	# unit, tcc needs about 3 MB more than the guest has)
 	build() {
 		b0=$(cut -d' ' -f1 /proc/uptime)
 		for u in tcc libtcc tccpp tccgen tccdbg tccelf tccasm tccrun \
 			riscv32-gen riscv64-link riscv64-asm; do
+			tar xzf ../tcc-src.tgz "$u.c" || return 1
+			if [ "$u" = tcc ]; then tar xzf ../tcc-src.tgz tcctools.c; fi
 			peak "$1-$u.c" "$1" -DONE_SOURCE=0 -c "$u.c" -o "$u.o" || return 1
+			rm -f "$u.c" tcctools.c
 		done
 		peak "$1-link" "$1" -o "$2" tcc.o libtcc.o tccpp.o tccgen.o tccdbg.o \
 			tccelf.o tccasm.o tccrun.o riscv32-gen.o riscv64-link.o \
 			riscv64-asm.o -lm -ldl -lpthread || return 1
+		rm -f ./*.o
 		b1=$(cut -d' ' -f1 /proc/uptime)
 		echo "time $1-builds-$2 $(echo "$b1 $b0" | awk '{printf "%.2f", $1 - $2}') s"
 	}
-	build cc tcc2
-	build ./tcc2 tcc3
+	build cc tcc2 && build ./tcc2 tcc3
 	ls -l tcc2 tcc3
 	if cmp tcc2 tcc3; then
 		pass=$((pass + 1)); echo "PASS selfhost (tcc2 and tcc3 identical)"
