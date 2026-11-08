@@ -105,6 +105,11 @@ pub struct JitRegs {
     pub tlb_cur: [usize; ACC_N],
     /// Translator's jump cache (owned by the translator; 0 if none).
     pub jc_base: usize,
+    /// Pending and enabled interrupts (`sip & sie`) at the last
+    /// `check_irq`, which the dispatcher calls before entering translated
+    /// code; they cannot change while it runs. Translated code that sets
+    /// sstatus.SIE exits to the dispatcher if any.
+    pub irq_pending: u32,
 }
 
 #[repr(C)]
@@ -215,7 +220,7 @@ impl Cpu {
         Cpu {
             x: [0; 32],
             pc: entry,
-            jit: JitRegs { budget: 0, exit_pc: 0, exit_info: 0, host_sp: 0, tlb_cur: [0; ACC_N], jc_base: 0 },
+            jit: JitRegs { budget: 0, exit_pc: 0, exit_info: 0, host_sp: 0, tlb_cur: [0; ACC_N], jc_base: 0, irq_pending: 0 },
             privilege: Priv::S,
             mmu_idx: MMU_S,
             sie_bit: false,
@@ -344,6 +349,8 @@ impl Cpu {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn check_irq<B: Bus>(&mut self, bus: &B) -> bool {
         let p = self.sip_value(bus) & self.sie;
+        // for translated code that sets SIE (rvjit)
+        self.jit.irq_pending = p;
         if p == 0 || (self.privilege == Priv::S && !self.sie_bit) {
             return false;
         }

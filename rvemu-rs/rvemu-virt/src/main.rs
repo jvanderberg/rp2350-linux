@@ -260,7 +260,11 @@ const CODE_KB: usize = match option_env!("RVEMU_CODE_KB") {
     None => 1024,
 };
 const CODE_WORDS: usize = CODE_KB * 256;
-const NBUCKETS: usize = 16 * 1024;
+/// Hash buckets: 16384, or RVEMU_NBUCKETS at build time (rvemu-pico uses 1024).
+const NBUCKETS: usize = match option_env!("RVEMU_NBUCKETS") {
+    Some(s) => parse_usize(s),
+    None => 16 * 1024,
+};
 
 const fn parse_usize(s: &str) -> usize {
     let b = s.as_bytes();

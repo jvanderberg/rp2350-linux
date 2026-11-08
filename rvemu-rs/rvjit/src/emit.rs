@@ -144,6 +144,22 @@ impl<'a> Asm<'a> {
         self.emit(r_type(0x33, rd, 4, rs1, rs2, 0));
     }
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn or(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 6, rs1, rs2, 0));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn and(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 7, rs1, rs2, 0));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn ori(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.emit(i_type(0x13, rd, 6, rs1, imm));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn xori(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.emit(i_type(0x13, rd, 4, rs1, imm));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn mul(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
         self.emit(r_type(0x33, rd, 0, rs1, rs2, 1));
     }

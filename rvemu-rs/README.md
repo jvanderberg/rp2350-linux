@@ -95,7 +95,13 @@ counters.
   back to its `jal budget_exit`, and the instruction by counting helper
   calls, so no per-access metadata is stored. AMOs use the host
   AMO on the translated address, or load/op/store when `Jit::native_amo` is
-  off. LR/SC, CSRs, ecall, sret and wfi go to the interpreter.
+  off. LR/SC, ecall, sret and wfi go to the interpreter.
+- **CSRs.** In S mode, every access to `sscratch`, `sepc`, `scause` and
+  `stval` is a load and store on `Cpu`. So are `csrr`, `csrs` and `csrc` of
+  `sstatus` when they change only SIE. A register-form operand with other
+  bits set exits like a memory miss. Setting SIE exits if an enabled
+  interrupt was already pending when the run began; the pending set can't
+  change during a run. Other CSRs go to the interpreter.
 - **Linking.** Blocks are keyed by (virtual pc, physical pc) and never cross a
   page. Same-page exits are chained by patching a `jal`. Other jumps use an
   inline jump cache, validated against the fetch TLB. On a jump-cache miss
@@ -124,10 +130,14 @@ counters.
 - `-D` boots the disk guest.
 - `-c` uses `-icount` for exact host-instruction counts.
 - `-I` takes keyboard input.
+- `RVEMU_CODE_KB`, `RVEMU_NJC`, `RVEMU_REGIONS` and `RVEMU_NBUCKETS` at
+  build time size the tables. `384`, `1024`, `8` and `1024` match
+  rvemu-pico.
 
 With the disk guest, lockstep matches through boot to `login:` (2,517,290
-events). Translation is about half of host time, at 31 host instructions per
-guest instruction under `-icount`.
+events). With rvemu-pico's table sizes, that boot takes 23.7 host
+instructions per guest instruction under `-icount`, and translation is 8.5 of
+them.
 
 ## On the RP2350 (`rvemu-pico/`)
 

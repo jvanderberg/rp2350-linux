@@ -56,7 +56,7 @@ pub mod emit;
 
 use core::mem::{MaybeUninit, offset_of};
 use emit::*;
-use rvcore::{ACC_R, ACC_W, ACC_X, Bus, Cpu, JitRegs, TlbEntry};
+use rvcore::{ACC_R, ACC_W, ACC_X, Bus, Cpu, JitRegs, Priv, TlbEntry};
 
 pub const S: Reg = 3;
 pub const K0: Reg = 4;
@@ -122,6 +122,24 @@ const OFF_EXIT_PC: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, exit_pc)) a
 const OFF_EXIT_INFO: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, exit_info)) as i32;
 const OFF_HOST_SP: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, host_sp)) as i32;
 const OFF_JC: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, jc_base)) as i32;
+const OFF_IRQ_PENDING: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, irq_pending)) as i32;
+const OFF_SIE_BIT: i32 = offset_of!(Cpu, sie_bit) as i32;
+/// sstatus as csr_read composes it: (field, bit)
+const SSTATUS_BITS: [(i32, u32); 5] = [
+    (offset_of!(Cpu, sie_bit) as i32, 1),
+    (offset_of!(Cpu, spie) as i32, 5),
+    (offset_of!(Cpu, spp) as i32, 8),
+    (offset_of!(Cpu, sum) as i32, 18),
+    (offset_of!(Cpu, mxr) as i32, 19),
+];
+const CSR_SSTATUS: u32 = 0x100;
+/// CSRs that are plain fields: (csr, field offset)
+const CSR_FIELDS: [(u32, i32); 4] = [
+    (0x140, offset_of!(Cpu, sscratch) as i32),
+    (0x141, offset_of!(Cpu, sepc) as i32),
+    (0x142, offset_of!(Cpu, scause) as i32),
+    (0x143, offset_of!(Cpu, stval) as i32),
+];
 const fn off_tlb_cur(acc: usize) -> i32 {
     (offset_of!(Cpu, jit) + offset_of!(JitRegs, tlb_cur) + acc * core::mem::size_of::<usize>()) as i32
 }
@@ -213,8 +231,24 @@ enum Kind {
     Nop,
     /// AMO*.W except LR/SC: done with the host AMO on the host address.
     Amo,
+    /// S-mode CSR access the translator does itself: sscratch, sepc, scause,
+    /// stval, and sstatus reads and SIE set/clear (`csr_sites`).
+    Csr,
     Interp,
 }
+
+/// Helper-call sites (`jal K3`) a Csr instruction emits: an sstatus set or
+/// clear with a register operand checks it holds only SIE, and leaves for
+/// the interpreter otherwise.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn csr_sites(insn: u32) -> usize {
+    let (f3, rs1) = ((insn >> 12) & 7, (insn >> 15) & 31);
+    usize::from(insn >> 20 == CSR_SSTATUS && f3 < 4 && rs1 != 0)
+}
+
+/// Translated host words, at most, for one instruction (an sstatus access;
+/// an AMO is 12).
+const MAX_WORDS: usize = 28;
 
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn imm_i(insn: u32) -> i32 {
@@ -249,7 +283,7 @@ fn imm_j(insn: u32) -> i32 {
 /// as strictly as the interpreter does, so anything copied verbatim is a
 /// valid RV32IM instruction with identical semantics on the host.
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-fn classify(insn: u32, pc: u32) -> Kind {
+fn classify(insn: u32, pc: u32, sup: bool) -> Kind {
     let f3 = (insn >> 12) & 7;
     let f7 = insn >> 25;
     match insn & 0x7F {
@@ -280,6 +314,23 @@ fn classify(insn: u32, pc: u32) -> Kind {
         0x2F if f3 == 2 && matches!(insn >> 27, 0x00 | 0x01 | 0x04 | 0x08 | 0x0C | 0x10 | 0x14 | 0x18 | 0x1C) => {
             Kind::Amo
         }
+        // (a page executable in S-mode never is in U-mode, so a block's
+        // privilege is the one it was translated in)
+        0x73 if sup && f3 & 3 != 0 => {
+            let csr = insn >> 20;
+            let rs1 = (insn >> 15) & 31;
+            if CSR_FIELDS.iter().any(|&(c, _)| c == csr) {
+                Kind::Csr
+            } else if csr == CSR_SSTATUS
+                && (f3 & 3 != 1)
+                && (f3 < 4 || rs1 & !2 == 0)
+            {
+                // csrr[s|c][i] sstatus: reads, and immediate SIE set/clear
+                Kind::Csr
+            } else {
+                Kind::Interp
+            }
+        }
         _ => Kind::Interp,
     }
 }
@@ -307,14 +358,126 @@ fn insn_at(host0: usize, k: usize) -> u32 {
 /// uninitialized otherwise: zero-filling it cost more than the scan).
 type Kinds = [MaybeUninit<Kind>; MAX_BLOCK];
 
+/// A translated S-mode CSR access (classify() picked which); `left` is the
+/// number of instructions after it in the block. Out of line, and `a` by
+/// value, so the translator loop keeps `a` in registers.
+#[inline(never)]
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn emit_csr<'a>(mut a: Asm<'a>, r: &Routines, insn: u32, pc: u32, left: usize) -> Asm<'a> {
+    let rd = (insn >> 7) & 31;
+    let rs1 = (insn >> 15) & 31;
+    let f3 = (insn >> 12) & 7;
+    macro_rules! call {
+        ($link:expr, $to:expr) => {{
+            let off = ($to as isize - a.pos() as isize) * 4;
+            a.emit(j_type($link, off as i32));
+        }};
+    }
+    let csr = insn >> 20;
+    let op = f3 & 3; // 1 rw, 2 rs, 3 rc
+    let imm = f3 & 4 != 0; // the rs1 field is the operand
+    let write = op == 1 || rs1 != 0;
+    let src = if imm || rs1 == 0 {
+        ZERO
+    } else if spilled(rs1) {
+        a.lw(K0, S, xoff(rs1));
+        K0
+    } else {
+        rs1
+    };
+    // the old value goes to K2, then rd
+    macro_rules! write_rd {
+        () => {
+            if spilled(rd) {
+                a.sw(K2, S, xoff(rd));
+            } else if rd != 0 {
+                a.addi(rd, K2, 0);
+            }
+        };
+    }
+    if csr == CSR_SSTATUS {
+        if rd != 0 {
+            for (i, &(off, bit)) in SSTATUS_BITS.iter().enumerate() {
+                let t = if i == 0 { K2 } else { K1 };
+                a.load(4, t, S, off); // lbu
+                a.slli(t, t, bit);
+                if i > 0 {
+                    a.or(K2, K2, K1);
+                }
+            }
+        }
+        let skip = if write && !imm {
+            // only SIE may change here; anything else is the
+            // interpreter's
+            a.andi(K1, src, -3);
+            a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+            call!(K3, r.mem_miss);
+            a.andi(K1, src, 2);
+            write_rd!();
+            Some(a.branch_fwd(0, K1, ZERO))
+        } else {
+            write_rd!();
+            None
+        };
+        if write {
+            if op == 2 {
+                a.addi(K1, ZERO, 1);
+                a.store(0, K1, S, OFF_SIE_BIT); // sb
+                // an interrupt pending since entry is now taken
+                a.lw(K1, S, OFF_IRQ_PENDING);
+                let refund = left as i32;
+                let past = 4 * (3 + i32::from(refund > 0));
+                a.emit(b_type(0, K1, ZERO, past)); // beq K1, zero
+                if refund > 0 {
+                    a.addi(KB, KB, refund);
+                }
+                call!(K1, r.jump_exit);
+                a.emit(pc.wrapping_add(4));
+            } else {
+                a.store(0, ZERO, S, OFF_SIE_BIT);
+            }
+        }
+        if let Some(j) = skip {
+            let here = a.pos();
+            a.fix(j, here);
+        }
+    } else {
+        let off = CSR_FIELDS.iter().find(|&&(c, _)| c == csr).map_or(0, |&(_, o)| o);
+        if !(op == 1 && rd == 0) {
+            a.lw(K2, S, off);
+        }
+        if write {
+            match (op, imm) {
+                (1, true) => a.addi(K1, ZERO, rs1 as i32),
+                (1, false) => a.addi(K1, src, 0),
+                (2, true) => a.ori(K1, K2, rs1 as i32),
+                (2, false) => a.or(K1, K2, src),
+                (_, true) => a.andi(K1, K2, !(rs1 as i32)),
+                (_, false) => {
+                    a.xori(K1, src, -1);
+                    a.and(K1, K1, K2);
+                }
+            }
+            if csr == 0x141 {
+                a.andi(K1, K1, -4); // sepc
+            }
+            a.sw(K1, S, off);
+        }
+        write_rd!();
+    }
+    a
+}
+
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn scan(cpu: &Cpu, pc0: u32, pa0: u32, kinds: &mut Kinds) -> Scan {
     let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
     // instructions left in the page
     let max = (((0x1000 - (pc0 & 0xFFF)) >> 2) as usize).min(MAX_BLOCK);
+    let sup = cpu.privilege == Priv::S;
+    // header, prologue and the closing jump
     let mut s = Scan { host0, n: 0, last: Kind::Interp, end_interp: false };
     while s.n < max {
-        let k = classify(insn_at(host0, s.n), pc0.wrapping_add(4 * s.n as u32));
+        let k = classify(insn_at(host0, s.n), pc0.wrapping_add(4 * s.n as u32), sup);
         if k == Kind::Interp {
             s.end_interp = true;
             break;
@@ -471,6 +634,8 @@ struct Routines {
     ijmp_imm: usize,
     /// `jal K1, interp_exit; .word pc`
     interp_exit: usize,
+    /// `jal K1, jump_exit; .word pc` - leave for the dispatcher at pc
+    jump_exit: usize,
     /// from the block prologue: `jal K1, budget_exit` (K1 = entry)
     budget_exit: usize,
     /// `jal K3, mem_miss` - interpret the instruction of that call site
@@ -601,6 +766,12 @@ impl<'m> Jit<'m> {
         r.interp_exit = a.pos();
         a.lw(K0, K1, 0);
         a.addi(K1, ZERO, EXIT_INTERP as i32);
+        jump!(r.exit);
+
+        // back to the dispatcher at the pc in the word at K1
+        r.jump_exit = a.pos();
+        a.lw(K0, K1, 0);
+        a.addi(K1, ZERO, EXIT_JUMP as i32);
         jump!(r.exit);
 
         // budget exhausted: K1 = entry, which is `addi KB, KB, -n`; undo it.
@@ -1057,7 +1228,7 @@ impl<'m> Jit<'m> {
             let rd = (w >> 7) & 31;
             self.code[at + i - 1] = j_type(rd, ((tgt - (at + i - 1) as isize) * 4) as i32);
             let t = tgt as usize;
-            if rd == K1 && (t == r.chain_req || t == r.ijmp_imm || t == r.interp_exit) {
+            if rd == K1 && (t == r.chain_req || t == r.ijmp_imm || t == r.interp_exit || t == r.jump_exit) {
                 i += 1;
             }
         }
@@ -1083,13 +1254,13 @@ impl<'m> Jit<'m> {
         }
         // room for the worst case (measuring never keeps the block)
         if !self.measure_only {
-            self.make_room(n * 12 + 16 + ENTRY_OFF);
+            self.make_room(n * MAX_WORDS + 16 + ENTRY_OFF);
         }
         if !self.measure_only {
             self.mark_code_page(cpu, pa0);
         }
 
-        let r = self.r;
+        let r = &self.r;
         let mut a = Asm::at(self.code, self.code_base, self.pos);
 
         // `jal link, routine` (the buffer is at most 1 MiB, so always in range)
@@ -1238,6 +1409,7 @@ impl<'m> Jit<'m> {
                     a.fix(j, r.ijmp);
                 }
                 Kind::Nop => {}
+                Kind::Csr => a = emit_csr(a, r, insn, pc, n - 1 - k),
                 Kind::Amo => {
                     // misaligned AMOs and every slow case go to the interpreter
                     if spilled(rs1) {
@@ -1428,9 +1600,10 @@ impl<'m> Jit<'m> {
         loop {
             // SAFETY: instruction k of the block, in the same guest RAM page.
             let insn = unsafe { ((host0 + 4 * k as usize) as *const u32).read() };
-            seen += match classify(insn, pc0.wrapping_add(4 * k)) {
+            seen += match classify(insn, pc0.wrapping_add(4 * k), cpu.privilege == Priv::S) {
                 Kind::Load | Kind::Store | Kind::Jalr => 1,
                 Kind::Amo => 2,
+                Kind::Csr => csr_sites(insn),
                 _ => 0,
             };
             if seen > before {
