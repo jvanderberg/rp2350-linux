@@ -109,13 +109,16 @@ print((e-s)//4096*4096)" "$m"
 
 # pack_guest IMAGE INITRD RAM_MB BLOB_OUT TEXT_OUT: device tree as the Mac host
 # makes it, then the blob and the kernel text. INITRD "-" means none: root on
-# the disk (pass its image as DISK=). NET=1 adds the network device node.
+# the disk (pass its image as DISK=). NET=1 adds the network device node,
+# IO=1 the pin devices (GPIO, I2C, SPI, PWM, ADC).
 pack_guest() {
   local dts dtb initrd=$2 src tl; dts=$(mktemp); dtb=$(mktemp)
   tl=$(text_len "$1")
   if [ "$initrd" = - ]; then src=(-d "$DISK"); initrd=/dev/null; else src=(-i "$initrd"); fi
   # NET=1: the firmware has the Wi-Fi virtio-net device
   [ "${NET:-0}" = 1 ] && src+=(-N)
+  # IO=1: the firmware drives the board's pins (rvemu-pico/src/pins.rs)
+  [ "${IO:-0}" = 1 ] && src+=(-G)
   ./target/release/rvemu -D -m "$3" -X "$tl" "${src[@]}" > "$dts"
   dtc -q -I dts -O dtb -o "$dtb" "$dts"
   python3 ../rp2350/tools/pack-guest.py "$1" "$initrd" "$dtb" "$3" "$tl" "$4" "$5"

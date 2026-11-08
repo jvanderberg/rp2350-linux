@@ -202,7 +202,19 @@ impl Bus for HostBus {
 
 // ------------------------------------------------------------------ setup
 
-fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u32)>, disk: bool, net: bool, io: bool) -> String {
+#[derive(Clone, Copy)]
+struct DtsOpts<'a> {
+    ram_base: u32,
+    ram_size: u32,
+    bootargs: &'a str,
+    initrd: Option<(u32, u32)>, // [start, end) guest PA
+    disk: bool,                 // virtio-blk at VIRTIO_BASE
+    net: bool,                  // virtio-net at VIRTIO_NET_BASE
+    gpio: bool,                 // the pin devices at IO_BASE (gpio)
+}
+
+fn make_dts(o: &DtsOpts) -> String {
+    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, gpio } = *o;
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -225,7 +237,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     if net {
         virtio += &node(VIRTIO_NET_BASE, VIRTIO_NET_IRQ);
     }
-    let (io_root, io_soc) = if io { io_nodes() } else { (String::new(), String::new()) };
+    let (io_root, io_soc) = if gpio { io_nodes() } else { (String::new(), String::new()) };
     format!(
         r#"/dts-v1/;
 / {{
@@ -623,15 +635,15 @@ fn run() -> Result<(), String> {
         }
         None => 0,
     };
-    let dts = make_dts(
+    let dts = make_dts(&DtsOpts {
         ram_base,
         ram_size,
-        &o.bootargs,
-        initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
-        o.disk.is_some(),
-        o.net,
-        o.io,
-    );
+        bootargs: &o.bootargs,
+        initrd: initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
+        disk: o.disk.is_some(),
+        net: o.net,
+        gpio: o.io,
+    });
     if o.dump_dts {
         print!("{dts}");
         return Ok(());

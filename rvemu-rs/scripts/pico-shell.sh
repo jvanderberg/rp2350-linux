@@ -28,7 +28,7 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 cargo build -q --release -p rvemu
 cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
-NET=1 pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
+NET=1 IO=1 pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
 ensure_bootsel "$ELF"
 keep_wifi
 load_text "$T/text.bin"
