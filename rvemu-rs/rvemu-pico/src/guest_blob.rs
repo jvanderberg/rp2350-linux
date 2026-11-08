@@ -17,7 +17,10 @@ const BLOB_MAX: u32 = 2 << 20;
 /// End of flash = start of the PSRAM window.
 pub const TEXT_END: usize = 0x1100_0000;
 /// Largest kernel text kept in flash (it starts at TEXT_END - text_len).
-pub const TEXT_MAX: u32 = 3 << 20;
+/// The PINS=1 kernel (MTD + jffs2 + the pin drivers) is 3.04 MiB; the root
+/// squashfs may then reach TEXT_END - TEXT_MAX (0x10C80000).
+/// rp2350/tools/pack-guest.py checks the same limit.
+pub const TEXT_MAX: u32 = 7 << 19;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

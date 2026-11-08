@@ -88,8 +88,16 @@ else
 fi
 put md5_files "$(wc -l < "$FIXED" | tr -d ' ')"
 awk 'NR==FNR{k[$1]; next} ($2 in k)' "$FIXED" "$T/manifest" > "$T/manifest.fixed"
+# The list goes to the board first, a few names per line: the shell's line
+# editor cuts a command line at about 1 KB, and the whole list is longer.
+python3 "$CMD" -- "rm -f /tmp/md5.list" > /dev/null
+xargs -n 12 < "$FIXED" | while read -r names; do
+  python3 "$CMD" -- "printf '%s\n' $names >> /tmp/md5.list" > /dev/null
+done
+python3 "$CMD" -- "wc -l < /tmp/md5.list" > "$T/listlen"
+[ "$(tr -dc 0-9 < "$T/listlen")" = "$(wc -l < "$FIXED" | tr -d ' ')" ] || { echo "perf-gate: the file list did not reach the board"; exit 1; }
 for pass in cold warm; do
-  timed "md5_${pass}_s" 600 "cd / && md5sum $(tr '\n' ' ' < "$FIXED")"
+  timed "md5_${pass}_s" 600 "cd / && xargs md5sum < /tmp/md5.list"
   if ! diff <(tr -d '\r' < "$T/md5_${pass}_s.out") "$T/manifest.fixed" > "$T/md5.diff"; then
     echo "perf-gate: CHECKSUM MISMATCH ($pass pass) -- possible memory corruption:"; head -20 "$T/md5.diff"; ok=0
   fi
