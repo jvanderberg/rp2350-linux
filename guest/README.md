@@ -55,6 +55,16 @@ and the root filesystem.
     build.sh. `/sys/bus/platform/devices/f8000400.flash/stats` reads the
     device's counters: erases, erases skipped (already blank), pages
     programmed, longest stall (us), total stall (ms).
+- **`/home` on the board (348 MHz):**
+
+  | | |
+  |---|---|
+  | Boot to `login:`, steady state | 26.95 s (no `/home`: 26.64 s) |
+  | First boot on blank flash / on garbage (formats) | 27.6 s / 35.4 s, once |
+  | Guest RAM (perf-gate `mem_adj_kb`) | 40 KiB less than without `/home` |
+  | Writing 256 KB in large writes / in 256-byte writes | about 260 KB/s / 13 KB/s |
+  | Longest guest stall: page program / sector erase | 0.5 ms / 51 ms |
+  | Wear, one day of typical use (300 shell commands, 20 saves of a 5 KB file, 200 log lines, five 50 KB rewrites) | 36 sector erases at 14% full, 252 at 72% full: 0.14 to 1 erase per sector per day against 100K cycles |
 - **Network:** `eth0` is virtio-net. `/etc/network/interfaces` runs DHCP in
   the background (`udhcpc -b`), so boot doesn't wait for the Wi-Fi join.
   On the board the NIC is bridged to the Wi-Fi radio. On the Mac, `rvemu -N`
