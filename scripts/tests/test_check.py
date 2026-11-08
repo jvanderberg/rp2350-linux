@@ -56,9 +56,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result['steps'][-1]['exit_code'], 7)
 
     def test_timeout_is_failure(self):
-        status, result = self.run_qemu('sleep 30\n', timeout=1)
-        self.assertEqual(status, 1)
-        self.assertEqual(result['steps'][-1]['status'], 'interrupted_or_timed_out')
+        for attempt in range(10):
+            with self.subTest(attempt=attempt):
+                status, result = self.run_qemu('sleep 30\n', timeout=1)
+                diagnostic = json.dumps(result, indent=2)
+                self.assertEqual(status, 1, diagnostic)
+                self.assertEqual(result['steps'][-1].get('status'),
+                                 'interrupted_or_timed_out', diagnostic)
+                self.assertIn('timed out', result['error'], diagnostic)
 
     def test_initial_and_final_source_states_are_retained(self):
         _, result = self.run_qemu('exit 7\n')
