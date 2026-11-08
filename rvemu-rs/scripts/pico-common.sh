@@ -116,6 +116,8 @@ pack_guest() {
   if [ "$initrd" = - ]; then src=(-d "$DISK"); initrd=/dev/null; else src=(-i "$initrd"); fi
   # NET=1: the firmware has the Wi-Fi virtio-net device
   [ "${NET:-0}" = 1 ] && src+=(-N)
+  # SWAP=1: the swap device node (rvemu-pico-shell's flash swap, /dev/vdb)
+  [ "${SWAP:-0}" = 1 ] && src+=(-W)
   ./target/release/rvemu -D -m "$3" -X "$tl" "${src[@]}" > "$dts"
   dtc -q -I dts -O dtb -o "$dtb" "$dts"
   python3 ../rp2350/tools/pack-guest.py "$1" "$initrd" "$dtb" "$3" "$tl" "$4" "$5"
