@@ -9,10 +9,12 @@ use std::time::Instant;
 use rvcore::dev::{Console, PLIC_BASE, PLIC_SIZE, Platform, UART_BASE, UART_IRQ, UART_SIZE};
 use rvcore::virtio::{GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE};
 use stubnet::StubNet;
+use stubpins::StubPins;
 use rvcore::{Bus, Cpu, Halt, Priv, TIMEBASE_HZ};
 
 mod sim;
 mod stubnet;
+mod stubpins;
 
 const DTB_RESERVE: u32 = 0x10000; // top 64 KiB of RAM holds the DTB
 
@@ -133,7 +135,7 @@ impl Console for TermConsole {
 // ------------------------------------------------------------------ bus
 
 struct HostBus {
-    plat: Platform<TermConsole, MemDisk, StubNet>,
+    plat: Platform<TermConsole, MemDisk, StubNet, StubPins>,
     interactive: bool,
 }
 
@@ -200,7 +202,7 @@ impl Bus for HostBus {
 
 // ------------------------------------------------------------------ setup
 
-fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u32)>, disk: bool, net: bool) -> String {
+fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u32)>, disk: bool, net: bool, io: bool) -> String {
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -223,6 +225,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     if net {
         virtio += &node(VIRTIO_NET_BASE, VIRTIO_NET_IRQ);
     }
+    let (io_root, io_soc) = if io { io_nodes() } else { (String::new(), String::new()) };
     format!(
         r#"/dts-v1/;
 / {{
@@ -230,7 +233,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
   #size-cells = <1>;
   model = "rvemu";
   compatible = "rvemu";
-  chosen {{
+{io_root}  chosen {{
     bootargs = "{bootargs}";
     stdout-path = "/soc/serial@f4000000";
 {initrd}  }};
@@ -279,10 +282,90 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
       clock-frequency = <5000000>;
       no-loopback-test;
     }};
-{virtio}  }};
+{virtio}{io_soc}  }};
 }};
 "#
     )
+}
+
+/// The board's pins (`-G`, rvcore::periph): root-level nodes (aliases fixing
+/// the bus numbers, the SPI controller's clock) and the devices on the soc.
+fn io_nodes() -> (String, String) {
+    use rvcore::periph::*;
+    let names = LINE_NAMES.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+    let i2c = |k: usize| {
+        let (base, irq) = (I2C_BASE[k], I2C_IRQ[k]);
+        format!(
+            r#"    virtio@{base:x} {{
+      compatible = "virtio,mmio";
+      reg = <0x{base:x} 0x{I2C_SIZE:x}>;
+      interrupts = <{irq}>;
+      interrupt-parent = <&plic0>;
+      i2c{k}: i2c {{
+        compatible = "virtio,device22";
+        #address-cells = <1>;
+        #size-cells = <0>;
+      }};
+    }};
+"#
+        )
+    };
+    let root = format!(
+        r#"  aliases {{
+    i2c0 = &i2c0;
+    i2c1 = &i2c1;
+    spi0 = &spi0;
+  }};
+  spiclk: clock-spi {{
+    compatible = "fixed-clock";
+    #clock-cells = <0>;
+    clock-frequency = <{SPI_CLOCK_HZ}>;
+  }};
+"#
+    );
+    let soc = format!(
+        r#"    gpio@{GPIO_BASE:x} {{
+      compatible = "rvemu,gpio";
+      reg = <0x{GPIO_BASE:x} 0x{GPIO_SIZE:x}>;
+      interrupts = <{GPIO_IRQ}>;
+      interrupt-parent = <&plic0>;
+      gpio-controller;
+      #gpio-cells = <2>;
+      interrupt-controller;
+      #interrupt-cells = <2>;
+      gpio-line-names = {names};
+    }};
+{i2c0}{i2c1}    spi0: spi@{SPI_BASE:x} {{
+      compatible = "sifive,spi0";
+      reg = <0x{SPI_BASE:x} 0x{SPI_SIZE:x}>;
+      interrupts = <{SPI_IRQ}>;
+      interrupt-parent = <&plic0>;
+      clocks = <&spiclk>;
+      sifive,fifo-depth = <{SPI_FIFO}>;
+      #address-cells = <1>;
+      #size-cells = <0>;
+      spidev@0 {{
+        compatible = "rohm,dh2228fv";
+        reg = <0>;
+        spi-max-frequency = <{max}>;
+      }};
+    }};
+    pwm@{PWM_BASE:x} {{
+      compatible = "rvemu,pwm";
+      reg = <0x{PWM_BASE:x} 0x{PWM_SIZE:x}>;
+      #pwm-cells = <3>;
+    }};
+    adc@{ADC_BASE:x} {{
+      compatible = "rvemu,adc";
+      reg = <0x{ADC_BASE:x} 0x{ADC_SIZE:x}>;
+      #io-channel-cells = <1>;
+    }};
+"#,
+        i2c0 = i2c(0),
+        i2c1 = i2c(1),
+        max = SPI_CLOCK_HZ / 2,
+    );
+    (root, soc)
 }
 
 fn compile_dts(dts: &str) -> Result<Vec<u8>, String> {
@@ -404,6 +487,8 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  guest/post-build-disk.sh)
   -N             virtio network device on a stub LAN: gateway 10.0.2.2
                  answers ARP and ping (the guest is 52:54:00:12:34:56)
+  -G             the board's pins: GPIO, I2C, SPI, PWM, ADC on a simulated
+                 board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins)
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size (default 64)
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only
@@ -438,6 +523,7 @@ struct Opts {
     disk: Option<String>,
     bootargs_set: bool,
     net: bool,
+    io: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -459,6 +545,7 @@ fn parse_args() -> Result<Opts, String> {
         disk: None,
         bootargs_set: false,
         net: false,
+        io: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -485,6 +572,7 @@ fn parse_args() -> Result<Opts, String> {
             }
             "-d" => o.disk = Some(val()?),
             "-N" => o.net = true,
+            "-G" => o.io = true,
             "-u" => o.until = Some(val()?),
             "-n" => o.max_insns = val()?.parse().map_err(|_| "bad -n")?,
             "-M" => o.model = true,
@@ -539,6 +627,7 @@ fn run() -> Result<(), String> {
         initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
         o.disk.is_some(),
         o.net,
+        o.io,
     );
     if o.dump_dts {
         print!("{dts}");
@@ -584,6 +673,9 @@ fn run() -> Result<(), String> {
     }
     if o.net {
         plat = plat.with_net(StubNet::default(), gmem);
+    }
+    if o.io {
+        plat = plat.with_io(StubPins::new(), gmem);
     }
     let mut bus = HostBus { plat, interactive: !o.batch };
 
