@@ -10,9 +10,12 @@
 #   2. rvemu-pico-shell with the disk guest: wall time from firmware start to
 #      login:, then a fixed workload over the console, timed on the Mac:
 #      first runs of five programs, MicroPython and Lua loops, 200
-#      fork+exec, and checksums of every file under /usr /lib /bin /sbin
-#      (twice) against the squashfs image's own, which is the stability
-#      check: one flipped bit fails the gate.
+#      fork+exec, checksums of a fixed file list (the baseline image's files,
+#      $RP2350_LOCK_HOME/md5-files.list; timed cold and warm, so added files
+#      don't read as slower I/O), and then of every file under /usr /lib
+#      /bin /sbin, all against the squashfs image's own: the stability
+#      check, where one flipped bit fails the gate. The boot console of every
+#      run is kept in $RP2350_LOCK_HOME/boot-logs/.
 # Results go to $RP2350_LOCK_HOME/perf.log (one JSON line per run) and are
 # compared with perf-baseline.json there. -s makes this run the baseline
 # (the integrator does that, nobody else). -B skips step 1.
@@ -54,7 +57,11 @@ docker run --rm -v "$(cd ../guest/out-disk && pwd):/d:ro" -v rvemu-guest-work:/w
 [ -s "$T/manifest" ] || { echo "perf-gate: could not make the checksum manifest of $DISK"; exit 1; }
 
 scripts/pico-shell.sh
-put boot_s "$(python3 ../rp2350/tools/boot-wait.py "$(cat "$LOCK_HOME/last-launch")" --timeout 180)"
+# the boot console of every run, kept so a slow or odd boot can be read later
+mkdir -p "$LOCK_HOME/boot-logs"
+BOOTLOG="$LOCK_HOME/boot-logs/$(date +%Y%m%d-%H%M%S)-${BOARD_LOCK_OWNER:-anon}.log"
+echo "perf-gate: boot console -> $BOOTLOG"
+put boot_s "$(python3 ../rp2350/tools/boot-wait.py "$(cat "$LOCK_HOME/last-launch")" --timeout 180 --log "$BOOTLOG")"
 python3 "$CMD" --timeout 60 -- true > /dev/null          # log in
 python3 "$CMD" -- "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo" > "$T/mem"
 put mem_total_kb "$(awk '/MemTotal/{print $2}' "$T/mem")"
@@ -69,12 +76,28 @@ timed mpy_s 300 "micropython -c 'print(sum(i*i for i in range(30000)))'"
 timed lua_s 300 "lua -e 'local s=0 for i=1,300000 do s=s+i end print(s)'"
 timed fork_exec_s 300 'i=0; while [ $i -lt 200 ]; do /bin/true; i=$((i+1)); done'
 ok=1
+# Timed passes read a fixed file list ($LOCK_HOME/md5-files.list: the
+# baseline image's files, as many of them as this image still has), so a
+# branch that adds files doesn't look like slower I/O. The last pass checks
+# every file of this image against its squashfs: the stability check.
+FIXED="$T/fixed.list"
+if [ -s "$LOCK_HOME/md5-files.list" ]; then
+  awk '{print $2}' "$T/manifest" | grep -Fxf "$LOCK_HOME/md5-files.list" > "$FIXED" || true
+else
+  awk '{print $2}' "$T/manifest" > "$FIXED"
+fi
+put md5_files "$(wc -l < "$FIXED" | tr -d ' ')"
+awk 'NR==FNR{k[$1]; next} ($2 in k)' "$FIXED" "$T/manifest" > "$T/manifest.fixed"
 for pass in cold warm; do
-  timed "md5_${pass}_s" 600 "cd / && find usr lib bin sbin -type f | sort | xargs md5sum"
-  if ! diff <(tr -d '\r' < "$T/md5_${pass}_s.out") "$T/manifest" > "$T/md5.diff"; then
+  timed "md5_${pass}_s" 600 "cd / && md5sum $(tr '\n' ' ' < "$FIXED")"
+  if ! diff <(tr -d '\r' < "$T/md5_${pass}_s.out") "$T/manifest.fixed" > "$T/md5.diff"; then
     echo "perf-gate: CHECKSUM MISMATCH ($pass pass) -- possible memory corruption:"; head -20 "$T/md5.diff"; ok=0
   fi
 done
+timed md5_all_s 900 "cd / && find usr lib bin sbin -type f | sort | xargs md5sum"
+if ! diff <(tr -d '\r' < "$T/md5_all_s.out") "$T/manifest" > "$T/md5.diff"; then
+  echo "perf-gate: CHECKSUM MISMATCH (all files) -- possible memory corruption:"; head -20 "$T/md5.diff"; ok=0
+fi
 put checksums_ok $ok
 
 python3 - "$R" "$LOCK_HOME" "$LABEL" "${BOARD_LOCK_OWNER:-}" "$SET" <<'P'

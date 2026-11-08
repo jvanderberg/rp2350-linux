@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Wait for `login:` on rvemu-pico-shell's console; print seconds since START.
 
-usage: boot-wait.py START_EPOCH [--port PORT] [--timeout S]
+usage: boot-wait.py START_EPOCH [--port PORT] [--timeout S] [--log FILE]
 
 START_EPOCH is when the firmware was started (pico-shell.sh writes it to
 $RP2350_LOCK_HOME/last-launch). Prints the boot time in seconds on stdout,
-or exits 1 on timeout. Plain termios, never 1200 baud.
+or exits 1 on timeout. --log writes the whole boot console, each line
+prefixed with its seconds since START_EPOCH, whatever the outcome.
+Plain termios, never 1200 baud.
 """
 import argparse
 import glob
@@ -22,7 +24,26 @@ def main():
     ap.add_argument("start", type=float)
     ap.add_argument("--port", default=None)
     ap.add_argument("--timeout", type=float, default=180.0)
+    ap.add_argument("--log", default=None)
     a = ap.parse_args()
+    logf = open(a.log, "w") if a.log else None
+    line = bytearray()
+
+    def keep(data):
+        # timestamp each console line as it completes
+        if not logf:
+            return
+        for c in data:
+            line.append(c)
+            if c == 0x0A:
+                logf.write(f"{time.time() - a.start:8.2f} {line.decode(errors='replace').rstrip()}\n")
+                line.clear()
+
+    def close_log():
+        if logf:
+            if line:
+                logf.write(f"{time.time() - a.start:8.2f} {line.decode(errors='replace')}\n")
+            logf.close()
     end = time.time() + a.timeout
     port = a.port
     while not port:
@@ -55,14 +76,17 @@ def main():
         if not data:
             break
         log += data
+        keep(data)
         buf = (buf + data)[-64:]
         if b"login:" in buf:
             t = time.time() - a.start
             os.close(fd)
+            close_log()
             print(f"{t:.2f}")
             return 0
         if b"Kernel panic" in log[-2048:]:
             break
+    close_log()
     sys.stderr.write(log[-1500:].decode(errors="replace"))
     sys.exit("boot-wait: no login: (timeout or panic)")
 
