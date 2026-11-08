@@ -54,7 +54,7 @@
 
 pub mod emit;
 
-use core::mem::offset_of;
+use core::mem::{MaybeUninit, offset_of};
 use emit::*;
 use rvcore::{ACC_R, ACC_W, ACC_X, Bus, Cpu, JitRegs, TlbEntry};
 
@@ -284,8 +284,8 @@ fn classify(insn: u32, pc: u32) -> Kind {
     }
 }
 
-/// Pass 1 of translation: the extent of the block starting at `pc0`. Pass 2
-/// reads and classifies the instructions again (cheaper than keeping them).
+/// Pass 1 of translation: the extent of the block starting at `pc0`, and
+/// the kind of each instruction (pass 2 reads the instructions again).
 struct Scan {
     /// host address of the instruction at `pc0`
     host0: usize,
@@ -303,8 +303,12 @@ fn insn_at(host0: usize, k: usize) -> u32 {
     unsafe { ((host0 + 4 * k) as *const u32).read() }
 }
 
+/// Kinds of a block's instructions; scan() writes the first `n` (left
+/// uninitialized otherwise: zero-filling it cost more than the scan).
+type Kinds = [MaybeUninit<Kind>; MAX_BLOCK];
+
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-fn scan(cpu: &Cpu, pc0: u32, pa0: u32) -> Scan {
+fn scan(cpu: &Cpu, pc0: u32, pa0: u32, kinds: &mut Kinds) -> Scan {
     let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
     // instructions left in the page
     let max = (((0x1000 - (pc0 & 0xFFF)) >> 2) as usize).min(MAX_BLOCK);
@@ -315,6 +319,7 @@ fn scan(cpu: &Cpu, pc0: u32, pa0: u32) -> Scan {
             s.end_interp = true;
             break;
         }
+        kinds[s.n] = MaybeUninit::new(k);
         s.last = k;
         s.n += 1;
         if matches!(k, Kind::Branch | Kind::Jal | Kind::Jalr) {
@@ -1067,7 +1072,8 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         // pass 1: find the block
-        let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0);
+        let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
+        let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0, &mut kinds);
         let pc = pc0.wrapping_add(4 * n as u32);
 
         // (no-code blocks are not kept: scanning one instruction again is
@@ -1114,10 +1120,11 @@ impl<'m> Jit<'m> {
             }};
         }
 
-        for k in 0..n {
+        for (k, kind) in kinds[..n].iter().enumerate() {
             let insn = insn_at(host0, k);
             let pc = pc0.wrapping_add(4 * k as u32);
-            let kind = classify(insn, pc);
+            // SAFETY: scan() wrote kinds[..n].
+            let kind = unsafe { kind.assume_init() };
             let rd = (insn >> 7) & 31;
             let rs1 = (insn >> 15) & 31;
             let rs2 = (insn >> 20) & 31;
@@ -1538,7 +1545,7 @@ impl<'m> Jit<'m> {
     /// `block_info`, plus the words the translator emits for the block and
     /// the word index they were emitted at (valid until the next translation).
     pub fn block_code(&mut self, cpu: &mut Cpu, va: u32, pa: u32) -> (BlockInfo, &[u32], usize) {
-        let sc = scan(cpu, va, pa);
+        let sc = scan(cpu, va, pa, &mut [MaybeUninit::uninit(); MAX_BLOCK]);
         let end = match sc.n {
             0 => BlockEnd::Interp,
             _ => match sc.last {
