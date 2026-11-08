@@ -232,24 +232,29 @@ enum Kind {
     Nop,
     /// AMO*.W except LR/SC: done with the host AMO on the host address.
     Amo,
-    /// S-mode CSR access the translator does itself: sscratch, sepc, scause,
-    /// stval, and sstatus reads and SIE set/clear (`csr_sites`).
+    /// S-mode access to sscratch, sepc, scause, stval or sstatus
+    /// (`emit_csr`).
     Csr,
     Interp,
 }
 
-/// Helper-call sites (`jal K3`) a Csr instruction emits: an sstatus set or
-/// clear with a register operand checks it holds only SIE, and leaves for
-/// the interpreter otherwise.
+/// Helper-call sites (`jal K3`) a Csr instruction emits: one for an sstatus
+/// write unless it is an immediate SIE set or clear.
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn csr_sites(insn: u32) -> usize {
     let (f3, rs1) = ((insn >> 12) & 7, (insn >> 15) & 31);
-    usize::from(insn >> 20 == CSR_SSTATUS && f3 < 4 && rs1 != 0)
+    usize::from(insn >> 20 == CSR_SSTATUS && (f3 & 3 == 1 || rs1 != 0) && !sie_imm(f3, rs1))
 }
 
-/// Translated host words, at most, for one instruction (an sstatus access;
+/// An sstatus `csrrsi` / `csrrci` that sets or clears at most SIE.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn sie_imm(f3: u32, rs1: u32) -> bool {
+    f3 >= 4 && f3 & 3 != 1 && rs1 & !2 == 0
+}
+
+/// Translated host words, at most, for one instruction (an sstatus write;
 /// an AMO is 12).
-const MAX_WORDS: usize = 28;
+const MAX_WORDS: usize = 36;
 
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn imm_i(insn: u32) -> i32 {
@@ -319,14 +324,7 @@ fn classify(insn: u32, pc: u32, sup: bool) -> Kind {
         // privilege is the one it was translated in)
         0x73 if sup && f3 & 3 != 0 => {
             let csr = insn >> 20;
-            let rs1 = (insn >> 15) & 31;
-            if CSR_FIELDS.iter().any(|&(c, _)| c == csr) {
-                Kind::Csr
-            } else if csr == CSR_SSTATUS
-                && (f3 & 3 != 1)
-                && (f3 < 4 || rs1 & !2 == 0)
-            {
-                // csrr[s|c][i] sstatus: reads, and immediate SIE set/clear
+            if csr == CSR_SSTATUS || CSR_FIELDS.iter().any(|&(c, _)| c == csr) {
                 Kind::Csr
             } else {
                 Kind::Interp
@@ -407,40 +405,68 @@ fn emit_csr<'a>(mut a: Asm<'a>, r: &Routines, insn: u32, pc: u32, left: usize) -
                 }
             }
         }
-        let skip = if write && !imm {
-            // only SIE may change here; anything else is the
-            // interpreter's
-            a.andi(K1, src, -3);
-            a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
-            call!(K3, r.mem_miss);
-            a.andi(K1, src, 2);
-            write_rd!();
-            Some(a.branch_fwd(0, K1, ZERO))
-        } else {
-            write_rd!();
-            None
-        };
-        if write {
-            if op == 2 {
-                a.addi(K1, ZERO, 1);
-                a.store(0, K1, S, OFF_SIE_BIT); // sb
-                // an interrupt pending since entry is now taken
-                a.lw(K1, S, OFF_IRQ_PENDING);
-                let refund = left as i32;
+        let refund = left as i32;
+        // `beq reg, zero` past the exit for an interrupt now taken
+        macro_rules! exit_if {
+            ($reg:expr) => {{
                 let past = 4 * (3 + i32::from(refund > 0));
-                a.emit(b_type(0, K1, ZERO, past)); // beq K1, zero
+                a.emit(b_type(0, $reg, ZERO, past));
                 if refund > 0 {
                     a.addi(KB, KB, refund);
                 }
                 call!(K1, r.jump_exit);
                 a.emit(pc.wrapping_add(4));
-            } else {
-                a.store(0, ZERO, S, OFF_SIE_BIT);
-            }
+            }};
         }
-        if let Some(j) = skip {
+        // SIE set (op 2) or clear (op 3) inline
+        macro_rules! set_sie {
+            () => {{
+                if op == 2 {
+                    a.addi(K1, ZERO, 1);
+                    a.store(0, K1, S, OFF_SIE_BIT); // sb
+                    // an interrupt pending since entry is now taken
+                    a.lw(K1, S, OFF_IRQ_PENDING);
+                    exit_if!(K1);
+                } else {
+                    a.store(0, ZERO, S, OFF_SIE_BIT);
+                }
+            }};
+        }
+        if !write {
+            write_rd!();
+        } else if sie_imm(f3, rs1) {
+            write_rd!();
+            if rs1 != 0 {
+                set_sie!();
+            }
+        } else {
+            // other writes: sstatus_op(), which says whether an interrupt is
+            // now taken; a register operand holding only SIE is done inline
+            if imm {
+                a.addi(K0, ZERO, rs1 as i32);
+            } else if src != K0 {
+                a.addi(K0, src, 0);
+            }
+            write_rd!();
+            // (inline: the branch when SIE is not in it, the jump at the end)
+            let mut inline_done = [None; 2];
+            if op != 1 && !imm {
+                a.andi(K1, K0, -3);
+                let to_call = a.branch_fwd(1, K1, ZERO);
+                a.andi(K1, K0, 2);
+                inline_done[0] = Some(a.branch_fwd(0, K1, ZERO));
+                set_sie!();
+                inline_done[1] = Some(a.jump_fwd());
+                let here = a.pos();
+                a.fix(to_call, here);
+            }
+            a.addi(K1, ZERO, op as i32);
+            call!(K3, r.sstatus);
+            exit_if!(K0);
             let here = a.pos();
-            a.fix(j, here);
+            for d in inline_done.into_iter().flatten() {
+                a.fix(d, here);
+            }
         }
     } else {
         let off = CSR_FIELDS.iter().find(|&&(c, _)| c == csr).map_or(0, |&(_, o)| o);
@@ -533,6 +559,14 @@ type EnterFn = unsafe extern "C" fn(*mut Cpu, usize);
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 extern "C" fn tlb_refill(cpu: &mut Cpu, va: u32, acc: usize) -> usize {
     cpu.tlb_refill(va, acc).unwrap_or(0)
+}
+
+/// Called from translated code for an sstatus write (the `sstatus`
+/// routine): 1 if an interrupt is now taken.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+extern "C" fn sstatus_op(cpu: &mut Cpu, src: u32, op: u32) -> usize {
+    cpu.sstatus_op(op, src);
+    usize::from(cpu.sie_bit && cpu.jit.irq_pending != 0)
 }
 
 /// Guest registers in host registers a Rust call may clobber (besides sp).
@@ -647,6 +681,9 @@ struct Routines {
     interp_exit: usize,
     /// `jal K1, jump_exit; .word pc` - leave for the dispatcher at pc
     jump_exit: usize,
+    /// `jal K3, sstatus` with K0 = operand, K1 = op: `Cpu::sstatus_op`;
+    /// K0 = 1 if an interrupt is now taken
+    sstatus: usize,
     /// from the block prologue: `jal K1, budget_exit` (K1 = entry)
     budget_exit: usize,
     /// `jal K3, mem_miss` - interpret the instruction of that call site
@@ -801,28 +838,39 @@ impl<'m> Jit<'m> {
         a.addi(K1, K3, EXIT_MEM as i32);
         jump!(r.exit);
 
+        // f(cpu, K0, K1) on the host stack, result in K0. The callee-saved
+        // registers (S, K0 = tp, KB, K2, K3, s-registers) survive the call.
+        macro_rules! call_rust {
+            ($f:expr) => {{
+                for &reg in &CALLER_SAVED {
+                    a.sw(reg, S, xoff(reg));
+                }
+                a.sw(SP, S, xoff(SP));
+                a.lw(SP, S, OFF_HOST_SP);
+                a.addi(10, S, 0);
+                a.addi(11, K0, 0);
+                a.addi(12, K1, 0);
+                a.li(5, $f as *const () as usize as u32);
+                a.jalr(RA, 5, 0);
+                a.addi(K0, 10, 0);
+                a.lw(SP, S, xoff(SP));
+                for &reg in &CALLER_SAVED {
+                    a.lw(reg, S, xoff(reg));
+                }
+            }};
+        }
+
         // TLB miss: K0 = guest va, K1 = access type, K3 = return address.
-        // tlb_refill() on the host stack fills the entry and returns the host
-        // address, or 0 for mem_miss. The callee-saved registers (S, K0 = tp,
-        // KB, K2, K3, s-registers) survive the call.
+        // tlb_refill() fills the entry and returns the host address, or 0
+        // for mem_miss.
         let refill = a.pos();
-        for &reg in &CALLER_SAVED {
-            a.sw(reg, S, xoff(reg));
-        }
-        a.sw(SP, S, xoff(SP));
-        a.lw(SP, S, OFF_HOST_SP);
-        a.addi(10, S, 0);
-        a.addi(11, K0, 0);
-        a.addi(12, K1, 0);
-        a.li(5, tlb_refill as *const () as usize as u32);
-        a.jalr(RA, 5, 0);
-        a.addi(K0, 10, 0);
-        a.lw(SP, S, xoff(SP));
-        for &reg in &CALLER_SAVED {
-            a.lw(reg, S, xoff(reg));
-        }
+        call_rust!(tlb_refill);
         a.emit(b_type(1, K0, ZERO, 8)); // bne K0, zero, +8
         jump!(r.mem_miss);
+        a.jalr(ZERO, K3, 0);
+
+        r.sstatus = a.pos();
+        call_rust!(sstatus_op);
         a.jalr(ZERO, K3, 0);
 
         // indirect jump with the target in the word at K1
