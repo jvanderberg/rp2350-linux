@@ -78,7 +78,7 @@ if [ "$1" = selfhost ]; then
 		done
 		# the link needs ~2 MB of its own: no sources in /tmp meanwhile
 		rm -f ./*.h ./*.c stab.def
-		if [ "$2" = tcc3 ]; then rm -f ../tcc-src.tgz ../*.out ../*.expect; fi
+		if [ "$2" = tcc3 ]; then rm -f ../tcc-src.tgz; fi
 		peak "$1-link" "$1" -o "$2" tcc.o libtcc.o tccpp.o tccgen.o tccdbg.o \
 			tccelf.o tccasm.o tccrun.o riscv32-gen.o riscv64-link.o \
 			riscv64-asm.o -lm -ldl -lpthread || return 1
