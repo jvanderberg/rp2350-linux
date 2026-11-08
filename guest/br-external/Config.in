@@ -1,0 +1,1 @@
+# One line per package: source "$BR2_EXTERNAL_RVEMU_PATH/package/<pkg>/Config.in"
