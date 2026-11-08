@@ -6,7 +6,10 @@ The Linux guests for the board, built in Docker:
 
 The first run clones Buildroot 2026.08.1 into `src/buildroot`. Build trees
 live in the Docker volume `rvemu-guest-work`, so later builds are
-incremental. Logs and outputs are not tracked.
+incremental. Logs and outputs are not tracked. The wrapper verifies the Buildroot checkout
+is clean at the expected tag, retains `build-STAGE.log`, and writes
+`build.json` beside successful outputs. See the
+[development guide](../docs/development.md) for provenance and clean-build limits.
 
 Packages that Buildroot doesn't have live in `br-external`, a BR2_EXTERNAL
 tree named `RVEMU`: one directory per package under `package/`, and one

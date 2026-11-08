@@ -39,7 +39,7 @@ lines starting with `$` on the Mac the board is plugged into.
 
 ## Prerequisites (macOS)
 
-- Rust stable with the `riscv32imac-unknown-none-elf` and
+- Rust selected by `rust-toolchain.toml`, with the `riscv32imac-unknown-none-elf` and
   `riscv32im-unknown-none-elf` targets.
 - Docker, for the guest build.
 - `dtc`, `picotool` and `screen`.
@@ -233,3 +233,8 @@ passphrase. `pico-shell.sh` writes only the regions whose contents changed
 | `rvemu-rs/` | the emulator and the board firmware, and the scripts that build, load and test them ([README](rvemu-rs/README.md)) |
 | `rp2350/` | board support and host tools ([README](rp2350/README.md)) |
 | `rvemu/` | the C reference emulator ([README](rvemu/README.md)) |
+
+## Development
+
+See the [development and verification guide](docs/development.md) for host
+checks, guest builds, QEMU, explicit board checks, CI and saved test results.

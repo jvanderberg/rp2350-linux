@@ -22,7 +22,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ELF = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell"
-OBJDUMP = next(Path.home().glob(".rustup/toolchains/*/lib/rustlib/*/bin/llvm-objdump"))
+SYSROOT = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
+HOST = next(line[6:] for line in subprocess.check_output(["rustc", "-vV"], text=True).splitlines() if line.startswith("host: "))
+OBJDUMP = Path(SYSROOT) / "lib/rustlib" / HOST / "bin/llvm-objdump"
+if not OBJDUMP.is_file():
+    sys.exit("Missing llvm-objdump. Run: rustup component add llvm-tools-preview")
 NM = OBJDUMP.with_name("llvm-nm")
 
 # Targets that only run on rare or one-time paths (BYTES: the radio firmware,
