@@ -118,6 +118,27 @@ wait
             self.fail(f'Descendant {pid} survived SIGTERM cleanup')
 
 
+class ProcessGroupTests(unittest.TestCase):
+    def test_darwin_permission_error_requires_no_live_members(self):
+        with patch.object(check.sys, 'platform', 'darwin'), \
+             patch.object(check.os, 'killpg', side_effect=PermissionError('denied')):
+            for table in ('', '123 Z\n456 S\n', '123 Z+\n'):
+                with patch.object(check.subprocess, 'check_output', return_value=table):
+                    check.signal_group(123, 9)
+            with patch.object(check.subprocess, 'check_output', return_value='123 Z\n123 S\n'):
+                with self.assertRaises(PermissionError):
+                    check.signal_group(123, 9)
+            with patch.object(check.subprocess, 'check_output', side_effect=OSError('ps failed')):
+                with self.assertRaises(OSError):
+                    check.signal_group(123, 9)
+
+    def test_other_platform_permission_errors_are_not_ignored(self):
+        with patch.object(check.sys, 'platform', 'linux'), \
+             patch.object(check.os, 'killpg', side_effect=PermissionError('denied')):
+            with self.assertRaises(PermissionError):
+                check.signal_group(123, 9)
+
+
 class BaselineTests(unittest.TestCase):
     def test_bundle_binding_and_numeric_validation(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -66,6 +66,23 @@ def preflight(tier):
         validate_baseline(RS / 'target/perf-gate')
 
 
+def signal_group(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if sys.platform != 'darwin':
+            raise
+        # Darwin can return EPERM for a group whose remaining members are
+        # zombies. Do not hide permission failures against a live descendant.
+        table = subprocess.check_output(['ps', '-axo', 'pgid=,stat='], text=True, timeout=5)
+        for row in table.splitlines():
+            group, state = row.split()
+            if int(group) == pgid and not state.startswith(('Z', 'X')):
+                raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('tier', choices=['host', 'qemu', 'board'])
@@ -120,21 +137,15 @@ def main():
                     except subprocess.TimeoutExpired:
                         continue
             except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                step['status'] = 'interrupted_or_timed_out'
+                signal_group(proc.pid, signal.SIGTERM)
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    signal_group(proc.pid, signal.SIGKILL)
                     proc.wait()
                 # The shell may exit before a descendant that ignores SIGTERM.
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                step['status'] = 'interrupted_or_timed_out'
+                signal_group(proc.pid, signal.SIGKILL)
                 raise
             finally:
                 step['seconds'] = round(time.monotonic() - start, 3)
