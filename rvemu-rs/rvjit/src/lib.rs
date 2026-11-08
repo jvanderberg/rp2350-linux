@@ -697,6 +697,9 @@ pub struct Jit<'m> {
     jc: &'m mut [JcEntry],
     generation: u32,
     force_interp: bool,
+    /// (pc, host, code) that chain() just looked up for the pc the next
+    /// step starts at
+    next: Option<(u32, usize, u32)>,
     /// Translate AMOs to the host AMO (true) or to a plain load / operate /
     /// store sequence (false). RP2350 only supports exclusives, and so
     /// Hazard3 AMOs, on main SRAM: an AMO to guest RAM in PSRAM is a
@@ -819,6 +822,7 @@ impl<'m> Jit<'m> {
             jc: mem.jump_cache,
             generation: 0,
             force_interp: false,
+            next: None,
             native_amo: true,
             measure_only: false,
             stats: JitStats::default(),
@@ -1701,7 +1705,7 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn chain(&mut self, cpu: &mut Cpu, slot_addr: usize, target: u32) {
         let generation = self.generation;
-        let Ok((pa, _)) = cpu.translate_pc(target) else { return };
+        let Ok((pa, host)) = cpu.translate_pc(target) else { return };
         let code = match self.lookup(target, pa) {
             Some(c) => c,
             None => self.translate(cpu, target, pa),
@@ -1709,6 +1713,8 @@ impl<'m> Jit<'m> {
         if code == NO_CODE || generation != self.generation {
             return;
         }
+        // the next step starts there: save it the lookup
+        self.next = Some((target, host, code));
         let slot = (slot_addr - self.code_base) / 4;
         let off = (code as isize - slot as isize) * 4;
         if (-(1 << 20)..(1 << 20)).contains(&off) {
@@ -1788,6 +1794,7 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn run_one_inner<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Event {
+        let next = self.next.take();
         if cpu.check_irq(bus) {
             self.force_interp = false;
             return Event::Irq;
@@ -1798,13 +1805,19 @@ impl<'m> Jit<'m> {
             return Event::Interp;
         }
         let pc = cpu.pc;
-        let Ok((pa, host)) = cpu.translate_pc(pc) else {
-            self.interp(cpu, bus); // raises the fetch fault
-            return Event::Interp;
-        };
-        let code = match self.lookup(pc, pa) {
-            Some(c) => c,
-            None => self.translate(cpu, pc, pa),
+        let (host, code) = match next {
+            Some((npc, host, code)) if npc == pc => (host, code),
+            _ => {
+                let Ok((pa, host)) = cpu.translate_pc(pc) else {
+                    self.interp(cpu, bus); // raises the fetch fault
+                    return Event::Interp;
+                };
+                let code = match self.lookup(pc, pa) {
+                    Some(c) => c,
+                    None => self.translate(cpu, pc, pa),
+                };
+                (host, code)
+            }
         };
         if code == NO_CODE {
             self.interp(cpu, bus);
