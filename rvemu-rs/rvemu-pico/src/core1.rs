@@ -471,6 +471,10 @@ static TICK_SYS_MHZ: AtomicU32 = AtomicU32::new(150);
 
 /// Start core1 on the service `make` builds (straight into its static slot,
 /// so it never sits in a stack frame). Returns once core1 is running it.
+// Not inlined, so whatever `make` puts on the stack leaves core0's stack
+// with this frame; and in flash (core0 runs it once), not in core1.x's SRAM.
+#[inline(never)]
+#[unsafe(link_section = ".text.core0_launch")]
 pub fn launch<S: Service + Send>(fifo: &mut hal::sio::SioFifo, psm: &mut hal::pac::PSM, sys_hz: u32, make: impl FnOnce() -> S) {
     const {
         assert!(size_of::<S>() <= SERVICE_BYTES && align_of::<S>() <= 16, "core1's service: raise SERVICE_BYTES");

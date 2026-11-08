@@ -30,9 +30,9 @@ use rp2350_board as board;
 use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
-use rvcore::nor::NorFlash;
+use rvcore::nor::{NorDev, NorFlash};
 use rvcore::swapdev::FlashSwap;
-use rvcore::virtio::{Disk as _, FRAME_MAX, GuestMem, MemDisk, NetLink, VirtioBlk};
+use rvcore::virtio::{Disk as _, FRAME_MAX, GuestMem, MemDisk, NetLink, VirtioBlk, VirtioNet};
 use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, TIMEBASE_HZ};
 use rvjit::{JcEntry, Jit, JitMem};
 use usb_device::class_prelude::UsbBusAllocator;
@@ -183,9 +183,10 @@ impl NorFlash for BoardNor {
 // ------------------------------------------------------------------ translator storage (SRAM)
 
 /// Translated code and its block headers: what SRAM has left once core1's
-/// code and buffers (`core1.rs`) and core0's stack (9 KB deep after a gate
-/// run; 12 KiB here) have theirs.
-const CODE_KIB: usize = 330;
+/// code and buffers (`core1.rs`), the pin devices and core0's stack (about
+/// 10 KiB, what is left above .bss; `setup` and the run each need about 6) have
+/// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
+const CODE_KIB: usize = 326;
 const CODE_WORDS: usize = CODE_KIB * 256;
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
@@ -203,6 +204,11 @@ static mut CHAIN_LOG: [u32; REGIONS * 128] = [0; REGIONS * 128];
 static mut STORE_EPOCHS: [u8; (GUEST_MAX >> 12) as usize] = [0; (GUEST_MAX >> 12) as usize];
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 static mut USB_BUS: MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> = MaybeUninit::uninit();
+// The bus and the translator live here rather than on main's stack: `setup`
+// builds them in its own frame, which is gone before the guest runs, so
+// core0's stack (what SRAM leaves above .bss, about 10 KB) is only the run.
+static mut BUS: MaybeUninit<PicoBus> = MaybeUninit::uninit();
+static mut JIT: MaybeUninit<Jit<'static>> = MaybeUninit::uninit();
 /// Sectors kept free for bursts of swap writes: 448 of the 511 are swap.
 const SWAP_SPARE: u32 = 63;
 /// With the swap device (`pico-shell.sh -w`), its backend (about 2.2 KB of
@@ -486,6 +492,23 @@ fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus) {
 
 #[hal::entry]
 fn main() -> ! {
+    let (jit, cpu, bus, sys_hz) = setup();
+    jit_loop(jit, cpu, bus);
+    let why = match cpu.halt {
+        Some(Halt::Shutdown) => "guest shut down",
+        _ => "guest stopped",
+    };
+    // let the last output reach the terminal
+    let t0 = board::mcycle64();
+    while !CON_OUT.is_empty() && board::mcycle64() - t0 < u64::from(sys_hz) {}
+    fail(why);
+}
+
+/// Everything before the guest runs: the board, core1, the guest's devices
+/// and the translator. Not inlined, so its temporaries (pin setup, the
+/// Platform builder chain) leave the stack before `jit_loop`.
+#[inline(never)]
+fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus, u32) {
     board::bootsel_if_requested();
     rtt_init_print!(ChannelMode::NoBlockSkip, 1024);
     let mut pac = hal::pac::Peripherals::take().unwrap();
@@ -608,14 +631,11 @@ fn main() -> ! {
         fail("no root filesystem: no initramfs in the blob and no squashfs at 0x10600000");
     }
     let gmem = GuestMem { ptr: h.ram_host() as *mut u8, base: 0, size: h.ram_size, ro: h.text_len };
-    let mut plat = Platform::new(con)
-        .with_net(RingLink { wait_cycles: ms(RADIO_BRING_UP_MS) }, gmem)
-        .with_nor(BoardNor, gmem)
-        .with_io(board_pins, gmem);
-    if let Some(d) = disk {
-        plat = plat.with_disk(d, gmem);
-    }
-    let mut bus = PicoBus { plat, sys_hz, seen: core1::events().wrapping_sub(1) };
+    // SAFETY: written once, here, before anything borrows it.
+    let bus = unsafe {
+        (*addr_of_mut!(BUS)).write(PicoBus { plat: Platform::new(con), sys_hz, seen: core1::events().wrapping_sub(1) })
+    };
+    add_devices(bus, board_pins, disk, gmem, ms(RADIO_BRING_UP_MS));
 
     // SAFETY: guest RAM is the mapped, writable PSRAM; the header was checked.
     let dtb = unsafe { h.load() };
@@ -645,9 +665,39 @@ fn main() -> ! {
         c.set_readonly_prefix(h.text_len);
         c
     };
-    // SAFETY: as above.
-    let mut jit = unsafe {
-        Jit::new(
+    let jit = make_jit(cpu);
+    // Guest RAM is PSRAM, where Hazard3 AMOs fault.
+    jit.native_amo = false;
+    rprintln!(
+        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
+        h.ram_size >> 10,
+        CODE_WORDS * 4 / 1024,
+        STORE_WORDS * 4 / 1024,
+        disk_kib,
+        if swap_on { "on" } else { "off" }
+    );
+    (jit, cpu, bus, sys_hz)
+}
+
+/// The guest's devices, built straight into the static bus (a `with_*`
+/// chain would keep a copy of the whole Platform per step on the stack), in
+/// a frame of their own.
+#[inline(never)]
+fn add_devices(bus: &mut PicoBus, pins: BoardPins, disk: Option<MemDisk>, gmem: GuestMem, radio_wait: u64) {
+    bus.plat.net = Some(VirtioNet::new(RingLink { wait_cycles: radio_wait }, gmem));
+    bus.plat.nor = Some(NorDev::new(BoardNor, gmem));
+    bus.plat.io = Some(rvcore::periph::Io::new(pins, gmem));
+    if let Some(d) = disk {
+        bus.plat.blk = Some(VirtioBlk::new(d, gmem));
+    }
+}
+
+/// The translator, in the static `JIT`, in a frame of its own.
+#[inline(never)]
+fn make_jit(cpu: &mut Cpu) -> &'static mut Jit<'static> {
+    // SAFETY: the translator tables are used only by this Jit, from here on.
+    unsafe {
+        (*addr_of_mut!(JIT)).write(Jit::new(
             cpu,
             JitMem {
                 code: &mut *addr_of_mut!(CODE),
@@ -661,27 +711,8 @@ fn main() -> ! {
                 store: core::slice::from_raw_parts_mut(STORE as *mut u32, STORE_WORDS),
                 store_epochs: &mut *addr_of_mut!(STORE_EPOCHS),
             },
-        )
-    };
-    // Guest RAM is PSRAM, where Hazard3 AMOs fault.
-    jit.native_amo = false;
-    rprintln!(
-        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
-        h.ram_size >> 10,
-        CODE_WORDS * 4 / 1024,
-        STORE_WORDS * 4 / 1024,
-        disk_kib,
-        if swap_on { "on" } else { "off" }
-    );
-    jit_loop(&mut jit, cpu, &mut bus);
-    let why = match cpu.halt {
-        Some(Halt::Shutdown) => "guest shut down",
-        _ => "guest stopped",
-    };
-    // let the last output reach the terminal
-    let t0 = board::mcycle64();
-    while !CON_OUT.is_empty() && board::mcycle64() - t0 < u64::from(sys_hz) {}
-    fail(why);
+        ))
+    }
 }
 
 #[unsafe(link_section = ".bi_entries")]
