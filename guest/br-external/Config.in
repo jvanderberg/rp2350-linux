@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_RVEMU_PATH/package/tcc/Config.in"
