@@ -31,6 +31,22 @@ fresh_target() {   # BR_OUT FILES...
   echo "$sum" > "$o/.config-sum"
 }
 
+# Buildroot rebuilds nothing when a package's .mk or patches change: after
+# defconfig, dirclean each external package whose files differ from the
+# last build in this tree.
+ext_rebuild() {   # BR_OUT
+  local o=$1 d p sum
+  [[ -n $EXT ]] || return 0
+  for d in "$EXT"/package/*/; do
+    p=$(basename "$d")
+    sum=$(find "$d" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
+    if [[ "$(cat "$o/.ext-sum-$p" 2>/dev/null)" != "$sum" ]]; then
+      make -C "$o" "$p-dirclean"
+      echo "$sum" > "$o/.ext-sum-$p"
+    fi
+  done
+}
+
 # disk / disk-rootfs / disk-kernel: the squashfs-root variant, into /out-disk
 # (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment)
 if [[ $stage == disk* ]]; then
@@ -47,6 +63,7 @@ if [[ $stage == disk* ]]; then
       make -C /work/br-disk busybox-dirclean
     fi
     echo "$bb" > /work/br-disk/.busybox-sum
+    ext_rebuild /work/br-disk
     make -C /work/br-disk -j"$JOBS"
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
@@ -86,6 +103,7 @@ if [[ $stage == all || $stage == rootfs ]]; then
   cp /guest/buildroot.defconfig /work/br/defconfig
   fresh_target /work/br buildroot.defconfig post-build.sh overlay br-external
   make -C /src/buildroot O=/work/br BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br/defconfig defconfig
+  ext_rebuild /work/br
   make -C /work/br -j"$JOBS"
   cp /work/br/images/rootfs.cpio /out/rootfs.cpio
 fi

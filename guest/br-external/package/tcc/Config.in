@@ -1,0 +1,13 @@
+config BR2_PACKAGE_TCC
+	bool "tcc"
+	depends on BR2_RISCV_32
+	depends on BR2_TOOLCHAIN_USES_MUSL
+	help
+	  TinyCC, a small C compiler, assembler and linker, with an
+	  rv32ima ilp32 soft-float back end (0001-*.patch). Installs it
+	  as /usr/bin/cc with what it needs to build programs on the
+	  target: the musl headers, crt1.o, a subset of the kernel
+	  UAPI headers (GPIO, I2C, SPI, input, ...) and the libgcc
+	  soft-float and long long helpers.
+
+	  https://repo.or.cz/tinycc.git

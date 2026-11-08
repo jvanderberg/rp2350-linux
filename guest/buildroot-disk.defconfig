@@ -44,3 +44,5 @@ BR2_PACKAGE_BC=y
 BR2_PACKAGE_NCDU=y
 BR2_PACKAGE_LSOF=y
 BR2_PACKAGE_LESS=y
+# C compiler (guest/br-external/package/tcc)
+BR2_PACKAGE_TCC=y

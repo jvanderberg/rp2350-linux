@@ -1,0 +1,37 @@
+From 52ef97cfbe9f4e8e462e6e96a358dc5318deb2ae Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 00:57:58 -0600
+Subject: [PATCH 3/7] riscv32: TOK_UMULL into new registers
+
+gen_opl's multiply operands are vpushv copies of words it uses again,
+so writing the product over the first one broke (int) * (long long).
+---
+ riscv32-gen.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/riscv32-gen.c b/riscv32-gen.c
+index ebe1eb46..0dc7d9a4 100644
+--- a/riscv32-gen.c
++++ b/riscv32-gen.c
+@@ -853,11 +853,15 @@ ST_FUNC void gen_opi(int op)
+     a = ireg(vtop[-1].r);
+     b = ireg(vtop[0].r);
+     if (op == TOK_UMULL) {
+-        /* 32x32 -> 64: low word into a's register, high word into a new one */
+-        int h = get_reg(RC_INT);
++        /* 32x32 -> 64 into two new registers: gen_opl's operands are
++           copies of values it uses again */
++        int l = get_reg(RC_INT), h;
++        vtop->r2 = l; /* l is taken while h is chosen */
++        h = get_reg(RC_INT);
+         ER(0x33, 3, ireg(h), a, b, 1); // mulhu h, a, b
+-        ER(0x33, 0, a, a, b, 1);       // mul a, a, b
++        ER(0x33, 0, ireg(l), a, b, 1); // mul l, a, b
+         vtop--;
++        vtop->r = l;
+         vtop->r2 = h;
+         return;
+     }
+-- 
+2.38.1
+
