@@ -171,9 +171,10 @@ device uses it, and so does swap.
 - **XIP cache.** Only the changed flash lines are invalidated, by address.
   The bootrom's `flash_flush_cache` would also discard guest RAM's dirty
   PSRAM lines, which share the 16 KB cache.
-- **Stalls.** The guest is paused while the flash is busy: about 0.7 ms per
-  page and 45 ms per sector (400 ms at most). Guest time doesn't advance
-  meanwhile, and USB is polled again as soon as the store returns.
+- **Stalls.** The guest is paused while the flash is busy, and guest time
+  doesn't advance meanwhile. Measured: at most 0.5 ms for a page and 47-51
+  ms for a sector erase (400 ms by the datasheet). USB isn't serviced during
+  a stall (the controller NAKs the host), and the console stays up.
 
 ### Wi-Fi (`rvemu-pico/src/wifi.rs`)
 
