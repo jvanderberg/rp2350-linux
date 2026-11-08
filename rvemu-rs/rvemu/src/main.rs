@@ -203,15 +203,24 @@ impl Bus for HostBus {
 
 // ------------------------------------------------------------------ setup
 
-fn make_dts(
+/// What the generated device tree describes; each optional device adds a node.
+#[derive(Clone, Copy)]
+struct DtsOpts<'a> {
     ram_base: u32,
     ram_size: u32,
-    bootargs: &str,
+    bootargs: &'a str,
+    /// [start, end) of the initramfs in guest physical memory
     initrd: Option<(u32, u32)>,
+    /// virtio-blk at VIRTIO_BASE
     disk: bool,
+    /// virtio-net at VIRTIO_NET_BASE
     net: bool,
+    /// NOR flash (`rvemu,flash`) at NOR_BASE
     nor: bool,
-) -> String {
+}
+
+fn make_dts(o: &DtsOpts) -> String {
+    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor } = *o;
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -557,15 +566,15 @@ fn run() -> Result<(), String> {
         }
         None => 0,
     };
-    let dts = make_dts(
+    let dts = make_dts(&DtsOpts {
         ram_base,
         ram_size,
-        &o.bootargs,
-        initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
-        o.disk.is_some(),
-        o.net,
-        o.nor.is_some(),
-    );
+        bootargs: &o.bootargs,
+        initrd: initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
+        disk: o.disk.is_some(),
+        net: o.net,
+        nor: o.nor.is_some(),
+    });
     if o.dump_dts {
         print!("{dts}");
         return Ok(());
