@@ -50,12 +50,11 @@ guest to `login:` in under a second.
 
 `-F`, `-W` and `-G` stand in for the board's flash, swap and pins, so the
 guest side of those features can be tried and tested without the board.
-These were run with the integrate/all guests (`-X 3063808` is the disk
-kernel's text, `-X 3182592` the `PINS=1` kernel's). The guest's own
+`-X 3063808` is the disk kernel's text and `-X 3182592` the `PINS=1`
+kernel's. The guest's own
 examples, on the board, are in the top-level README.
 
-Boot cost, batch to `login:` (77.3 M guest instructions with the static
-BusyBox; 109.5 M before it):
+Boot cost, batch to `login:` (77.3 M guest instructions):
 
 ```
 $ ./target/release/rvemu -k ../guest/out-disk/Image -d ../guest/out-disk/rootfs.squashfs \
@@ -271,11 +270,8 @@ counters.
   numbers use `RVEMU_CODE_KB=326 RVEMU_NJC=1024 RVEMU_REGIONS=8
   RVEMU_NBUCKETS=1024` with `-c`.
 
-With the disk guest, lockstep matches through boot to `login:` (2,517,290
-events). With rvemu-pico's table sizes, that boot takes 20.9 host
-instructions per guest instruction under `-icount`, and translation is 7.8 of
-them. (Both measured before the speed work; `RVEMU_CODE_KB=384` is
-feat/speed's cache, the board now has 326.)
+With the disk guest, lockstep matches every event through boot to
+`login:`.
 
 tcc's self-host stress test runs here too:
 `../guest/br-external/package/tcc/test/emu-selfhost.sh` boots the disk
@@ -285,8 +281,7 @@ its sources one file at a time, then builds itself again with the result,
 and the two binaries must be identical. With the sources and objects in
 `/tmp` taking about 2 MB of RAM, the first build stops at "memory full"
 after about 80 s, and the guest stays responsive while it runs (the
-longest 10 s monitor step was 15.9 s, against 198 s without tcc's memory
-check).
+longest 10 s monitor step is about 16 s).
 
 ## On the RP2350 (`rvemu-pico/`)
 
@@ -392,15 +387,14 @@ guest gives up 4 KiB of RAM plus the device's own kernel cost.
 - **Statistics.** The device's last page reads back as text: counters,
   erase/program/request times. `flashswap-stats` in the guest prints it.
 
-Measured on the board (W25Q128, 348 MHz; *feat/swap*, when it still had
-its own QMI routine):
+Measured on the board (W25Q128, 348 MHz):
 
 | | |
 |---|---|
-| 256-byte page program | 0.44 ms (max 0.46) |
-| 4 KB sector erase | 43-46 ms |
-| 4 KiB swap write, pre-erased sector | 7.1 ms average, 9.1 ms max: about 550 KB/s |
-| 4 KiB swap write with its erase | about 52 ms: about 80 KB/s |
+| 256-byte page program | 0.42 ms average, 0.56 ms max (5,826 programs) |
+| 4 KB sector erase | 44.6 ms average, 48.8 ms max (230 erases) |
+| 4 KiB swap write, pre-erased sector | about 7 ms: about 550 KB/s |
+| 4 KiB swap write with its erase | about 52 ms, 55.9 ms max: about 80 KB/s |
 | Reading back | 128 pages in 0.08 s |
 
 ### Pins (`rvemu-pico/src/pins.rs`)

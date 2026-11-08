@@ -54,10 +54,9 @@ iface eth0 inet manual
   up udhcpc -b -R -i eth0 -p /var/run/udhcpc.eth0.pid </dev/null >/dev/null 2>&1 &
   down kill $(cat /var/run/udhcpc.eth0.pid) 2>/dev/null; ip link set eth0 down
 N
-# boot: every init script is a fork+exec (~1 M guest instructions each
-# before BusyBox was linked statically). No syslogd/klogd (dmesg has the
-# kernel log), no crond, no seedrng (the device tree's rng-seed seeds the
-# CRNG), no modules.
+# boot: every init script is a fork+exec, so only the needed ones stay. No
+# syslogd/klogd (dmesg has the kernel log), no crond, no seedrng (the device
+# tree's rng-seed seeds the CRNG), no modules.
 rm -f "$T/etc/init.d/S01seedrng" "$T/etc/init.d/S01syslogd" "$T/etc/init.d/S02klogd" \
   "$T/etc/init.d/S11modules" "$T/etc/init.d/S50crond"
 # inittab: the four `ln -sf /proc/self/fd... /dev/...` sysinit lines become

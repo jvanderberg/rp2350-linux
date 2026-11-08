@@ -62,9 +62,9 @@ and the root filesystem.
   `/lib/devlinks` and copied by one inittab line.
 - **Init scripts:** only `S02sysctl`, `S02swap` (which does nothing without
   a swap device) and `S40network`. Every script and command at boot is a
-  fork+exec, so syslogd, klogd, crond, seedrng (the device tree's
-  `rng-seed` seeds the CRNG) and the modules script are removed. `dmesg`
-  has the kernel log.
+  fork+exec, so there is no syslogd, klogd, crond, seedrng (the device
+  tree's `rng-seed` seeds the CRNG) or modules script. `dmesg` has the
+  kernel log.
 - **Network:** `eth0` is virtio-net, bridged to the board's Wi-Fi radio.
   `/etc/network/interfaces` starts `udhcpc -b`
   in the background, so boot doesn't wait for a lease or the Wi-Fi join.
@@ -101,11 +101,11 @@ costs and examples are in the top-level README.
 - Without the device, overlay-init says "no flash storage; /home is in
   RAM" and `/home` is part of the overlay.
 
-Measured on the board *(feat/storage, on dev/base)*:
+Measured on the board:
 
 | | |
 |---|---|
-| Boot to `login:`, steady state | +0.3 s (26.95 s against 26.64 s then) |
+| Boot to `login:`, steady state | +0.3 s |
 | First boot on blank flash / on garbage (formats) | +1 s / +8.7 s, once |
 | Guest RAM (perf-gate `mem_adj_kb`) | 40 KiB |
 | Writing 256 KB in large writes / in 256-byte writes | about 260 KB/s / 13 KB/s |

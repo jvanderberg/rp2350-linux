@@ -1,8 +1,9 @@
 # rp2350-linux
 
-Linux 6.12 (rv32ima, Sv32 MMU) on an RP2350B board. The kernel runs in an
-emulated hart. The emulator runs on one of the chip's own Hazard3 RISC-V
-cores, and the other core does the console and network I/O. The guest gets
+Linux 6.12 (rv32ima, Sv32 MMU) on an RP2350B board. The RP2350's Hazard3
+RISC-V cores have no MMU, so they can't run Linux themselves: one of them
+runs an emulated RISC-V CPU that has one, and the kernel runs on that. The
+other core does the console and network I/O. The guest gets
 the board's 8 MB PSRAM as RAM, plus its kernel text read in place from
 flash. Its root filesystem is a squashfs in flash, and `/home` is a jffs2
 filesystem in flash. Its console is the board's USB serial port, and its
@@ -25,17 +26,13 @@ Boot to `login:` takes 10.9 s on the board.
 | Feature | On by default? | Turn it on / use it | Main cost | Section |
 |---|---|---|---|---|
 | Fast boot: static BusyBox, short init, DHCP in the background, TRNG seed, translator speedups | yes | nothing to do | +128 KiB of flash | [Boot time](#boot-time) |
-| I/O on core1: USB console, Wi-Fi radio, the radio side of virtio-net | yes | nothing to do | 54 KiB less code cache, so about 1.5 s more on a cold `md5sum` pass | [Two cores](#two-cores-io-on-core1) |
+| I/O on core1: USB console, Wi-Fi radio, the radio side of virtio-net | yes | nothing to do | 58 KiB of SRAM the code cache could otherwise use (about 1.5 s on a cold `md5sum` pass) | [Two cores](#two-cores-io-on-core1) |
 | `/home` (and `/root`) on flash, jffs2, 1 MB | yes | nothing to do | 40 KiB of guest RAM | [/home on flash](#home-on-flash) |
 | C compiler: TinyCC as `cc` | yes (disk guest) | `cc hello.c`, `tcc -run`, `tcc -ar` | 704 KiB of squashfs | [C compiler](#c-compiler) |
 | Swap on flash, 1788 KiB | no | `scripts/pico-shell.sh -w` | about 32 KiB of guest RAM and 0.5 s of boot | [Swap](#swap-on-flash) |
 | Pins: GPIO, I2C, SPI, PWM, ADC | no | `PINS=1 guest/run-build.sh disk` | +112 KiB of kernel text, about 72 KiB of RAM, file reads 5-10% slower | [Pins](#pins) |
 
-Board numbers are at 348 MHz. Unless marked otherwise, they come from the
-integration gate on integrate/all 5a38822 or from the feature's own
-board tests. Numbers marked *(feature branch)* were measured on that
-feature's branch before the merge, and may differ a little on the merged
-build. Every example below was run on the board: lines starting with `#`
+All numbers are measured on the board at 348 MHz. Every example below was run on the board: lines starting with `#`
 are in the board's shell, lines starting with `$` on the Mac it is plugged
 into.
 
@@ -132,44 +129,44 @@ console port, or failing that over SWD. It refuses while another program
 
 ## Boot time
 
-The disk guest boots to `login:` in **10.9 s** on the board (10.90 s and
-10.84 s in the two integration gates), against 26.6 s before. Nothing needs
-turning on. What changed:
+The disk guest boots to `login:` in about **10.9 s**. Nothing needs
+turning on. What keeps it short:
 
 - **Static BusyBox** (`guest/busybox-disk.fragment`). Every init script and
   every shell command is a fork+exec, and a static BusyBox skips musl's
   dynamic loader each time (about 0.4 M guest instructions per exec).
-  The other programs still link against the shared musl.
-- **Short init.** syslogd, klogd, crond, seedrng and the modules script are
-  gone (`dmesg` has the kernel log), and the four `/dev/fd` and `/dev/std*`
-  symlink commands in inittab are one `cp -a`.
-- **DHCP in the background.** `eth0` runs `udhcpc -b`, so boot no longer
-  waits up to about 6 s for the Wi-Fi join and the lease.
+  The other programs link against the shared musl.
+- **Short init.** The only init scripts are `S02sysctl`, `S02swap` and
+  `S40network`. There is no syslogd, klogd, crond, seedrng or modules
+  script (`dmesg` has the kernel log), and the `/dev/fd` and `/dev/std*`
+  symlinks are one `cp -a` in inittab.
+- **DHCP in the background.** `eth0` runs `udhcpc -b`, so boot doesn't
+  wait for the Wi-Fi join or the lease.
 - **rng-seed.** The device tree's `/chosen` carries 32 bytes of `rng-seed`,
-  so the kernel's CRNG is ready at once. `rvemu-pico-shell` fills them from
-  the RP2350's TRNG before the guest starts.
-- **Translator.** LR/SC, `sstatus` writes and TLB refills now stay in
+  which `rvemu-pico-shell` fills from the RP2350's TRNG before the guest
+  starts, so the kernel's CRNG is ready at once.
+- **Translator.** LR/SC, `sstatus` writes and TLB refills stay in
   translated code, block descriptors live in the code buffer, and a
   jump-cache miss walks the hash chain itself
   ([rvemu-rs/README.md](rvemu-rs/README.md#translator-rvjit)).
 
-Integration gate against the dev/base baseline:
+What the performance gate measures:
 
-| | dev/base | integrate/all |
-|---|---|---|
-| Boot to `login:`, disk guest | 26.64 s | 10.90 s |
-| Benchmark boot, initramfs guest (`initramfs_ms`) | 8.31 s | 5.24 s |
-| 200 fork+exec of `/bin/true` | 39.7 s | 18.2 s |
-| MicroPython loop | 4.23 s | 2.96 s |
-| md5sum of 58 files, cold / warm | 16.8 / 20.3 s | 15.1 / 14.3 s |
-| MemAvailable + per-CPU lists (`mem_adj_kb`) | 3,808 KiB | 4,004 KiB |
+| | |
+|---|---|
+| Boot to `login:`, disk guest | 10.9 s |
+| Benchmark boot, initramfs guest | 5.2 s |
+| First runs of htop, tmux, MicroPython, Lua and nano | 6.6 s |
+| 200 fork+exec of `/bin/true` | 18.2 s |
+| MicroPython, sum of 30,000 squares | 2.96 s |
+| md5sum of 58 files, cold / warm | 15.1 / 14.3 s |
+| MemAvailable after boot | about 4,000 KiB |
 
-**Costs and limits.** Flash +128 KiB for the static BusyBox. The first run
-of a dynamic program after boot (`htop`, `lua`, ...) now pays for paging
-in libc, which boot used to do: about +0.9 s over five programs
-*(feature branch)*.
+**Costs and limits.** The static BusyBox takes 128 KiB more flash than a
+shared one. Boot doesn't touch libc, so the first dynamic program after
+boot pages it in.
 
-**Example:** boot, and what it no longer waits for.
+**Example:** boot.
 
 ```
 $ scripts/pico-shell.sh
@@ -197,14 +194,15 @@ On the board:
 |---|---|
 | Typed-key echo, round trip | median 1.23 ms (min 1.08, max 5.72, n = 40) |
 | `ping` to the Wi-Fi gateway | avg 1.05 ms (0.92-1.31), 0% loss |
-| Console output (`seq`) | 7.3 KiB/s, exact *(feature branch)* |
+| Console output (`seq`) | 7.3 KiB/s, exact |
 | `wget` 1 MiB from a server on the LAN | 0.99 s, md5 correct |
 
 **Costs and limits.**
 - SRAM: core1's code (about 56 KB, in `.core1_text`), its 7 KiB service
   slot, 5 KiB stack and 16 KiB console ring come out of the translator's
-  code cache: `CODE_KIB` is 326 KiB, against 384 KiB with all the I/O on
-  core0. That costs about 1.5 s on a cold `md5sum` pass.
+  SRAM the translator's code cache would otherwise have: the cache is
+  326 KiB (`CODE_KIB`). 58 KiB more cache would make a cold `md5sum` pass
+  about 1.5 s faster.
 - Everything core1 runs must be in SRAM, because both cores share the QMI
   and the XIP cache with guest RAM (see the rvemu-rs README for how that's
   checked).
@@ -239,14 +237,14 @@ else outside `/home` is a tmpfs overlay and is gone at reboot.
 - **Always on.** A blank region formats itself on the first boot. If the
   region holds something that isn't jffs2, `overlay-init` formats it.
 - **Power cuts.** jffs2 checksums every node, so a cut loses at most the
-  write in flight. Tested *(feature branch)* with an SWD reset in the middle
-  of a write and delete burst: a clean mount, the old files intact, the
-  burst's files present up to the reset.
+  write in flight. A reset in the middle of a burst of writes and deletes
+  leaves a clean mount, the older files intact and the burst's files
+  present up to the reset.
 - **Counters:** `/sys/bus/platform/devices/f8000400.flash/stats` reads
   erases, erases skipped (already blank), pages programmed, the longest
   stall (us) and the total stall (ms).
 
-**Costs and limits** *(feature branch, on dev/base)*:
+**Costs and limits:**
 
 | | |
 |---|---|
@@ -350,7 +348,7 @@ timings.
 
 Workload: tmux with four panes and htop; Lua holding a 1.7 MB table
 (idle); MicroPython building a 15,000-string list and a 5,000-entry dict
-in a 1 MB heap; then a Lua loop. On the board *(feature branch)*:
+in a 1 MB heap; then a Lua loop:
 
 | Swap | Finishes | Wall time | Echo latency p50 / p95 / max |
 |---|---|---|---|
@@ -371,9 +369,8 @@ in a 1 MB heap; then a Lua loop. On the board *(feature branch)*:
 
 **Costs and limits.**
 - About 32 KiB of guest RAM with `-w` (the device's slab and virtqueue,
-  plus the reserved page that holds the swap map), and more boot for mkswap
-  and swapon: 11.46 s against 10.91 s in one session on the merged build
-  (1.8 s on the feature branch). That's why it's opt-in.
+  plus the reserved page that holds the swap map), and about 0.5 s of boot
+  for mkswap and swapon. That's why it's opt-in.
 - Wear levelling is in RAM only (a random start each boot, no erase
   counts kept), and Linux sends no discards, so freed slots are found only
   when they are overwritten.
@@ -453,7 +450,7 @@ to the guest; `gpioinfo` names every line. The pins build has:
 **Costs and limits.**
 - The `PINS=1` guest: kernel text +112 KiB (read from flash on the
   board), rootfs +256 KiB, about 72 KiB of guest RAM, and md5sum over the
-  fixed file list 5% slower cold and 9.5% warm *(feature branch)*. The
+  fixed file list 5% slower cold and 9.5% warm. The
   default guest pays none of it.
 - The firmware, in either mode: +22 KB of flash and +1.2 KB of SRAM.
 - I2C runs at 100 kHz only. A stuck bus fails the transfer with
@@ -585,8 +582,8 @@ runs:
 4. MemAvailable plus the pages on the per-CPU free lists (`mem_adj_kb`;
    the lists alone swing MemAvailable by hundreds of KiB between boots);
 5. md5sum of a fixed list of files (`~/.cache/rp2350-board/md5-files.list`,
-   dev/base's 58), cold and warm, so a branch that adds files doesn't read
-   as slower I/O; then of every file under `/usr /lib /bin /sbin`. All must
+   58 files), cold and warm, so adding files to the image doesn't read as
+   slower I/O; then of every file under `/usr /lib /bin /sbin`. All must
    match the squashfs image's own checksums: one flipped bit fails the gate.
 
 ```sh
@@ -599,8 +596,7 @@ compared with `perf-baseline.json` there. A slowdown fails only past both a
 percentage (3% for boot, 5% for the workload) and the run-to-run noise
 measured on unchanged code (0.3 s; fork+exec 0.5 s; md5 0.8 / 1.5 s). So do
 128 KiB less memory and any checksum mismatch. `-B` skips the benchmark
-boot; `-s` makes the run the baseline (the integrator does that, nobody
-else). One gate takes about 4 minutes.
+boot; `-s` makes the run the new baseline. One gate takes about 4 minutes.
 
 ## Results (on the board, 348 MHz)
 
