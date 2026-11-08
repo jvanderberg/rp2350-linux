@@ -129,7 +129,8 @@ tcc: memory full (508 kB left for the system)
 
 `scripts/compare.sh [Image] [initrd]` boots the C reference (`../rvemu`) and
 this emulator on the same guest, and requires identical console output and
-counters.
+counters (after subtracting the Rust host's one setup TLB flush). Both runs
+receive the same generated device tree, including the fixed entropy seed.
 
 ## Machine
 
@@ -528,6 +529,11 @@ Mac for the reference, and compares every board run.
 | RP2350 lockstep | 56c7e73f | 9,540,070 | 2,477 events matched |
 
 ## Scripts
+
+From the repository root, `scripts/check.sh host|qemu|board` runs the
+corresponding verification tier and retains logs and provenance. See the
+[development guide](../docs/development.md) for prerequisites, coverage and
+the board tier's flashing/reboot behavior.
 
 | Script | |
 |---|---|

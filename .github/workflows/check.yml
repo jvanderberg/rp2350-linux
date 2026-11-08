@@ -1,0 +1,77 @@
+name: Verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      guest:
+        description: Build the initramfs guest and run QEMU checks
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup show
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rvemu-rs/target
+          key: host-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - run: scripts/check.sh host --artifacts target/ci-host
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: host-${{ runner.os }}
+          path: target/ci-host
+  guest-qemu:
+    if: github.event_name == 'workflow_dispatch' && inputs.guest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler qemu-system-misc
+          rustup show
+          rustup target add riscv32imac-unknown-none-elf
+      # Cache only downloads, never opaque build trees or guest binaries.
+      - uses: actions/cache@v4
+        with:
+          path: .cache/buildroot-dl
+          key: guest-dl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('guest/**') }}
+          restore-keys: guest-dl-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore source downloads
+        run: |
+          mkdir -p .cache/buildroot-dl
+          docker volume create rvemu-guest-work
+          docker run --rm -v "$PWD/.cache/buildroot-dl:/cache:ro" -v rvemu-guest-work:/work debian:bookworm sh -c 'mkdir -p /work/dl && cp -a /cache/. /work/dl/ && chown -R 1000:1000 /work/dl'
+      - name: Build initramfs guest
+        run: cd guest && ./run-build.sh all
+      - name: Compare and run QEMU
+        run: scripts/check.sh qemu --artifacts target/ci-qemu
+      - name: Save source downloads
+        if: always()
+        run: |
+          docker run --rm -v "$PWD/.cache/buildroot-dl:/cache" -v rvemu-guest-work:/work:ro debian:bookworm sh -c 'cp -a /work/dl/. /cache/'
+          sudo chown -R "$(id -u):$(id -g)" .cache/buildroot-dl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guest-qemu
+          path: |
+            target/ci-qemu
+            guest/build-all.log
+            guest/out

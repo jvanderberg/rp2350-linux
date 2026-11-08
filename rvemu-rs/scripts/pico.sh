@@ -6,14 +6,18 @@
 #   scripts/pico.sh [TIMEOUT_S]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-BIN=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin
+BIN=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
+. ../scripts/preflight.sh
+need_file "$BIN/llvm-objcopy" 'Run: rustup component add llvm-tools-preview'
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
-(cd jittest-guest && cargo build -q --release)
+(cd jittest-guest && cargo build --locked -q --release)
 "$BIN/llvm-objcopy" -O binary jittest-guest/target/riscv32im-unknown-none-elf/release/jittest-guest jittest-guest/jittest.bin
-cargo build -q --release -p rvemu
+# Capture the exact generated input before either reference or board execution.
+[ -z "${JITTEST_CAPTURE:-}" ] || cp jittest-guest/jittest.bin "$JITTEST_CAPTURE"
+cargo build --locked -q --release -p rvemu
 ./target/release/rvemu -k jittest-guest/jittest.bin -m 4 -B > "$T/mac.out" 2>&1
-cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
+cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 ../rp2350/tools/run-riscv.sh target/riscv32imac-unknown-none-elf/release/rvemu-pico "${1:-180}" | tee "$T/board.out"
 
 pick() { grep -aE '^(jittest|uart:|SELFCHECK|PANIC|unexpected|[a-z]+ +[0-9a-f]{8} )' | tr -d '\r'; }

@@ -3,19 +3,20 @@
 The C reference interpreter: RV32IMA + Sv32, boots MMU Linux on the Mac.
 `../rvemu-rs` is the emulator in use (Rust, Mac + QEMU + RP2350, with the
 translator). `../rvemu-rs/scripts/compare.sh` requires this one and the Rust
-interpreter to produce identical console output and counters on a full boot.
+interpreter to produce identical console output and counters on a full boot,
+using a shared device tree and subtracting the Rust host's one setup TLB flush.
 
 ## Build and run
 
     make
-    make run      # interactive boot of semu's prebuilt kernel + rootfs (Ctrl-A x quits)
+    make run      # interactive boot of guest/out (Ctrl-A x quits)
     make bench    # deterministic boot-to-login with the RP2350 timing model
 
 Options: `./rvemu -h`. `-m` sets the guest RAM size and the emulator generates
 a matching device tree (`-D` prints it), so a different kernel/rootfs is a
 drop-in: `./rvemu -k ../guest/out/Image -i ../guest/out/rootfs.cpio -m 8`.
-`make run` / `make bench` use semu's prebuilt guest from its release page, in
-`../ref/prebuilt` (not in the repository).
+`make run` / `make bench` use `../guest/out`; build it with
+`(cd ../guest && ./run-build.sh all)`. Override with `make run GUEST=/path/to/guest`.
 
 ## Design
 

@@ -15,14 +15,14 @@ ELF=target/riscv32imac-unknown-none-elf/release/rvemu-pico-linux
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 . scripts/pico-common.sh
 
-cargo build -q --release -p rvemu
+cargo build --locked -q --release -p rvemu
 ./target/release/rvemu -k "$K" -i "$I" -m "$M" -X "$(text_len "$K")" -u "$U" -B > "$T/mac.out" 2> "$T/mac.err"
 python3 ../rp2350/tools/fnv.py "$T/mac.out" "$T/mac.err" > "$T/mac.ref"
 read -r REF_N REF_H < "$T/mac.ref"
 echo "pico-linux.sh: Mac reference: $REF_N guest insns, console hash $REF_H"
 
 pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
-cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
+cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 ensure_bootsel "$ELF"
 load_text "$T/text.bin"
 load_blob "$T/blob.bin"
