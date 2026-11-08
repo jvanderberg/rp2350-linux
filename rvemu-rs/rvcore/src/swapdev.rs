@@ -13,7 +13,9 @@
 //! - **Static wear levelling.** A page that stays in swap pins its sector,
 //!   and writes would wear only the rest. So every `MOVE_EVERY`th write also
 //!   moves the live page nearest ahead of the head to a fresh sector: every
-//!   sector keeps taking its turn, for 1/`MOVE_EVERY` more writes.
+//!   sector keeps taking its turn, for 1/`MOVE_EVERY` more writes. A move
+//!   only uses an already erased sector, so it never adds an erase to a
+//!   request (it waits for the next write instead).
 //! - **Nothing persists.** Swap is empty at every boot, so the map lives in
 //!   host RAM only and there is no on-flash metadata to keep consistent.
 //!   Sectors are of unknown state at boot: blank ones are found by reading.
@@ -310,14 +312,20 @@ impl<F: Flash> FlashSwap<F> {
         ok
     }
 
-    /// Move the live page nearest ahead of the head to a fresh sector.
-    fn move_one(&mut self) {
+    /// Move the live page nearest ahead of the head to a fresh sector, if
+    /// one is erased already: a move never waits for an erase, so it can't
+    /// add one to a request's stall. Returns whether it moved.
+    fn move_one(&mut self) -> bool {
         let n = self.nsect;
+        if !self.state[..n as usize].contains(&ERASED) {
+            return false;
+        }
         let live = (0..n).map(|i| (self.head + i) % n).find(|&s| self.state[s as usize] < UNKNOWN);
         if let Some(s) = live {
             let lp = u32::from(self.state[s as usize]);
             self.write_page(lp, &|_| None);
         }
+        true
     }
 
     /// The statistics page, as text.
@@ -442,9 +450,9 @@ impl<F: Flash> crate::virtio::Disk for FlashSwap<F> {
             };
             ok &= self.write_page(lp as u32, &new);
             self.since_move += 1;
-            if self.since_move >= MOVE_EVERY {
+            // else it's tried again on the next write
+            if self.since_move >= MOVE_EVERY && self.move_one() {
                 self.since_move = 0;
-                self.move_one();
             }
             lp += 1;
         }
