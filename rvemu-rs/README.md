@@ -98,7 +98,10 @@ counters.
   off. LR/SC, CSRs, ecall, sret and wfi go to the interpreter.
 - **Linking.** Blocks are keyed by (virtual pc, physical pc) and never cross a
   page. Same-page exits are chained by patching a `jal`. Other jumps use an
-  inline jump cache, validated against the fetch TLB.
+  inline jump cache, validated against the fetch TLB. On a jump-cache miss
+  the same routine walks the target's hash chain in the code buffer and
+  refills the entry, so only untranslated targets go back to the
+  dispatcher.
 - **Code cache.** Each block's descriptor (hash-chain link, physical and
   virtual pc) is a header in front of its code, so the code buffer is the
   only limit on how many blocks are live. When the buffer is full it is

@@ -140,6 +140,14 @@ impl<'a> Asm<'a> {
         self.emit(r_type(0x33, rd, 0, rs1, rs2, 0x20));
     }
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn xor(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 4, rs1, rs2, 0));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn mul(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 0, rs1, rs2, 1));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn lui(&mut self, rd: Reg, imm: u32) {
         self.emit((imm & 0xFFFF_F000) | (rd << 7) | 0x37);
     }

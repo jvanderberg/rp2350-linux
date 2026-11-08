@@ -92,6 +92,7 @@ const HDR_NEXT: usize = 0;
 const HDR_PA: usize = 1;
 const HDR_VA: usize = 2;
 const ENTRY_OFF: usize = 4;
+const HASH_MUL: u32 = 0x9E37_79B1;
 
 pub const MAX_BLOCK: usize = 32;
 /// Most code-buffer regions (`JitMem::regions`).
@@ -402,6 +403,8 @@ pub struct Jit<'m> {
     enter: usize,
     buckets: &'m mut [u32],
     bucket_shift: u32,
+    /// host address - guest physical address in guest RAM
+    ram_off: u32,
     code_pages: &'m mut [u8],
     ring: Ring<'m>,
     store: Store<'m>,
@@ -509,6 +512,7 @@ impl<'m> Jit<'m> {
             enter: 0,
             buckets: mem.buckets,
             bucket_shift,
+            ram_off: (cpu.ram_ptr() as usize as u32).wrapping_sub(cpu.ram_base()),
             code_pages: mem.code_pages,
             ring: Ring {
                 regions: mem.regions,
@@ -614,7 +618,9 @@ impl<'m> Jit<'m> {
         r.ijmp_imm = a.pos();
         a.lw(K0, K1, 0);
         // falls through into ijmp: indirect jump to guest K0 via the
-        // fetch-TLB check and the jump cache
+        // fetch-TLB check and the jump cache, and on a jump-cache miss the
+        // block's hash chain (refilling the jump cache), before giving up
+        // to the dispatcher
         r.ijmp = a.pos();
         a.srli(K1, K0, 9);
         a.andi(K1, K1, 0x7F8);
@@ -636,10 +642,59 @@ impl<'m> Jit<'m> {
         let miss3 = a.branch_fwd(1, K2, K3); // same mapping
         a.lw(K2, K1, 8);
         a.jalr(ZERO, K2, 0);
+        // jump-cache miss: K0 = va, K3 = addend. K3 = pa - va from here on.
+        let walk = a.pos();
+        a.fix(miss2, walk);
+        a.fix(miss3, walk);
+        a.li(K1, self.ram_off);
+        a.sub(K3, K3, K1);
+        a.add(K1, K0, K3); // pa
+        a.srli(K1, K1, 12);
+        a.srli(K2, K0, 2);
+        a.xor(K1, K1, K2);
+        a.li(K2, HASH_MUL);
+        a.mul(K1, K1, K2);
+        a.srli(K1, K1, self.bucket_shift);
+        a.slli(K1, K1, 2);
+        a.li(K2, self.buckets.as_ptr() as usize as u32);
+        a.add(K1, K1, K2);
+        a.lw(K2, K1, 0); // first header (word index) or EMPTY
+        let lp = a.pos();
+        a.addi(K1, K2, 1);
+        let end = a.branch_fwd(0, K1, ZERO); // EMPTY
+        a.slli(K2, K2, 2);
+        a.li(K1, self.code_base as u32);
+        a.add(K2, K2, K1); // header address
+        a.lw(K1, K2, (4 * HDR_VA) as i32);
+        let nx1 = a.branch_fwd(1, K1, K0);
+        a.lw(K1, K2, (4 * HDR_PA) as i32);
+        a.sub(K1, K1, K0);
+        let nx2 = a.branch_fwd(1, K1, K3);
+        // found: fill the jump-cache entry and go
+        a.addi(K2, K2, (4 * ENTRY_OFF) as i32);
+        a.li(K1, self.ram_off);
+        a.add(K3, K3, K1); // the addend again
+        a.srli(K1, K0, 2);
+        a.slli(K1, K1, 32 - jc_bits);
+        a.srli(K1, K1, 32 - jc_bits - 4);
+        // (exit_info is free until the exit routine writes it)
+        a.sw(K3, S, OFF_EXIT_INFO);
+        a.lw(K3, S, OFF_JC);
+        a.add(K1, K1, K3);
+        a.lw(K3, S, OFF_EXIT_INFO);
+        a.sw(K0, K1, 0);
+        a.sw(K3, K1, 4);
+        a.sw(K2, K1, 8);
+        a.jalr(ZERO, K2, 0);
+        let next = a.pos();
+        a.fix(nx1, next);
+        a.fix(nx2, next);
+        a.lw(K2, K2, (4 * HDR_NEXT) as i32);
+        let back = a.jump_fwd();
+        a.fix(back, lp);
         let miss = a.pos();
         a.fix(miss1, miss);
-        a.fix(miss2, miss);
-        a.fix(miss3, miss);
+        a.fix(end, miss);
         a.addi(K1, ZERO, EXIT_JUMP as i32);
         jump!(r.exit);
 
@@ -790,7 +845,8 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn hash(&self, va: u32, pa: u32) -> usize {
-        ((va ^ pa.rotate_left(16)) >> 2).wrapping_mul(0x9E37_79B1) as usize >> self.bucket_shift
+        // (the ijmp routine computes the same in host code)
+        ((va >> 2) ^ (pa >> 12)).wrapping_mul(HASH_MUL) as usize >> self.bucket_shift
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
