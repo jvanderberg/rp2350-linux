@@ -23,7 +23,7 @@
 
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use panic_rtt_target as _;
 use rp2350_board as board;
@@ -48,8 +48,6 @@ mod usbcon;
 use usbcon::{CON_IN, CON_OUT};
 #[path = "../wifi.rs"]
 mod wifi;
-#[path = "../prefetch.rs"]
-mod prefetch;
 use wifi::{Creds, RadioPins};
 
 #[unsafe(link_section = ".start_block")]
@@ -144,9 +142,7 @@ fn patch_rng_seed(dtb: &mut [u8], seed: &[u8; 32]) -> bool {
 /// Translated code and its block headers: what SRAM has left once core1's
 /// code and buffers (`core1.rs`) and core0's stack (9 KB deep after a gate
 /// run; 12 KiB here) have theirs.
-const CODE_KIB: usize = 330 - PREFETCH_KIB;
-/// core1's prefetch tables and store, and its code.
-const PREFETCH_KIB: usize = prefetch::SRAM_WORDS / 256 + 5;
+const CODE_KIB: usize = 330;
 const CODE_WORDS: usize = CODE_KIB * 256;
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
@@ -163,7 +159,6 @@ static mut JUMP_CACHE: [JcEntry; NJC] = [JcEntry::EMPTY; NJC];
 static mut CHAIN_LOG: [u32; REGIONS * 128] = [0; REGIONS * 128];
 static mut STORE_EPOCHS: [u8; (GUEST_MAX >> 12) as usize] = [0; (GUEST_MAX >> 12) as usize];
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
-static mut PREFETCH: MaybeUninit<prefetch::Client> = MaybeUninit::uninit();
 static mut USB_BUS: MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> = MaybeUninit::uninit();
 
 /// How long the radio may take to come up (and the guest wait for its MAC).
@@ -321,16 +316,14 @@ struct Io<F> {
     console: usbcon::UsbConsole,
     radio: wifi::RadioService<F>,
     status: Status,
-    prefetch: prefetch::Prefetcher,
 }
 
 impl<F: core::future::Future<Output = ()>> core1::Service for Io<F> {
     #[unsafe(link_section = ".data.core1")]
-    fn poll(&mut self) -> bool {
+    fn poll(&mut self) {
         self.console.poll();
         self.radio.poll();
         self.status.poll();
-        self.prefetch.poll()
     }
 }
 
@@ -367,14 +360,6 @@ impl Status {
             hi - lo,
             core1::stack_used(),
             core1::STACK_BYTES
-        );
-        let n = |c: &AtomicU32| c.load(Ordering::Relaxed);
-        rprintln!(
-            "[core1] prefetch: requests {} translated {} taken {} lost {}",
-            n(&prefetch::REQUESTS),
-            n(&prefetch::TRANSLATED),
-            n(&prefetch::TAKEN),
-            n(&prefetch::LOST)
         );
     }
 }
@@ -482,7 +467,6 @@ fn main() -> ! {
             RADIO_BRING_UP_MS,
         ),
         status: Status { next: 0, period: u64::from(sys_hz) * u64::from(STATUS_S) },
-        prefetch: prefetch::Prefetcher::new(),
     });
     // Self-test of what flash writes use.
     let t0 = board::mcycle64();
@@ -538,8 +522,6 @@ fn main() -> ! {
     };
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
-    // SAFETY: PREFETCH is used only from here on, by the translator.
-    jit.set_prefetch(unsafe { (*addr_of_mut!(PREFETCH)).write(prefetch::Client::new(jit.block_gen(cpu))) });
     rprintln!(
         "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB; console on USB",
         h.ram_size >> 10,

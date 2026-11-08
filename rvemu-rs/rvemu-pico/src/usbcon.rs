@@ -46,7 +46,7 @@ impl UsbConsole {
 }
 
 impl core1::Service for UsbConsole {
-    fn poll(&mut self) -> bool {
+    fn poll(&mut self) {
         let now = core1::now();
         self.usb.poll(&mut [&mut self.serial]);
         if CON_IN.free() >= 64 {
@@ -86,6 +86,5 @@ impl core1::Service for UsbConsole {
                 CON_OUT.consume(len - (CON_OUT_LEN - KEEP_FREE));
             }
         }
-        false
     }
 }
