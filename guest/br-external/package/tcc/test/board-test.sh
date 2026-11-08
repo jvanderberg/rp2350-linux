@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # board-test.sh [selfhost]: copy these tests to the board's /tmp/tcc-test over
-# the console (push.py) and run them there
-# with run.sh. "selfhost" also copies tcc's source from the disk guest's
-# Buildroot build (Docker volume rvemu-guest-work) and has tcc build itself.
+# the console (push.py) and run them there with run.sh, for at most
+# TCC_TEST_MAX_S seconds (600). "selfhost" also copies tcc's source from the
+# disk guest's Buildroot build (Docker volume rvemu-guest-work) and has tcc
+# build itself.
 # Needs the board lock: rp2350/tools/board-lock run NAME -- ./board-test.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -24,6 +25,20 @@ start=$(date +%s)
 ./push.py "$W/t.tgz" /tmp/t.tgz
 "$CMD" -- 'cd /tmp && gunzip -c t.tgz | tar xf - && rm t.tgz && ls tcc-test | wc -l'
 echo "board-test: copied in $(($(date +%s) - start)) s"
+# run.sh runs as a background job of the console's (interactive) shell, so in
+# its own process group, into /tmp/tcc-test/log, which is polled: its output
+# comes back even when the deadline stops it
 start=$(date +%s)
-"$CMD" --timeout 1800 -- "sh /tmp/tcc-test/run.sh ${1:-}"
+deadline=$((start + ${TCC_TEST_MAX_S:-600}))
+"$CMD" -- "cd /tmp/tcc-test && { sh run.sh ${1:-} > log 2>&1 < /dev/null & echo \$! > pid; }"
+until "$CMD" -- 'grep -q "^tcc tests:" /tmp/tcc-test/log' > /dev/null; do
+	if (($(date +%s) >= deadline)); then
+		echo "board-test: deadline reached, stopping run.sh"
+		"$CMD" -- "kill -9 -\$(cat /tmp/tcc-test/pid); true" > /dev/null
+		break
+	fi
+	sleep 15
+done
+"$CMD" -- 'cat /tmp/tcc-test/log'
 echo "board-test: ran in $(($(date +%s) - start)) s (wall, from the Mac)"
+"$CMD" -- 'grep -q "^tcc tests: .* 0 failed" /tmp/tcc-test/log'
