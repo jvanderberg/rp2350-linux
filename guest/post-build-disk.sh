@@ -29,3 +29,30 @@ iface eth0 inet dhcp
 N
 # UTF-8 for tmux and friends (musl has C.UTF-8 built in)
 grep -q LANG "$T/etc/profile" || echo 'export LANG=C.UTF-8' >> "$T/etc/profile"
+# swap on the board's flash, when the firmware offers it (pico-shell.sh -w):
+# the virtio disk whose serial is rvemu-flash-swap; its last page is the
+# device's statistics, not swap
+cat > "$T/etc/init.d/S02swap" <<'S'
+#!/bin/sh
+case "$1" in
+start)
+  for d in /sys/block/vd*; do
+    [ "$(cat "$d/serial" 2>/dev/null)" = rvemu-flash-swap ] || continue
+    mkswap "/dev/${d##*/}" $(( $(cat "$d/size") / 2 - 4 )) >/dev/null && swapon "/dev/${d##*/}"
+  done
+  ;;
+stop)
+  swapoff -a
+  ;;
+esac
+S
+chmod 755 "$T/etc/init.d/S02swap"
+# the flash swap device's counters and flash timings (its last page)
+cat > "$T/usr/bin/flashswap-stats" <<'S'
+#!/bin/sh
+for d in /sys/block/vd*; do
+  [ "$(cat "$d/serial" 2>/dev/null)" = rvemu-flash-swap ] || continue
+  dd if="/dev/${d##*/}" bs=4096 skip=$(( $(cat "$d/size") / 8 - 1 )) count=1 iflag=direct 2>/dev/null | tr -d '\0'
+done
+S
+chmod 755 "$T/usr/bin/flashswap-stats"

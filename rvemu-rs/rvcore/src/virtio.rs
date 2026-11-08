@@ -72,6 +72,10 @@ pub trait Disk {
     fn block_size(&self) -> u32 {
         512
     }
+    /// The device ID (`/sys/block/vdX/serial` in the guest), NUL padded.
+    fn id(&self) -> [u8; 20] {
+        *b"rvemu-disk\0\0\0\0\0\0\0\0\0\0"
+    }
     /// Fill `buf` from byte offset `sector * 512`; false on error.
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> bool;
     fn write(&mut self, _sector: u64, _buf: &[u8]) -> bool {
@@ -88,6 +92,9 @@ impl<D: Disk + ?Sized> Disk for &mut D {
     }
     fn block_size(&self) -> u32 {
         (**self).block_size()
+    }
+    fn id(&self) -> [u8; 20] {
+        (**self).id()
     }
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> bool {
         (**self).read(sector, buf)
@@ -578,7 +585,7 @@ impl<D: Disk> VirtioBlk<D> {
             }
             BLK_T_FLUSH => BLK_S_OK,
             BLK_T_GET_ID => {
-                let id = b"rvemu-disk\0\0\0\0\0\0\0\0\0\0";
+                let id = self.disk.id();
                 match data.first() {
                     Some(d) if d.flags & DESC_F_WRITE != 0 => {
                         let len = (d.len as usize).min(id.len());

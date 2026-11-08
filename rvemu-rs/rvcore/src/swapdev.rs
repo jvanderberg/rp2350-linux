@@ -8,8 +8,12 @@
 //! synchronously only when no erased sector is left.
 //!
 //! - **Placement.** Writes take the next erased sector after a moving head,
-//!   so erases rotate through the whole region (wear levelling). The host
-//!   starts the head somewhere different on every boot (`set_head`).
+//!   so erases rotate through the region (wear levelling). The host starts
+//!   the head somewhere different on every boot (`set_head`).
+//! - **Static wear levelling.** A page that stays in swap pins its sector,
+//!   and writes would wear only the rest. So every `MOVE_EVERY`th write also
+//!   moves the live page nearest ahead of the head to a fresh sector: every
+//!   sector keeps taking its turn, for 1/`MOVE_EVERY` more writes.
 //! - **Nothing persists.** Swap is empty at every boot, so the map lives in
 //!   host RAM only and there is no on-flash metadata to keep consistent.
 //!   Sectors are of unknown state at boot: blank ones are found by reading.
@@ -29,6 +33,8 @@ pub const CHUNK: usize = 256;
 const CHUNKS: usize = PAGE / CHUNK;
 /// Largest region handled: the map tables are fixed arrays.
 pub const MAX_SECTORS: usize = 512;
+/// One wear-levelling move per this many page writes.
+const MOVE_EVERY: u32 = 8;
 
 /// A region of NOR flash, addressed from its start.
 pub trait Flash {
@@ -57,6 +63,8 @@ const UNKNOWN: u16 = 0xFFFD;
 #[derive(Default, Clone, Copy)]
 pub struct Stats {
     pub pages_written: u64,
+    /// Pages moved for wear levelling (not counted in `pages_written`).
+    pub pages_moved: u64,
     pub zero_pages: u64,
     pub pages_read: u64,
     pub programs: u64,
@@ -84,6 +92,8 @@ pub struct FlashSwap<F: Flash> {
     head: u32,
     /// Sectors that are dirty or unknown (worth an idle erase).
     to_erase: u32,
+    /// Page writes since the last wear-levelling move.
+    since_move: u32,
     pub stats: Stats,
 }
 
@@ -105,6 +115,7 @@ impl<F: Flash> FlashSwap<F> {
             state,
             head: 0,
             to_erase: nsect,
+            since_move: 0,
             stats: Stats::default(),
         }
     }
@@ -259,11 +270,25 @@ impl<F: Flash> FlashSwap<F> {
         // even a failed program leaves the sector to be erased again
         self.map[lp as usize] = s as u16;
         self.state[s as usize] = lp as u16;
-        self.stats.pages_written += 1;
+        if all_new {
+            self.stats.pages_written += 1;
+        } else {
+            self.stats.pages_moved += 1;
+        }
         if !ok {
             self.stats.errors += 1;
         }
         ok
+    }
+
+    /// Move the live page nearest ahead of the head to a fresh sector.
+    fn move_one(&mut self) {
+        let n = self.nsect;
+        let live = (0..n).map(|i| (self.head + i) % n).find(|&s| self.state[s as usize] < UNKNOWN);
+        if let Some(s) = live {
+            let lp = u32::from(self.state[s as usize]);
+            self.write_page(lp, &|_| None);
+        }
     }
 
     /// The statistics page, as text.
@@ -292,7 +317,7 @@ impl<F: Flash> FlashSwap<F> {
         let _ = write!(
             w,
             "pages {}\nsectors {}\nlive {}\nerased {}\ndirty {}\nzero_mapped {}\n\
-             pages_written {}\nzero_pages {}\npages_read {}\nprograms {}\nprograms_skipped {}\n\
+             pages_written {}\npages_moved {}\nzero_pages {}\npages_read {}\nprograms {}\nprograms_skipped {}\n\
              erases_sync {}\nerases_idle {}\nblank_found {}\nerrors {}\n\
              erase_us_total {}\nerase_us_max {}\nprogram_us_total {}\nprogram_us_max {}\n\
              write_us_total {}\nwrite_us_max {}\n",
@@ -303,6 +328,7 @@ impl<F: Flash> FlashSwap<F> {
             dirty,
             self.map[..self.pages as usize].iter().filter(|&&m| m == ZERO).count(),
             s.pages_written,
+            s.pages_moved,
             s.zero_pages,
             s.pages_read,
             s.programs,
@@ -332,9 +358,12 @@ impl<F: Flash> crate::virtio::Disk for FlashSwap<F> {
     fn block_size(&self) -> u32 {
         PAGE as u32
     }
+    fn id(&self) -> [u8; 20] {
+        *b"rvemu-flash-swap\0\0\0\0"
+    }
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> bool {
         let Ok(off) = usize::try_from(sector * 512) else { return false };
-        if buf.len() % 512 != 0 || off + buf.len() > (self.pages as usize + 1) * PAGE {
+        if !buf.len().is_multiple_of(512) || off + buf.len() > (self.pages as usize + 1) * PAGE {
             return false;
         }
         let mut done = 0;
@@ -370,7 +399,7 @@ impl<F: Flash> crate::virtio::Disk for FlashSwap<F> {
     }
     fn write(&mut self, sector: u64, buf: &[u8]) -> bool {
         let Ok(off) = usize::try_from(sector * 512) else { return false };
-        if buf.len() % 512 != 0 || off + buf.len() > self.pages as usize * PAGE {
+        if !buf.len().is_multiple_of(512) || off + buf.len() > self.pages as usize * PAGE {
             return false;
         }
         let t0 = self.flash.cycles();
@@ -383,6 +412,11 @@ impl<F: Flash> crate::virtio::Disk for FlashSwap<F> {
                 (at >= off && at + CHUNK <= off + buf.len()).then(|| buf[at - off..].as_ptr())
             };
             ok &= self.write_page(lp as u32, &new);
+            self.since_move += 1;
+            if self.since_move >= MOVE_EVERY {
+                self.since_move = 0;
+                self.move_one();
+            }
             lp += 1;
         }
         let dt = self.flash.cycles() - t0;

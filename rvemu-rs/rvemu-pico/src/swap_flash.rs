@@ -182,7 +182,7 @@ impl Flash for SwapFlash {
     }
     fn program(&mut self, off: u32, data: &[u8; CHUNK]) -> bool {
         let addr = SWAP_START + off;
-        if off % CHUNK as u32 != 0 || addr + CHUNK as u32 > SWAP_END {
+        if !off.is_multiple_of(CHUNK as u32) || addr + CHUNK as u32 > SWAP_END {
             return false;
         }
         // `data` may be in PSRAM: copy it to the stack (SRAM) first
