@@ -128,12 +128,40 @@ impl<'a> Asm<'a> {
         self.emit(i_type(0x13, rd, 5, rs1, sh as i32));
     }
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn srai(&mut self, rd: Reg, rs1: Reg, sh: u32) {
+        self.emit(i_type(0x13, rd, 5, rs1, 0x400 | sh as i32));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn add(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
         self.emit(r_type(0x33, rd, 0, rs1, rs2, 0));
     }
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn sub(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
         self.emit(r_type(0x33, rd, 0, rs1, rs2, 0x20));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn xor(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 4, rs1, rs2, 0));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn or(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 6, rs1, rs2, 0));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn and(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 7, rs1, rs2, 0));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn ori(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.emit(i_type(0x13, rd, 6, rs1, imm));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn xori(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.emit(i_type(0x13, rd, 4, rs1, imm));
+    }
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn mul(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.emit(r_type(0x33, rd, 0, rs1, rs2, 1));
     }
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn lui(&mut self, rd: Reg, imm: u32) {

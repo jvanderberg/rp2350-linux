@@ -54,6 +54,12 @@ counters.
 
 - **No M-mode.** The kernel runs in S-mode, and SBI is implemented in the
   emulator.
+- **Entropy.** The device tree's `/chosen` has a 32-byte `rng-seed`, so the
+  kernel's CRNG is ready at boot. Without it the CRNG never initializes and
+  every `get_random_*` (several per exec) re-extracts its pool. Batch runs,
+  `-D` and the benchmark firmware keep the fixed bytes (`DTB_RNG_SEED`), so
+  they stay deterministic. The interactive Mac host fills them from
+  `/dev/urandom`, and `rvemu-pico-shell` from the RP2350's TRNG.
 - **virtio** (`rvcore/src/virtio.rs`): one virtio-mmio v2 transport (split
   virtqueues, no indirect descriptors) shared by both devices. Requests
   complete synchronously.
@@ -73,27 +79,47 @@ counters.
 
 ## Translator (`rvjit/`)
 
-- **Registers.** Guest `xN` lives in host `xN`. Five host registers are
-  reserved: x3 (state pointer), x4/x7/x23 (scratch) and x24 (helper link).
-  These are the five least-used guest registers in a boot (about 1.5% of
-  operand uses); their guest values live in `cpu.x[]`.
-- **Exact timing.** Every block starts with `budget -= N; if < 0 exit`. The
-  budget is the number of instructions until the next timer deadline, so
-  `instret` and interrupt timing are identical to the interpreter's.
+- **Registers.** Guest `xN` lives in host `xN`. Six host registers are
+  reserved: x3 (state pointer), x4/x7/x23 (scratch), x22 (instruction
+  budget) and x24 (helper link). These are the six least-used guest
+  registers in a boot (about 2% of operand uses); their guest values live in
+  `cpu.x[]`.
+- **Exact timing.** A block is its guest pc, `jal budget_exit`, then the
+  entry: `addi x22, x22, -N; blt x22, zero, <the jal>`. The budget is the
+  number of instructions until the next timer deadline, so `instret` and
+  interrupt timing are identical to the interpreter's.
 - **Memory.** Loads and stores call a shared soft-TLB helper
-  (`addi; jal helper; .word meta; ld/st`) that skips the metadata word on a
-  hit. A miss, MMIO, a fault, a page-crossing access or a misaligned access
-  exits, and `Cpu::step()` executes that one instruction. AMOs use the host
+  (`addi; jal helper; ld/st`). On a TLB miss the helper saves the
+  caller-saved guest registers, calls `Cpu::tlb_refill()` on the host stack
+  and carries on. MMIO, a fault, a write to a code page or a misaligned
+  access exits with the call site, and `Cpu::step()` executes that one
+  instruction. The dispatcher finds the block by scanning
+  back to its `jal budget_exit`, and the instruction by counting helper
+  calls, so no per-access metadata is stored. AMOs use the host
   AMO on the translated address, or load/op/store when `Jit::native_amo` is
-  off. LR/SC, CSRs, ecall, sret and wfi go to the interpreter.
+  off. LR.W and SC.W keep the interpreter's reservation in `Cpu`
+  (`res_valid`, `res_addr`). Ecall, sret and wfi go to the interpreter.
+- **CSRs.** In S mode, every access to `sscratch`, `sepc`, `scause` and
+  `stval` is a load and store on `Cpu`. So are reads of `sstatus` and SIE
+  set or clear. Other `sstatus` writes call `Cpu::sstatus_op()` the same way
+  as a TLB refill. Setting SIE exits if an enabled interrupt was already
+  pending when the run began; the pending set can't change during a run.
+  Other CSRs go to the interpreter.
 - **Linking.** Blocks are keyed by (virtual pc, physical pc) and never cross a
   page. Same-page exits are chained by patching a `jal`. Other jumps use an
-  inline jump cache, validated against the fetch TLB.
-- **Code cache.** When the code buffer is full it is either flushed
-  (`regions = 1`) or used as a ring of equal regions. Moving on to the next
-  region evicts the blocks in it, which are the oldest. Chains from a newer
-  region into an older one are logged, and reset when that older region is
-  evicted.
+  inline jump cache, validated against the fetch TLB. On a jump-cache miss
+  the same routine walks the target's hash chain in the code buffer and
+  refills the entry, so only untranslated targets go back to the
+  dispatcher.
+- **Code cache.** Each block's descriptor (hash-chain link, physical and
+  virtual pc) is a header in front of its code, so the code buffer is the
+  only limit on how many blocks are live. When the buffer is full it is
+  either flushed (`regions = 1`) or used as a ring of equal regions. Moving
+  on to the next region evicts the blocks in it, which are the oldest: they
+  are the tail of every hash chain, so each chain is cut at the first one.
+  Chains from a newer region into an older one are logged, and reset when
+  that older region is evicted. Blocks whose first instruction needs the
+  interpreter are not kept.
 - **Self-modifying code.** Pages with translations never get write-TLB
   entries. A store to one reaches the interpreter, and that page's blocks
   are dropped.
@@ -107,10 +133,14 @@ counters.
 - `-D` boots the disk guest.
 - `-c` uses `-icount` for exact host-instruction counts.
 - `-I` takes keyboard input.
+- `RVEMU_CODE_KB`, `RVEMU_NJC`, `RVEMU_REGIONS` and `RVEMU_NBUCKETS` at
+  build time size the tables. `384`, `1024`, `8` and `1024` match
+  rvemu-pico.
 
 With the disk guest, lockstep matches through boot to `login:` (2,517,290
-events). Translation is about half of host time, at 31 host instructions per
-guest instruction under `-icount`.
+events). With rvemu-pico's table sizes, that boot takes 22.0 host
+instructions per guest instruction under `-icount`, and translation is 7.9 of
+them.
 
 ## On the RP2350 (`rvemu-pico/`)
 
@@ -129,7 +159,8 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
   USB console and the Wi-Fi radio (below).
 - **Memory.** Guest RAM is the 8 MB PSRAM, preceded by the kernel text in
   flash (`guest_blob.rs`; flash map in the top-level README). The translator
-  has a `CODE_KIB` code cache in SRAM: 4,096 blocks in a ring of 8 regions. It
+  has a `CODE_KIB` code cache in SRAM (330 KiB; core1 takes the rest), in a
+  ring of 8 regions. It
   has no PSRAM backing store, because that traffic would share the 16 KB XIP
   cache with guest RAM.
 - **Console** (`usbcon.rs`). Output waits in a 16 KB ring while no terminal
@@ -144,6 +175,8 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
   BOOTSEL. So does the SWD request in `rp2350-board::bootsel_if_requested`.
 - **Disk.** The squashfs is read through flash's uncached, non-allocating
   XIP alias, so disk reads don't evict guest RAM from the XIP cache.
+- **Entropy.** The DTB's `rng-seed` is overwritten with 32 bytes from the
+  TRNG before the guest starts.
 
 ### Wi-Fi (`rvemu-pico/src/wifi.rs`)
 

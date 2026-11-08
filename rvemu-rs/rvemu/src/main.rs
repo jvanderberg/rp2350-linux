@@ -9,7 +9,7 @@ use std::time::Instant;
 use rvcore::dev::{Console, PLIC_BASE, PLIC_SIZE, Platform, UART_BASE, UART_IRQ, UART_SIZE};
 use rvcore::virtio::{GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE};
 use stubnet::StubNet;
-use rvcore::{Bus, Cpu, Halt, Priv, TIMEBASE_HZ};
+use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, Priv, TIMEBASE_HZ};
 
 mod sim;
 mod stubnet;
@@ -200,6 +200,18 @@ impl Bus for HostBus {
 
 // ------------------------------------------------------------------ setup
 
+/// Bytes as a DTS byte string body: `72 76 ...`.
+fn dts_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+fn os_random() -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut b = [0u8; 32];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| format!("/dev/urandom: {e}"))?;
+    Ok(b)
+}
+
 fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u32)>, disk: bool, net: bool) -> String {
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
@@ -223,6 +235,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     if net {
         virtio += &node(VIRTIO_NET_BASE, VIRTIO_NET_IRQ);
     }
+    let seed = dts_bytes(&DTB_RNG_SEED);
     format!(
         r#"/dts-v1/;
 / {{
@@ -233,6 +246,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
   chosen {{
     bootargs = "{bootargs}";
     stdout-path = "/soc/serial@f4000000";
+    rng-seed = [{seed}];
 {initrd}  }};
   cpus {{
     #address-cells = <1>;
@@ -544,6 +558,9 @@ fn run() -> Result<(), String> {
         print!("{dts}");
         return Ok(());
     }
+    // interactive: a real seed (batch runs keep the fixed one, to stay
+    // deterministic)
+    let dts = if o.batch { dts } else { dts.replace(&dts_bytes(&DTB_RNG_SEED), &dts_bytes(&os_random()?)) };
 
     let mut ram = vec![0u8; ram_size as usize].into_boxed_slice();
     let kimg = read(o.kernel.as_deref().unwrap())?;

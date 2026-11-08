@@ -31,8 +31,8 @@ use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
 use rvcore::virtio::{Disk as _, FRAME_MAX, GuestMem, MemDisk, NetLink};
-use rvcore::{Bus, Cpu, Halt, TIMEBASE_HZ};
-use rvjit::{Block, JcEntry, Jit, JitMem};
+use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, TIMEBASE_HZ};
+use rvjit::{JcEntry, Jit, JitMem};
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
@@ -85,14 +85,65 @@ fn flash_disk() -> Option<MemDisk> {
         .then(|| unsafe { MemDisk::new(base as *const u8, len) })
 }
 
+/// 32 bytes from the RP2350's TRNG (its ring oscillator, through the block's
+/// von Neumann corrector and health checks; a failed check discards that
+/// batch). The guest kernel hashes the seed into its pool anyway.
+fn trng_seed(trng: &hal::pac::TRNG, resets: &mut hal::pac::RESETS) -> [u8; 32] {
+    resets.reset().modify(|_, w| w.trng().clear_bit());
+    while resets.reset_done().read().trng().bit_is_clear() {}
+    trng.rng_icr().write(|w| unsafe { w.bits(0xF) });
+    trng.rnd_source_enable().write(|w| w.rnd_src_en().set_bit());
+    let mut out = [0u8; 32];
+    let mut n = 0;
+    while n < out.len() {
+        let isr = trng.rng_isr().read();
+        if isr.autocorr_err().bit_is_set() || isr.crngt_err().bit_is_set() || isr.vn_err().bit_is_set() {
+            trng.rng_icr().write(|w| unsafe { w.bits(0xF) });
+            continue;
+        }
+        if isr.ehr_valid().bit_is_clear() {
+            continue;
+        }
+        // 192 bits; reading them starts the next batch
+        for w in [
+            trng.ehr_data0().read().bits(),
+            trng.ehr_data1().read().bits(),
+            trng.ehr_data2().read().bits(),
+            trng.ehr_data3().read().bits(),
+            trng.ehr_data4().read().bits(),
+            trng.ehr_data5().read().bits(),
+        ] {
+            for b in w.to_le_bytes() {
+                if n < out.len() {
+                    out[n] = b;
+                    n += 1;
+                }
+            }
+        }
+        trng.rng_icr().write(|w| w.ehr_valid().set_bit());
+    }
+    trng.rnd_source_enable().write(|w| w.rnd_src_en().clear_bit());
+    out
+}
+
+/// Replace the device tree's fixed `rng-seed` (`DTB_RNG_SEED`) with `seed`.
+fn patch_rng_seed(dtb: &mut [u8], seed: &[u8; 32]) -> bool {
+    match dtb.windows(32).position(|w| w == DTB_RNG_SEED) {
+        Some(i) => {
+            dtb[i..i + 32].copy_from_slice(seed);
+            true
+        }
+        None => false,
+    }
+}
+
 // ------------------------------------------------------------------ translator storage (SRAM)
 
-/// The translator's code cache: what SRAM has left once core1's code and
-/// buffers (`core1.rs`) and core0's stack (9 KB deep after a gate run;
-/// 11.6 KB here) have theirs.
-const CODE_KIB: usize = 272;
+/// Translated code and its block headers: what SRAM has left once core1's
+/// code and buffers (`core1.rs`) and core0's stack (9 KB deep after a gate
+/// run; 12 KiB here) have theirs.
+const CODE_KIB: usize = 330;
 const CODE_WORDS: usize = CODE_KIB * 256;
-const NBLOCKS: usize = 4096;
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
 /// Ring of 8 regions (simulator: 7.9 s to login: against 8.8 s flush-all);
@@ -100,7 +151,6 @@ const NJC: usize = 1024;
 const REGIONS: usize = 8;
 
 static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
-static mut BLOCKS: [Block; NBLOCKS] = [Block::EMPTY; NBLOCKS];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
 /// Guest RAM as Linux sees it, at most: flash-backed kernel text + PSRAM.
 const GUEST_MAX: u32 = RAM_MAX + guest_blob::TEXT_MAX;
@@ -377,6 +427,7 @@ fn main() -> ! {
         rprintln!("no valid guest blob at {:#010x}", BLOB_ADDR);
         fail("run scripts/pico-shell.sh");
     }
+    let seed = trng_seed(&pac.TRNG, &mut pac.RESETS);
 
     let radio_pins = RadioPins { pwr: pins.gpio23, dio: pins.gpio24, cs: pins.gpio25, clk: pins.gpio29 };
     let creds = Creds::from_flash();
@@ -437,6 +488,13 @@ fn main() -> ! {
 
     // SAFETY: guest RAM is the mapped, writable PSRAM; the header was checked.
     let dtb = unsafe { h.load() };
+    // SAFETY: the DTB `load` just copied into guest RAM (PSRAM).
+    let dtb_bytes = unsafe { core::slice::from_raw_parts_mut((h.ram_host() + dtb as usize) as *mut u8, h.dtb_len as usize) };
+    if patch_rng_seed(dtb_bytes, &seed) {
+        rprintln!("[rvemu-pico] rng-seed filled from the TRNG");
+    } else {
+        rprintln!("[rvemu-pico] the DTB has no rng-seed to fill from the TRNG");
+    }
     // SAFETY: CPU and the translator tables are used only from here on.
     let cpu = unsafe {
         let p = (*addr_of_mut!(CPU)).as_mut_ptr();
@@ -451,7 +509,6 @@ fn main() -> ! {
             JitMem {
                 code: &mut *addr_of_mut!(CODE),
                 buckets: &mut *addr_of_mut!(BUCKETS),
-                blocks: &mut *addr_of_mut!(BLOCKS),
                 code_pages: &mut *addr_of_mut!(CODE_PAGES),
                 jump_cache: &mut *addr_of_mut!(JUMP_CACHE),
                 regions: REGIONS,

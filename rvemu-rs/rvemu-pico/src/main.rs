@@ -18,7 +18,7 @@ use rp235x_hal as hal;
 use rtt_target::{rprint, rprintln, rtt_init_print, ChannelMode};
 use rvcore::dev::{Console, Platform};
 use rvcore::{Bus, Cpu, Halt};
-use rvjit::{Block, Event, JcEntry, Jit, JitMem};
+use rvjit::{Event, JcEntry, Jit, JitMem};
 
 #[unsafe(link_section = ".start_block")]
 #[used]
@@ -37,13 +37,11 @@ const XIP_CTR_ACC: usize = 0x400c_8010;
 
 // ------------------------------------------------------------------ translator storage (SRAM)
 
-const CODE_WORDS: usize = 48 * 1024; // 192 KiB of translated code
-const NBLOCKS: usize = 4096;
+const CODE_WORDS: usize = 64 * 1024; // 256 KiB of translated code and block headers
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
 
 static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
-static mut BLOCKS: [Block; NBLOCKS] = [Block::EMPTY; NBLOCKS];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
 static mut CODE_PAGES: [u8; (RAM_SIZE >> 15) as usize] = [0; (RAM_SIZE >> 15) as usize];
 static mut JUMP_CACHE: [JcEntry; NJC] = [JcEntry::EMPTY; NJC];
@@ -267,7 +265,6 @@ fn run(mode: Mode) -> RunResult {
                 JitMem {
                     code: &mut *addr_of_mut!(CODE),
                     buckets: &mut *addr_of_mut!(BUCKETS),
-                    blocks: &mut *addr_of_mut!(BLOCKS),
                     code_pages: &mut *addr_of_mut!(CODE_PAGES),
                     jump_cache: &mut *addr_of_mut!(JUMP_CACHE),
                     regions: 1,
@@ -448,7 +445,7 @@ fn main() -> ! {
         "PSRAM {} KB at {} MHz (timing {:08x}); guest RAM {} KB at {:#010x}; guest image {} bytes",
         psram.size >> 10, psram.sck_hz / 1_000_000, psram.timing, RAM_SIZE >> 10, GUEST_RAM, GUEST.len()
     );
-    rprintln!("translator: {} KiB code cache, {} blocks, {} jump-cache entries", CODE_WORDS * 4 / 1024, NBLOCKS, NJC);
+    rprintln!("translator: {} KiB code cache, {} jump-cache entries", CODE_WORDS * 4 / 1024, NJC);
 
     let modes = [Mode::Jit, Mode::Lockstep, Mode::Interp];
     let mut results: [Option<RunResult>; 3] = [None, None, None];
