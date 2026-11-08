@@ -29,6 +29,8 @@ BR2_TARGET_ROOTFS_SQUASHFS_EXTREME_COMP=y
 BR2_TARGET_ROOTFS_SQUASHFS_PAD=y
 # packages
 BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+# statically linked BusyBox (build.sh rebuilds it when this file changes)
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="/guest/busybox-disk.fragment"
 BR2_PACKAGE_NCURSES_ADDITIONAL_TERMINFO="t/tmux t/tmux-256color x/xterm-color"
 BR2_PACKAGE_NANO=y
 BR2_PACKAGE_MG=y

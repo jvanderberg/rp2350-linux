@@ -18,7 +18,7 @@ password.
 | Stages | `all`, `rootfs`, `kernel` | `disk`, `disk-rootfs`, `disk-kernel` |
 | Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` |
 | Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay |
-| Userland | static BusyBox | shared musl; BusyBox, nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less |
+| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less |
 | Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets |
 | Used by | the boot benchmark (`scripts/pico-linux.sh`), `pico-shell.sh -i` | `scripts/pico-shell.sh` (default), `rvemu -d`, `virt.sh -D` |
 
@@ -37,11 +37,15 @@ and the root filesystem.
   Mac host's and the firmware's default command line for a disk without an
   initramfs is
   `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`.
+- **BusyBox** is linked statically (`busybox-disk.fragment`), so an applet
+  exec skips musl's dynamic loader (about 0.4 M guest instructions per
+  fork+exec of `/bin/true`). Everything else links against the shared musl.
+  The `/dev/fd` and `/dev/std*` links are made at build time in
+  `/lib/devlinks` and copied by one inittab line.
 - **Init scripts:** only `S02sysctl` and `S40network`. Every script and
-  command at boot is a fork+exec of the shared BusyBox, about 1 M guest
-  instructions each, so syslogd, klogd, crond, seedrng (the device tree's
-  `rng-seed` seeds the CRNG) and the modules script are removed. `dmesg`
-  has the kernel log.
+  command at boot is a fork+exec, so syslogd, klogd, crond, seedrng (the
+  device tree's `rng-seed` seeds the CRNG) and the modules script are
+  removed. `dmesg` has the kernel log.
 - **Network:** `eth0` is virtio-net. `/etc/network/interfaces` starts
   `udhcpc -b` in the background, so boot doesn't wait for a lease or the
   Wi-Fi join.

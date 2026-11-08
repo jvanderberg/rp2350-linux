@@ -36,5 +36,15 @@ N
 # no seedrng (the device tree's rng-seed seeds the CRNG), no modules.
 rm -f "$T/etc/init.d/S01seedrng" "$T/etc/init.d/S01syslogd" "$T/etc/init.d/S02klogd" \
   "$T/etc/init.d/S11modules" "$T/etc/init.d/S50crond"
+# inittab: the four `ln -sf /proc/self/fd... /dev/...` sysinit lines become
+# one `cp -a` of the same symlinks, made here (three fewer fork+execs at boot);
+# every other line stays where it is
+mkdir -p "$T/lib/devlinks"
+ln -sfn /proc/self/fd "$T/lib/devlinks/fd"
+for i in 0:stdin 1:stdout 2:stderr; do ln -sfn "/proc/self/fd/${i%%:*}" "$T/lib/devlinks/${i#*:}"; done
+if [ "$(grep -c '^null::sysinit:/bin/ln -sf /proc/self/fd' "$T/etc/inittab")" = 4 ]; then
+  awk '/^null::sysinit:\/bin\/ln -sf \/proc\/self\/fd/ { if (!d) print "null::sysinit:/bin/cp -a /lib/devlinks/fd /lib/devlinks/stdin /lib/devlinks/stdout /lib/devlinks/stderr /dev/"; d = 1; next } { print }' \
+    "$T/etc/inittab" > "$T/etc/inittab.new" && mv "$T/etc/inittab.new" "$T/etc/inittab"
+fi
 # UTF-8 for tmux and friends (musl has C.UTF-8 built in)
 grep -q LANG "$T/etc/profile" || echo 'export LANG=C.UTF-8' >> "$T/etc/profile"

@@ -39,6 +39,14 @@ if [[ $stage == disk* ]]; then
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
     fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
     make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
+    # Buildroot doesn't rebuild BusyBox when its config fragment changes or
+    # goes away, so a tree last built for another checkout could keep the
+    # wrong (static or dynamic) BusyBox: rebuild it when the fragment differs
+    bb=$(cat /guest/busybox-disk.fragment 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [[ "$(cat /work/br-disk/.busybox-sum 2>/dev/null)" != "$bb" ]]; then
+      make -C /work/br-disk busybox-dirclean
+    fi
+    echo "$bb" > /work/br-disk/.busybox-sum
     make -C /work/br-disk -j"$JOBS"
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
