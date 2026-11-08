@@ -206,11 +206,13 @@ class Pin:
             if h is not None:
                 h(self)
 
-    def irq(self, handler=None, trigger=IRQ_FALLING | IRQ_RISING):
+    def irq(self, handler=-1, trigger=IRQ_FALLING | IRQ_RISING):
         """Edge interrupts: handler(pin) runs in a thread of its own for each
-        edge. No handler: edges are still detected, read them with
-        wait_edge()."""
+        edge. handler None: edges are still detected, read them with
+        wait_edge(). No arguments: the current irq, unchanged."""
         l = self._l
+        if handler == -1:
+            return _Irq(l)
         start = handler is not None and l.handler is None
         l.handler = handler
         l.trigger = trigger
