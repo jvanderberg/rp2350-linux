@@ -1,0 +1,48 @@
+From 4f0d228b68940170da15b836b7309047d17e0165 Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 01:19:56 -0600
+Subject: [PATCH 6/6] riscv32: put .eh_frame/.debug_* relocation values in
+ r_addend in objects
+
+tccdbg leaves them in the data, which tcc's linker adds; GNU ld uses
+only r_addend, so every FDE of a tcc object started at .text+0 and ld
+failed with '.eh_frame_hdr refers to overlapping FDEs'.
+---
+ tccelf.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/tccelf.c b/tccelf.c
+index 04189711..4b0b7e33 100644
+--- a/tccelf.c
++++ b/tccelf.c
+@@ -3229,6 +3229,27 @@ static int elf_output_obj(TCCState *s1, const char *filename)
+ {
+     Section *s;
+     int i, ret, file_offset;
++#ifdef TCC_TARGET_RISCV32
++    /* tccdbg puts the values of its .eh_frame and .debug_* relocations in
++       the data, which tcc's linker adds in; other linkers use only r_addend */
++    for (i = 1; i < s1->nb_sections; i++) {
++        Section *sr = s1->sections[i], *t;
++        ElfW_Rel *rel;
++        if (sr->sh_type != SHT_RELX)
++            continue;
++        t = s1->sections[sr->sh_info];
++        if (strncmp(t->name, ".debug_", 7) && strcmp(t->name, ".eh_frame"))
++            continue;
++        for_each_elem(sr, 0, rel, ElfW_Rel) {
++            int type = ELFW(R_TYPE)(rel->r_info);
++            if (type == R_RISCV_32 || type == R_RISCV_32_PCREL) {
++                unsigned char *p = t->data + rel->r_offset;
++                rel->r_addend += (int)read32le(p);
++                write32le(p, 0);
++            }
++        }
++    }
++#endif
+     /* Allocate strings for section names */
+     alloc_sec_names(s1, 1);
+     file_offset = (sizeof (ElfW(Ehdr)) + 3) & -4;
+-- 
+2.38.1
+

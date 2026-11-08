@@ -1,7 +1,7 @@
 From 0893b774ef7b415fdf01dddfbe29cdcb3abf31ac Mon Sep 17 00:00:00 2001
 From: Josh Vanderberg <jvanderberg@gmail.com>
 Date: Sun, 8 Nov 2026 00:47:42 -0600
-Subject: [PATCH 2/2] tccpp: no 'redefined' warning in system headers
+Subject: [PATCH 2/6] tccpp: no 'redefined' warning in system headers
 
 musl's <sys/ioctl.h> and the kernel's <linux/ioctl.h> both define _IOC
 and friends; gcc is silent about it there, and so is tcc now.
