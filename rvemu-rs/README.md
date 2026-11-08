@@ -138,8 +138,8 @@ counters.
   rvemu-pico.
 
 With the disk guest, lockstep matches through boot to `login:` (2,517,290
-events). With rvemu-pico's table sizes, that boot takes 22.0 host
-instructions per guest instruction under `-icount`, and translation is 7.9 of
+events). With rvemu-pico's table sizes, that boot takes 20.9 host
+instructions per guest instruction under `-icount`, and translation is 7.8 of
 them.
 
 ## On the RP2350 (`rvemu-pico/`)
@@ -223,8 +223,8 @@ Mac for the reference, and compares every board run.
 |---|---|---|---|
 | Mac interpreter | 56c7e73f | 9,540,070 | reference |
 | RP2350 interpreter | 56c7e73f | 9,540,070 | 1.90 MIPS, 183 cycles/insn |
-| RP2350 translator | 56c7e73f | 9,540,070 | 36.8 MIPS, 9.45 cycles/insn |
-| RP2350 lockstep | 56c7e73f | 9,540,070 | 3,503 events matched |
+| RP2350 translator | 56c7e73f | 9,540,070 | 40.1 MIPS, 8.68 cycles/insn |
+| RP2350 lockstep | 56c7e73f | 9,540,070 | 2,477 events matched |
 
 ## Scripts
 
