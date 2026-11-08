@@ -292,10 +292,34 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
 /// the bus numbers, the SPI controller's clock) and the devices on the soc.
 fn io_nodes() -> (String, String) {
     use rvcore::periph::*;
+    // RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc: only these (for measuring)
+    let only = std::env::var("RVEMU_IO").ok();
+    let want = |d: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == d));
     let names = LINE_NAMES.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
-    let i2c = |k: usize| {
+    let (mut root, mut soc, mut aliases) = (String::new(), String::new(), String::new());
+    if want("gpio") {
+        soc += &format!(
+            r#"    gpio@{GPIO_BASE:x} {{
+      compatible = "rvemu,gpio";
+      reg = <0x{GPIO_BASE:x} 0x{GPIO_SIZE:x}>;
+      interrupts = <{GPIO_IRQ}>;
+      interrupt-parent = <&plic0>;
+      gpio-controller;
+      #gpio-cells = <2>;
+      interrupt-controller;
+      #interrupt-cells = <2>;
+      gpio-line-names = {names};
+    }};
+"#
+        );
+    }
+    for k in 0..2 {
+        if !want(&format!("i2c{k}")) {
+            continue;
+        }
         let (base, irq) = (I2C_BASE[k], I2C_IRQ[k]);
-        format!(
+        aliases += &format!("    i2c{k} = &i2c{k};\n");
+        soc += &format!(
             r#"    virtio@{base:x} {{
       compatible = "virtio,mmio";
       reg = <0x{base:x} 0x{I2C_SIZE:x}>;
@@ -308,34 +332,20 @@ fn io_nodes() -> (String, String) {
       }};
     }};
 "#
-        )
-    };
-    let root = format!(
-        r#"  aliases {{
-    i2c0 = &i2c0;
-    i2c1 = &i2c1;
-    spi0 = &spi0;
-  }};
-  spiclk: clock-spi {{
+        );
+    }
+    if want("spi") {
+        aliases += "    spi0 = &spi0;\n";
+        root += &format!(
+            r#"  spiclk: clock-spi {{
     compatible = "fixed-clock";
     #clock-cells = <0>;
     clock-frequency = <{SPI_CLOCK_HZ}>;
   }};
 "#
-    );
-    let soc = format!(
-        r#"    gpio@{GPIO_BASE:x} {{
-      compatible = "rvemu,gpio";
-      reg = <0x{GPIO_BASE:x} 0x{GPIO_SIZE:x}>;
-      interrupts = <{GPIO_IRQ}>;
-      interrupt-parent = <&plic0>;
-      gpio-controller;
-      #gpio-cells = <2>;
-      interrupt-controller;
-      #interrupt-cells = <2>;
-      gpio-line-names = {names};
-    }};
-{i2c0}{i2c1}    spi0: spi@{SPI_BASE:x} {{
+        );
+        soc += &format!(
+            r#"    spi0: spi@{SPI_BASE:x} {{
       compatible = "sifive,spi0";
       reg = <0x{SPI_BASE:x} 0x{SPI_SIZE:x}>;
       interrupts = <{SPI_IRQ}>;
@@ -350,21 +360,33 @@ fn io_nodes() -> (String, String) {
         spi-max-frequency = <{max}>;
       }};
     }};
-    pwm@{PWM_BASE:x} {{
+"#,
+            max = SPI_CLOCK_HZ / 2
+        );
+    }
+    if want("pwm") {
+        soc += &format!(
+            r#"    pwm@{PWM_BASE:x} {{
       compatible = "rvemu,pwm";
       reg = <0x{PWM_BASE:x} 0x{PWM_SIZE:x}>;
       #pwm-cells = <3>;
     }};
-    adc@{ADC_BASE:x} {{
+"#
+        );
+    }
+    if want("adc") {
+        soc += &format!(
+            r#"    adc@{ADC_BASE:x} {{
       compatible = "rvemu,adc";
       reg = <0x{ADC_BASE:x} 0x{ADC_SIZE:x}>;
       #io-channel-cells = <1>;
     }};
-"#,
-        i2c0 = i2c(0),
-        i2c1 = i2c(1),
-        max = SPI_CLOCK_HZ / 2,
-    );
+"#
+        );
+    }
+    if !aliases.is_empty() {
+        root = format!("  aliases {{\n{aliases}  }};\n{root}");
+    }
     (root, soc)
 }
 
