@@ -100,14 +100,18 @@ if not os.path.exists(bp):
 b = json.load(open(bp))
 fail = []
 print(f"\n{'metric':<18}{'baseline':>12}{'this run':>12}{'change':>9}")
-for k, lim in [("initramfs_ms", 3), ("boot_s", 3), ("first_runs_s", 5), ("mpy_s", 5), ("lua_s", 5),
-               ("fork_exec_s", 5), ("md5_cold_s", 5), ("md5_warm_s", 5)]:
+# (metric, % limit, absolute floor): a slowdown fails only past both. The floors
+# are the run-to-run noise measured on unchanged code (two dev/base runs: Lua
+# 8%, warm md5 6%, everything else within 3%).
+for k, lim, floor in [("initramfs_ms", 3, 0), ("boot_s", 3, 0.3), ("first_runs_s", 5, 0.3),
+                      ("mpy_s", 5, 0.3), ("lua_s", 5, 0.3), ("fork_exec_s", 5, 0.5),
+                      ("md5_cold_s", 5, 0.8), ("md5_warm_s", 5, 1.5)]:
     if k not in r or k not in b:
         continue
     d = 100.0 * (r[k] - b[k]) / b[k]
-    flag = "  SLOWER" if d > lim else ""
+    flag = "  SLOWER" if d > lim and r[k] - b[k] > floor else ""
     if flag:
-        fail.append(f"{k} +{d:.1f}% (limit {lim}%)")
+        fail.append(f"{k} +{d:.1f}% (limit {lim}% and {floor})")
     print(f"{k:<18}{b[k]:>12}{r[k]:>12}{d:>8.1f}%{flag}")
 # memory: MemAvailable plus the per-CPU free lists when both runs have it
 mk = "mem_adj_kb" if "mem_adj_kb" in b and "mem_adj_kb" in r else "mem_avail_kb"
