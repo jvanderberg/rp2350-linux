@@ -426,7 +426,9 @@ fn main() -> ! {
     let dtb = unsafe { h.load() };
     // SAFETY: the DTB `load` just copied into guest RAM (PSRAM).
     let dtb_bytes = unsafe { core::slice::from_raw_parts_mut((h.ram_host() + dtb as usize) as *mut u8, h.dtb_len as usize) };
-    if !patch_rng_seed(dtb_bytes, &seed) {
+    if patch_rng_seed(dtb_bytes, &seed) {
+        rprintln!("[rvemu-pico] rng-seed filled from the TRNG");
+    } else {
         rprintln!("[rvemu-pico] the DTB has no rng-seed to fill from the TRNG");
     }
     // SAFETY: CPU and the translator tables are used only from here on.
