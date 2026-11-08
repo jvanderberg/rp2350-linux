@@ -12,11 +12,6 @@ stage=${1:-all}
 # pass it: the external tree, or empty when this checkout has none.
 EXT=; [[ -f /guest/br-external/external.desc ]] && EXT=/guest/br-external
 
-# src_sum FILES/DIRS... (relative to /guest): one checksum of their contents
-src_sum() {
-  { find "$@" -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -c1-16
-}
-
 # The /work volume is shared by every checkout. Buildroot never removes files
 # from target/, so when the configuration (defconfig, post-build script, overlay
 # or external tree under /guest) differs from the last one built in this tree,
@@ -36,6 +31,22 @@ fresh_target() {   # BR_OUT FILES...
   echo "$sum" > "$o/.config-sum"
 }
 
+# Buildroot rebuilds nothing when a package's .mk or patches change: after
+# defconfig, dirclean each external package whose files differ from the
+# last build in this tree.
+ext_rebuild() {   # BR_OUT
+  local o=$1 d p sum
+  [[ -n $EXT ]] || return 0
+  for d in "$EXT"/package/*/; do
+    p=$(basename "$d")
+    sum=$(find "$d" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
+    if [[ "$(cat "$o/.ext-sum-$p" 2>/dev/null)" != "$sum" ]]; then
+      make -C "$o" "$p-dirclean"
+      echo "$sum" > "$o/.ext-sum-$p"
+    fi
+  done
+}
+
 # disk / disk-rootfs / disk-kernel: the squashfs-root variant, into /out-disk
 # (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment)
 if [[ $stage == disk* ]]; then
@@ -44,26 +55,16 @@ if [[ $stage == disk* ]]; then
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
     fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
     make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
-    # Buildroot copies a local package's source once, and doesn't track the C
-    # modules external packages compile into MicroPython (cmod/,
-    # USER_C_MODULES): rebuild a package whose files changed since its shared
-    # build directory was built.
-    rebuild=()
-    for p in /guest/br-external/package/*/; do
-      [[ -d $p ]] && rebuild+=("$(basename "$p")=$(cd /guest && src_sum "br-external/package/$(basename "$p")")")
-    done
-    rebuild+=("micropython=$(cd /guest && src_sum br-external/package/*/cmod)")
-    for r in "${rebuild[@]}"; do
-      for d in /work/br-disk/build/"${r%%=*}"-[0-9]*; do
-        if [[ -d $d && "$(cat "$d/.src-sum" 2>/dev/null)" != "${r#*=}" ]]; then
-          echo "build.sh: ${r%%=*}'s sources changed: rebuilding it"; rm -rf "$d"
-        fi
-      done
+    ext_rebuild /work/br-disk
+    # MicroPython is built with the external packages' C modules (cmod/,
+    # USER_C_MODULES), which Buildroot doesn't track: rebuild it unless its
+    # build directory (shared with other checkouts) has these ones
+    mp=$(cd /guest && { find br-external/package/*/cmod -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
+    for d in /work/br-disk/build/micropython-[0-9]*/; do
+      [[ -d $d && "$(cat "$d/.cmod-sum" 2>/dev/null)" != "$mp" ]] && make -C /work/br-disk micropython-dirclean
     done
     make -C /work/br-disk -j"$JOBS"
-    for r in "${rebuild[@]}"; do
-      for d in /work/br-disk/build/"${r%%=*}"-[0-9]*; do [[ -d $d ]] && echo "${r#*=}" > "$d/.src-sum"; done
-    done
+    for d in /work/br-disk/build/micropython-[0-9]*/; do [[ -d $d ]] && echo "$mp" > "$d/.cmod-sum"; done
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
   if [[ $stage == disk || $stage == disk-kernel ]]; then
@@ -96,6 +97,7 @@ if [[ $stage == all || $stage == rootfs ]]; then
   cp /guest/buildroot.defconfig /work/br/defconfig
   fresh_target /work/br buildroot.defconfig post-build.sh overlay br-external
   make -C /src/buildroot O=/work/br BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br/defconfig defconfig
+  ext_rebuild /work/br
   make -C /work/br -j"$JOBS"
   cp /work/br/images/rootfs.cpio /out/rootfs.cpio
 fi

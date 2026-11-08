@@ -83,9 +83,9 @@ the top-level README; the devices in `rvemu-rs/README.md`).
   - `pins-examples`: `gpio-blink`, `gpio-edge`, `i2c-scan`, `spi-xfer` and
     `adc-read`, built and as source in `/usr/share/examples/pins` (its
     `Makefile` builds them on the board).
-- **Rebuilds:** Buildroot copies a local package's source only once, so
-  `build.sh` rebuilds an external package whose files changed (and
-  MicroPython when a `cmod/` changed).
+- **Rebuilds:** `build.sh` rebuilds an external package whose files
+  changed, and MicroPython when the C modules it was built with differ from
+  the checkout's `cmod/` directories.
 
 ## Configuration notes
 
