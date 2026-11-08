@@ -292,6 +292,7 @@ fn imm_j(insn: u32) -> i32 {
 /// Which instructions the translator handles itself. Encodings are checked
 /// as strictly as the interpreter does, so anything copied verbatim is a
 /// valid RV32IM instruction with identical semantics on the host.
+#[inline(always)]
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn classify(insn: u32, pc: u32, sup: bool) -> Kind {
     let f3 = (insn >> 12) & 7;
