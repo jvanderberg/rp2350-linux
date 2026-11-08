@@ -52,8 +52,22 @@ rm -f a.out; cc hello.c && ./a.out > aout.out 2>&1; cp hello.expect aout.expect;
 
 if [ "$1" = selfhost ]; then
 	cd tcc-src || exit 1
-	peak "cc-builds-tcc" cc -o tcc2 tcc.c -lm -ldl -lpthread
-	peak "tcc2-builds-tcc" ./tcc2 -o tcc3 tcc.c -lm -ldl -lpthread
+	# build CC OUT: tcc from its sources one file at a time, as its
+	# Makefile does (as one unit, tcc needs ~3 MB more than the guest has)
+	build() {
+		b0=$(cut -d' ' -f1 /proc/uptime)
+		for u in tcc libtcc tccpp tccgen tccdbg tccelf tccasm tccrun \
+			riscv32-gen riscv64-link riscv64-asm; do
+			peak "$1-$u.c" "$1" -DONE_SOURCE=0 -c "$u.c" -o "$u.o" || return 1
+		done
+		peak "$1-link" "$1" -o "$2" tcc.o libtcc.o tccpp.o tccgen.o tccdbg.o \
+			tccelf.o tccasm.o tccrun.o riscv32-gen.o riscv64-link.o \
+			riscv64-asm.o -lm -ldl -lpthread || return 1
+		b1=$(cut -d' ' -f1 /proc/uptime)
+		echo "time $1-builds-$2 $(echo "$b1 $b0" | awk '{printf "%.2f", $1 - $2}') s"
+	}
+	build cc tcc2
+	build ./tcc2 tcc3
 	ls -l tcc2 tcc3
 	if cmp tcc2 tcc3; then
 		pass=$((pass + 1)); echo "PASS selfhost (tcc2 and tcc3 identical)"
