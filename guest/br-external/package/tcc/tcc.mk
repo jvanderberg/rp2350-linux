@@ -10,6 +10,11 @@ TCC_SITE_METHOD = git
 TCC_LICENSE = LGPL-2.1+
 TCC_LICENSE_FILES = COPYING
 
+# musl keeps libm, libpthread etc. in libc; these empty archives make
+# -lm and friends work
+TCC_MUSL_EMPTY_LIBS = libm.a libpthread.a librt.a libdl.a libcrypt.a \
+	libutil.a libxnet.a libresolv.a
+
 # libgcc members that programs built by tcc never need (quad float
 # arithmetic, half and bfloat, _BitInt, complex, x87, support code)
 TCC_LIBGCC_DROP = \
@@ -29,14 +34,16 @@ TCC_LIBGCC_DROP = \
 	multi3.o
 
 # Two builds from one tree: a cross tcc on the build host, only to compile
-# libtcc1.a for the target, and the tcc that runs on the target (built by
-# the target gcc). tccdefs.h is read at run time (predefs=no): compiling it
+# libtcc1.a and runmain.o (for tcc -run) for the target, and the tcc that
+# runs on the target (built by the target gcc). tccdefs.h is read at run time (predefs=no): compiling it
 # in would need a host tool from the target build.
 define TCC_BUILD_CMDS
 	mkdir -p $(@D)/build-host $(@D)/build-target
 	cd $(@D)/build-host && $(HOST_MAKE_ENV) $(@D)/configure \
 		--cc="$(HOSTCC)" --config-predefs=no
 	$(HOST_MAKE_ENV) $(MAKE) -C $(@D)/build-host riscv32-libtcc1.a
+	$(@D)/build-host/riscv32-tcc -B$(@D) -c $(@D)/lib/runmain.c \
+		-o $(@D)/build-host/riscv32-runmain.o
 	cd $(@D)/build-target && $(TARGET_MAKE_ENV) $(@D)/configure \
 		--prefix=/usr \
 		--cross-prefix=$(TARGET_CROSS) \
@@ -64,6 +71,10 @@ define TCC_INSTALL_TARGET_CMDS
 	ln -sf tcc $(TARGET_DIR)/usr/bin/cc
 	$(INSTALL) -D -m 0644 $(@D)/build-host/riscv32-libtcc1.a \
 		$(TCC_DEVROOT)/usr/lib/tcc/libtcc1.a
+	$(INSTALL) -m 0644 $(@D)/build-host/riscv32-runmain.o \
+		$(TCC_DEVROOT)/usr/lib/tcc/runmain.o
+	$(INSTALL) -m 0644 $(addprefix $(STAGING_DIR)/lib/,$(TCC_MUSL_EMPTY_LIBS)) \
+		$(TCC_DEVROOT)/usr/lib/tcc/
 	$(INSTALL) -d $(TCC_DEVROOT)/usr/lib/tcc/include
 	$(INSTALL) -m 0644 $(@D)/include/*.h $(TCC_DEVROOT)/usr/lib/tcc/include/
 	$(INSTALL) -m 0644 $(STAGING_DIR)/lib/crt1.o $(STAGING_DIR)/lib/crti.o \
