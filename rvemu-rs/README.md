@@ -54,6 +54,12 @@ counters.
 
 - **No M-mode.** The kernel runs in S-mode, and SBI is implemented in the
   emulator.
+- **Entropy.** The device tree's `/chosen` has a 32-byte `rng-seed`, so the
+  kernel's CRNG is ready at boot. Without it the CRNG never initializes and
+  every `get_random_*` (several per exec) re-extracts its pool. Batch runs,
+  `-D` and the benchmark firmware keep the fixed bytes (`DTB_RNG_SEED`), so
+  they stay deterministic. The interactive Mac host fills them from
+  `/dev/urandom`, and `rvemu-pico-shell` from the RP2350's TRNG.
 - **virtio** (`rvcore/src/virtio.rs`): one virtio-mmio v2 transport (split
   virtqueues, no indirect descriptors) shared by both devices. Requests
   complete synchronously.
@@ -149,6 +155,8 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
   BOOTSEL. So does the SWD request in `rp2350-board::bootsel_if_requested`.
 - **Disk.** The squashfs is read through flash's uncached, non-allocating
   XIP alias, so disk reads don't evict guest RAM from the XIP cache.
+- **Entropy.** The DTB's `rng-seed` is overwritten with 32 bytes from the
+  TRNG before the guest starts.
 
 ### Wi-Fi (`rvemu-pico/src/wifi.rs`)
 
