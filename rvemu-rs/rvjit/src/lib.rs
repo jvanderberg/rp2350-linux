@@ -18,9 +18,10 @@
 //! jumps ends the block and is run by the interpreter (`Cpu::step`).
 //!
 //! Loads and stores call a shared soft-TLB helper (`jal K3`) that returns
-//! the host address in K0. A miss, MMIO, a fault or a misaligned access
-//! exits with the call site, and the interpreter executes that one
-//! instruction: the dispatcher finds the block from the call site (the
+//! the host address in K0. On a TLB miss the helper calls into Rust on the
+//! host stack to fill the entry, and carries on. MMIO, a fault, a write to a
+//! code page or a misaligned access exits with the call site, and the
+//! interpreter executes that one instruction: the dispatcher finds the block from the call site (the
 //! `jal K1, budget_exit` before its entry; data words in a block are guest
 //! pcs, 4-aligned, so they never look like an instruction) and which
 //! instruction it was (counting `jal K3` sites).
@@ -527,6 +528,16 @@ pub struct BlockInfo {
 
 type EnterFn = unsafe extern "C" fn(*mut Cpu, usize);
 
+/// Called from translated code on a TLB miss (the `refill` routine): the host
+/// address of `va`, or 0 to leave for the interpreter.
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+extern "C" fn tlb_refill(cpu: &mut Cpu, va: u32, acc: usize) -> usize {
+    cpu.tlb_refill(va, acc).unwrap_or(0)
+}
+
+/// Guest registers in host registers a Rust call may clobber (besides sp).
+const CALLER_SAVED: [Reg; 15] = [1, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 28, 29, 30, 31];
+
 /// What one dispatcher step did (used by lockstep checking).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Event {
@@ -790,6 +801,30 @@ impl<'m> Jit<'m> {
         a.addi(K1, K3, EXIT_MEM as i32);
         jump!(r.exit);
 
+        // TLB miss: K0 = guest va, K1 = access type, K3 = return address.
+        // tlb_refill() on the host stack fills the entry and returns the host
+        // address, or 0 for mem_miss. The callee-saved registers (S, K0 = tp,
+        // KB, K2, K3, s-registers) survive the call.
+        let refill = a.pos();
+        for &reg in &CALLER_SAVED {
+            a.sw(reg, S, xoff(reg));
+        }
+        a.sw(SP, S, xoff(SP));
+        a.lw(SP, S, OFF_HOST_SP);
+        a.addi(10, S, 0);
+        a.addi(11, K0, 0);
+        a.addi(12, K1, 0);
+        a.li(5, tlb_refill as *const () as usize as u32);
+        a.jalr(RA, 5, 0);
+        a.addi(K0, 10, 0);
+        a.lw(SP, S, xoff(SP));
+        for &reg in &CALLER_SAVED {
+            a.lw(reg, S, xoff(reg));
+        }
+        a.emit(b_type(1, K0, ZERO, 8)); // bne K0, zero, +8
+        jump!(r.mem_miss);
+        a.jalr(ZERO, K3, 0);
+
         // indirect jump with the target in the word at K1
         r.ijmp_imm = a.pos();
         a.lw(K0, K1, 0);
@@ -904,10 +939,13 @@ impl<'m> Jit<'m> {
                 a.jalr(ZERO, K3, 0);
                 let here = a.pos();
                 a.fix(m, here);
+                a.addi(K1, ZERO, if store == 1 { ACC_W } else { ACC_R } as i32);
+                jump!(refill);
                 if let Some(mis) = misaligned {
+                    let here = a.pos();
                     a.fix(mis, here);
+                    jump!(r.mem_miss);
                 }
-                jump!(r.mem_miss);
             }
         }
 

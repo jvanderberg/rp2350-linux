@@ -89,9 +89,11 @@ counters.
   number of instructions until the next timer deadline, so `instret` and
   interrupt timing are identical to the interpreter's.
 - **Memory.** Loads and stores call a shared soft-TLB helper
-  (`addi; jal helper; ld/st`). A miss, MMIO, a fault, a page-crossing
-  access or a misaligned access exits with the call site, and `Cpu::step()`
-  executes that one instruction. The dispatcher finds the block by scanning
+  (`addi; jal helper; ld/st`). On a TLB miss the helper saves the
+  caller-saved guest registers, calls `Cpu::tlb_refill()` on the host stack
+  and carries on. MMIO, a fault, a write to a code page or a misaligned
+  access exits with the call site, and `Cpu::step()` executes that one
+  instruction. The dispatcher finds the block by scanning
   back to its `jal budget_exit`, and the instruction by counting helper
   calls, so no per-access metadata is stored. AMOs use the host
   AMO on the translated address, or load/op/store when `Jit::native_amo` is
@@ -135,8 +137,8 @@ counters.
   rvemu-pico.
 
 With the disk guest, lockstep matches through boot to `login:` (2,517,290
-events). With rvemu-pico's table sizes, that boot takes 23.7 host
-instructions per guest instruction under `-icount`, and translation is 8.5 of
+events). With rvemu-pico's table sizes, that boot takes 22.0 host
+instructions per guest instruction under `-icount`, and translation is 7.9 of
 them.
 
 ## On the RP2350 (`rvemu-pico/`)
