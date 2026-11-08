@@ -55,16 +55,17 @@ if [ "$1" = selfhost ]; then
 	# is compiled, and the first build's objects go once tcc2 is linked:
 	# /tmp is RAM, and the compiler needs 2-2.6 MB of its own
 	rm -f hello ll fp misc arith gpio lib a.out ./*.o libvec.a
+	cp arith.expect arith3.expect
 	mkdir -p tcc-src && cd tcc-src || exit 1
 	# src FILE...: unpack FILEs from tcc-src.tgz (busybox tar has no -z)
 	src() { gunzip -c ../tcc-src.tgz | tar xf - "$@"; }
-	# the headers, and the target files that tcc.h includes for their defines
-	src config.h tcc.h tcctok.h libtcc.h elf.h stab.h stab.def dwarf.h \
-		tcclib.h riscv64-tok.h riscv32-gen.c riscv64-link.c riscv64-asm.c
 	# build CC OUT: tcc one file at a time, as its Makefile does (as one
 	# unit, tcc needs about 3 MB more than the guest has)
 	build() {
 		b0=$(cut -d' ' -f1 /proc/uptime)
+		# the headers, and the target files tcc.h includes for their defines
+		src config.h tcc.h tcctok.h libtcc.h elf.h stab.h stab.def dwarf.h \
+			tcclib.h riscv64-tok.h riscv32-gen.c riscv64-link.c riscv64-asm.c
 		for u in tcc libtcc tccpp tccgen tccdbg tccelf tccasm tccrun \
 			riscv32-gen riscv64-link riscv64-asm; do
 			case $u in
@@ -75,6 +76,9 @@ if [ "$1" = selfhost ]; then
 			peak "$1-$u.c" "$1" -DONE_SOURCE=0 -c "$u.c" -o "$u.o" || return 1
 			case $u in riscv*) ;; *) rm -f "$u.c" tcctools.c ;; esac
 		done
+		# the link needs ~2 MB of its own: no sources in /tmp meanwhile
+		rm -f ./*.h ./*.c stab.def
+		if [ "$2" = tcc3 ]; then rm -f ../tcc-src.tgz ../*.out ../*.expect; fi
 		peak "$1-link" "$1" -o "$2" tcc.o libtcc.o tccpp.o tccgen.o tccdbg.o \
 			tccelf.o tccasm.o tccrun.o riscv32-gen.o riscv64-link.o \
 			riscv64-asm.o -lm -ldl -lpthread || return 1
@@ -90,7 +94,7 @@ if [ "$1" = selfhost ]; then
 		fail=$((fail + 1)); echo "FAIL selfhost"
 	fi
 	./tcc3 -o ../arith3 ../arith.c && ../arith3 > ../arith3.out
-	cd .. && cp arith.expect arith3.expect && check arith3
+	cd .. && check arith3
 fi
 
 free
