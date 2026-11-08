@@ -1,0 +1,46 @@
+From 0893b774ef7b415fdf01dddfbe29cdcb3abf31ac Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 00:47:42 -0600
+Subject: [PATCH 2/7] tccpp: no 'redefined' warning in system headers
+
+musl's <sys/ioctl.h> and the kernel's <linux/ioctl.h> both define _IOC
+and friends; gcc is silent about it there, and so is tcc now.
+---
+ tccpp.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/tccpp.c b/tccpp.c
+index 214e9cd4..f34513ff 100644
+--- a/tccpp.c
++++ b/tccpp.c
+@@ -1248,6 +1248,16 @@ static int macro_is_equal(const int *a, const int *b)
+     return !(*a || *b);
+ }
+ 
++/* whether the file being read was found in a system include path */
++static int in_sysinclude(TCCState *s1)
++{
++    BufferedFile *bf = file;
++    int i = bf->include_next_index;
++    while (i == 1 && (bf = bf->prev))
++        i = bf->include_next_index;
++    return bf && i - 2 >= s1->nb_include_paths;
++}
++
+ /* defines handling */
+ ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg)
+ {
+@@ -1259,7 +1269,9 @@ ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg)
+     s->next = first_arg;
+     table_ident[v - TOK_IDENT]->sym_define = s;
+ 
+-    if (o && !macro_is_equal(o->d, s->d))
++    /* like gcc, system headers may redefine macros silently
++       (musl's <sys/ioctl.h> and the kernel's <linux/ioctl.h>) */
++    if (o && !macro_is_equal(o->d, s->d) && !in_sysinclude(tcc_state))
+ 	tcc_warning("%s redefined", get_tok_str(v, NULL));
+ }
+ 
+-- 
+2.38.1
+

@@ -1,0 +1,5 @@
+# BusyBox for the disk guest, on top of Buildroot's default busybox.config.
+# Static: every applet exec (init scripts, shells, /bin/true) skips musl's
+# dynamic loader and its relocation and GOT pages. The other programs still
+# link against libc.so.
+CONFIG_STATIC=y

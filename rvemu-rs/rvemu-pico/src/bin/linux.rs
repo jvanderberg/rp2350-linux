@@ -22,7 +22,7 @@ use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprint, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
 use rvcore::{Bus, Cpu, Halt};
-use rvjit::{Block, JcEntry, Jit, JitMem};
+use rvjit::{JcEntry, Jit, JitMem};
 
 #[path = "../guest_blob.rs"]
 mod guest_blob;
@@ -46,10 +46,9 @@ const XIP_CTR_ACC: usize = 0x400c_8010;
 
 // ------------------------------------------------------------------ translator storage (SRAM)
 
-/// Same as rvemu-pico-shell: 320 KiB in a ring of 8 regions, plus the PSRAM
-/// backing store.
-const CODE_WORDS: usize = 80 * 1024;
-const NBLOCKS: usize = 4096;
+/// 384 KiB in a ring of 8 regions, plus the PSRAM backing store. (The shell
+/// has 326 KiB: core1's code and buffers take the rest of its SRAM.)
+const CODE_WORDS: usize = 96 * 1024;
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
 const REGIONS: usize = 8;
@@ -58,7 +57,6 @@ const REGIONS: usize = 8;
 const RUN_INTERPRETER: bool = false;
 
 static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
-static mut BLOCKS: [Block; NBLOCKS] = [Block::EMPTY; NBLOCKS];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
 /// Guest RAM as Linux sees it, at most: flash-backed kernel text + PSRAM.
 const GUEST_MAX: u32 = RAM_MAX + guest_blob::TEXT_MAX;
@@ -228,7 +226,6 @@ fn run(jit_mode: bool, h: &BlobHeader, sys_hz: u32) {
                 JitMem {
                     code: &mut *addr_of_mut!(CODE),
                     buckets: &mut *addr_of_mut!(BUCKETS),
-                    blocks: &mut *addr_of_mut!(BLOCKS),
                     code_pages: &mut *addr_of_mut!(CODE_PAGES),
                     jump_cache: &mut *addr_of_mut!(JUMP_CACHE),
                     regions: REGIONS,
@@ -350,8 +347,8 @@ fn main() -> ! {
         psram.size >> 10, psram.sck_hz / 1_000_000, h.ram_size >> 10, h.kernel_len, h.initrd_len, h.dtb_len
     );
     rprintln!(
-        "translator: {} KiB code cache in {} regions, {} blocks, {} jump-cache entries, {} KiB PSRAM store",
-        CODE_WORDS * 4 / 1024, REGIONS, NBLOCKS, NJC, STORE_WORDS * 4 / 1024
+        "translator: {} KiB code cache in {} regions, {} jump-cache entries, {} KiB PSRAM store",
+        CODE_WORDS * 4 / 1024, REGIONS, NJC, STORE_WORDS * 4 / 1024
     );
     // don't time a run while RTT may block on a host that hasn't attached
     if !wait_rtt_drained(30, sys_hz) {

@@ -1,0 +1,75 @@
+From 5de0147c2dcdfd55438dc0d2de7017adb0702038 Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 04:49:40 -0600
+Subject: [PATCH 7/7] tcc (native riscv32 Linux): stop with 'memory full'
+ before the system thrashes
+
+Without swap, a compile that takes the last of the RAM evicts the page
+cache that every program's code lives in, and the guest stalls for
+minutes instead of failing. After every 128 kB allocated, tcc now reads
+MemAvailable and stops when less than 512 kB are left.
+---
+ libtcc.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/libtcc.c b/libtcc.c
+index 8c9df8ac..e7484820 100644
+--- a/libtcc.c
++++ b/libtcc.c
+@@ -246,6 +246,45 @@ static void tcc_concat_str(char **pp, const char *str, int sep)
+ #undef free
+ #undef realloc
+ 
++#if defined TCC_TARGET_RISCV32 && defined TCC_IS_NATIVE && defined __linux__
++/* A machine with a few MB of RAM and no swap does not fail a compile that
++   takes the last of it: it evicts the page cache that every program's code
++   is in, and the whole system thrashes for minutes. So after every 128 kB
++   allocated, check that the system still has 512 kB available, else stop. */
++#define MEM_CHECK_STEP (128 * 1024)
++#define MEM_RESERVE_KB 512
++static void mem_check(unsigned long size)
++{
++    static unsigned long since_check;
++    char buf[512], *p;
++    long kb;
++    int fd, n;
++
++    since_check += size;
++    if (since_check < MEM_CHECK_STEP)
++        return;
++    since_check = 0;
++    fd = open("/proc/meminfo", O_RDONLY);
++    if (fd < 0)
++        return;
++    n = read(fd, buf, sizeof buf - 1);
++    close(fd);
++    if (n <= 0)
++        return;
++    buf[n] = 0;
++    p = strstr(buf, "MemAvailable:");
++    if (!p)
++        return;
++    kb = strtol(p + 13, NULL, 10);
++    if (kb < MEM_RESERVE_KB) {
++        fprintf(stderr, "tcc: memory full (%ld kB left for the system)\n", kb);
++        exit(1);
++    }
++}
++#else
++#define mem_check(size)
++#endif
++
+ static void *default_reallocator(void *ptr, unsigned long size)
+ {
+     void *ptr1;
+@@ -254,6 +293,7 @@ static void *default_reallocator(void *ptr, unsigned long size)
+         ptr1 = NULL;
+     }
+     else {
++        mem_check(size);
+         ptr1 = realloc(ptr, size);
+         if (!ptr1) {
+             fprintf(stderr, "tcc: memory full\n");
+-- 
+2.38.1
+

@@ -53,6 +53,7 @@ The flash map is in the [top-level README](../README.md#flash-map-16-mb).
 
 | Tool | |
 |---|---|
+| `boot-wait.py START [--log FILE]` | wait for `login:` on the console and print the seconds since START (`pico-shell.sh` writes it to `rvemu-rs/target/pico-last-launch`) |
 | `pack-guest.py IMAGE INITRD DTB RAM_MB TEXT_LEN BLOB TEXT` | split an Image into the flash text and the guest blob |
 | `board-cmd.py [--port P] [--timeout S] COMMAND...` | run a command in the board's shell over the USB console (logs in as root if needed), print its output, exit with its status |
 | `serial-chat.py PORT EXPECT [SEND EXPECT]...` | script a serial console: wait for a pattern, send a line, repeat |

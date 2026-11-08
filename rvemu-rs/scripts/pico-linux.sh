@@ -24,7 +24,6 @@ echo "pico-linux.sh: Mac reference: $REF_N guest insns, console hash $REF_H"
 pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
 cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 ensure_bootsel "$ELF"
-keep_wifi
 load_text "$T/text.bin"
 load_blob "$T/blob.bin"
 picotool load -v -x -t elf "$ELF"

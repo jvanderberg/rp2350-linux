@@ -5,13 +5,14 @@
 //! filesystem, when there is one, from a squashfs at `DISK_ADDR` behind a
 //! read-only virtio disk (scripts/pico-shell.sh loads them and this firmware
 //! over BOOTSEL); guest RAM is the PSRAM. While the guest idles in WFI the firmware waits in real time
-//! (polling USB) up to the next timer deadline, like the Mac host's
-//! interactive mode. Console output is kept in a ring while no terminal is
-//! open, so connecting late shows the end of the boot log (`dmesg` has all
-//! of the kernel's).
+//! up to the next timer deadline, like the Mac host's interactive mode.
 //!
-//! The guest's Ethernet (virtio-net) is the RM2 Wi-Fi radio (`wifi.rs`);
-//! scripts/pico-wifi.sh stores the network to join.
+//! core0 runs only the guest. core1 (`core1.rs`) does all the I/O: the USB
+//! console (`usbcon.rs`) and the RM2 Wi-Fi radio behind the guest's
+//! virtio-net (`wifi.rs`; scripts/pico-wifi.sh stores the network to join).
+//! They exchange console bytes and frames through rings in SRAM. Console
+//! output is kept while no terminal is open, so connecting late shows the
+//! end of the boot log (`dmesg` has all of the kernel's).
 //!
 //! Back to BOOTSEL: open the port at 1200 baud and close it
 //! (`stty -f /dev/cu.usbmodemXXXX 1200`), or the SWD request in
@@ -20,19 +21,20 @@
 #![no_std]
 #![no_main]
 
-use core::future::Future;
 use core::mem::MaybeUninit;
-use core::pin::{Pin, pin};
 use core::ptr::addr_of_mut;
+use core::sync::atomic::Ordering;
 
 use panic_rtt_target as _;
 use rp2350_board as board;
 use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
-use rvcore::virtio::{Disk as _, GuestMem, MemDisk};
-use rvcore::{Bus, Cpu, Halt, TIMEBASE_HZ};
-use rvjit::{Block, JcEntry, Jit, JitMem};
+use rvcore::nor::{NorDev, NorFlash};
+use rvcore::swapdev::FlashSwap;
+use rvcore::virtio::{Disk as _, FRAME_MAX, GuestMem, MemDisk, NetLink, VirtioBlk, VirtioNet};
+use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, TIMEBASE_HZ};
+use rvjit::{JcEntry, Jit, JitMem};
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
@@ -41,9 +43,24 @@ use usbd_serial::SerialPort;
 mod guest_blob;
 use guest_blob::{BLOB_ADDR, BlobHeader};
 
+#[path = "../core1.rs"]
+mod core1;
+#[path = "../usbcon.rs"]
+mod usbcon;
+use usbcon::{CON_IN, CON_OUT};
 #[path = "../wifi.rs"]
 mod wifi;
-use wifi::{Creds, Radio, RadioPins, WifiLink};
+
+#[path = "../flash.rs"]
+mod flash;
+#[path = "../swap_flash.rs"]
+mod swap_flash;
+use swap_flash::SwapFlash;
+use wifi::{Creds, RadioPins};
+
+#[path = "../pins.rs"]
+mod pins;
+use pins::{BoardPins, Gp, PinSet};
 
 #[unsafe(link_section = ".start_block")]
 #[used]
@@ -80,12 +97,97 @@ fn flash_disk() -> Option<MemDisk> {
         .then(|| unsafe { MemDisk::new(base as *const u8, len) })
 }
 
+/// 32 bytes from the RP2350's TRNG (its ring oscillator, through the block's
+/// von Neumann corrector and health checks; a failed check discards that
+/// batch). The guest kernel hashes the seed into its pool anyway.
+fn trng_seed(trng: &hal::pac::TRNG, resets: &mut hal::pac::RESETS) -> [u8; 32] {
+    resets.reset().modify(|_, w| w.trng().clear_bit());
+    while resets.reset_done().read().trng().bit_is_clear() {}
+    trng.rng_icr().write(|w| unsafe { w.bits(0xF) });
+    trng.rnd_source_enable().write(|w| w.rnd_src_en().set_bit());
+    let mut out = [0u8; 32];
+    let mut n = 0;
+    while n < out.len() {
+        let isr = trng.rng_isr().read();
+        if isr.autocorr_err().bit_is_set() || isr.crngt_err().bit_is_set() || isr.vn_err().bit_is_set() {
+            trng.rng_icr().write(|w| unsafe { w.bits(0xF) });
+            continue;
+        }
+        if isr.ehr_valid().bit_is_clear() {
+            continue;
+        }
+        // 192 bits; reading them starts the next batch
+        for w in [
+            trng.ehr_data0().read().bits(),
+            trng.ehr_data1().read().bits(),
+            trng.ehr_data2().read().bits(),
+            trng.ehr_data3().read().bits(),
+            trng.ehr_data4().read().bits(),
+            trng.ehr_data5().read().bits(),
+        ] {
+            for b in w.to_le_bytes() {
+                if n < out.len() {
+                    out[n] = b;
+                    n += 1;
+                }
+            }
+        }
+        trng.rng_icr().write(|w| w.ehr_valid().set_bit());
+    }
+    trng.rnd_source_enable().write(|w| w.rnd_src_en().clear_bit());
+    out
+}
+
+/// Replace the device tree's fixed `rng-seed` (`DTB_RNG_SEED`) with `seed`.
+fn patch_rng_seed(dtb: &mut [u8], seed: &[u8; 32]) -> bool {
+    match dtb.windows(32).position(|w| w == DTB_RNG_SEED) {
+        Some(i) => {
+            dtb[i..i + 32].copy_from_slice(seed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The guest's /home: `flash::STORAGE` (1 MB) as the NOR flash device.
+struct BoardNor;
+
+impl NorFlash for BoardNor {
+    fn size(&self) -> u32 {
+        flash::STORAGE.end - flash::STORAGE.start
+    }
+    fn read(&mut self, off: u32, buf: &mut [u8]) -> bool {
+        flash::read(flash::STORAGE.start + off, buf);
+        true
+    }
+    fn program(&mut self, off: u32, data: &[u8]) -> bool {
+        flash::program(flash::STORAGE.start + off, data).is_ok()
+    }
+    fn erase(&mut self, off: u32) -> bool {
+        flash::erase_sector(flash::STORAGE.start + off).is_ok()
+    }
+    fn stat(&self, i: u32) -> u32 {
+        let s = flash::stats();
+        let mhz = u64::from(flash::sys_hz() / 1_000_000).max(1);
+        match i {
+            0 => s.erases,
+            1 => s.erases_skipped,
+            2 => s.pages,
+            3 => (u64::from(s.stall_cycles_max) / mhz) as u32,
+            4 => (s.stall_cycles_total / mhz / 1000) as u32,
+            _ => 0,
+        }
+    }
+}
+
 // ------------------------------------------------------------------ translator storage (SRAM)
 
-/// 320 KiB: what the SRAM holds without the lockstep reference CPU and with
-/// a small stack (the cache-policy simulator's `flush320`).
-const CODE_WORDS: usize = 80 * 1024;
-const NBLOCKS: usize = 4096;
+/// Translated code and its block headers: what SRAM has left once core1's
+/// code and buffers (`core1.rs`), the pin devices and core0's stack (about
+/// 10 KiB, what is left above .bss; `setup` and the run each need about 6) have
+/// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
+const CODE_KIB: usize = 326;
+const CODE_WORDS: usize = CODE_KIB * 256;
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
 /// Ring of 8 regions (simulator: 7.9 s to login: against 8.8 s flush-all);
@@ -93,7 +195,6 @@ const NJC: usize = 1024;
 const REGIONS: usize = 8;
 
 static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
-static mut BLOCKS: [Block; NBLOCKS] = [Block::EMPTY; NBLOCKS];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
 /// Guest RAM as Linux sees it, at most: flash-backed kernel text + PSRAM.
 const GUEST_MAX: u32 = RAM_MAX + guest_blob::TEXT_MAX;
@@ -103,111 +204,129 @@ static mut CHAIN_LOG: [u32; REGIONS * 128] = [0; REGIONS * 128];
 static mut STORE_EPOCHS: [u8; (GUEST_MAX >> 12) as usize] = [0; (GUEST_MAX >> 12) as usize];
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 static mut USB_BUS: MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> = MaybeUninit::uninit();
+// The bus and the translator live here rather than on main's stack: `setup`
+// builds them in its own frame, which is gone before the guest runs, so
+// core0's stack (what SRAM leaves above .bss, about 10 KB) is only the run.
+static mut BUS: MaybeUninit<PicoBus> = MaybeUninit::uninit();
+static mut JIT: MaybeUninit<Jit<'static>> = MaybeUninit::uninit();
+/// Sectors kept free for bursts of swap writes: 448 of the 511 are swap.
+const SWAP_SPARE: u32 = 63;
+/// With the swap device (`pico-shell.sh -w`), its backend (about 2.2 KB of
+/// tables) lives in the top page of guest RAM, which that DTB reserves
+/// (`rvemu -D -W`). Without it, swap costs no SRAM and no guest RAM.
+const SWAP_TABLES: usize = 0x1000;
+const _: () = assert!(core::mem::size_of::<FlashSwap<SwapFlash>>() <= SWAP_TABLES);
 
-// ------------------------------------------------------------------ console
-
-/// Byte ring; when full, `push` drops the oldest byte.
-struct Ring<const N: usize> {
-    buf: [u8; N],
-    head: usize,
-    len: usize,
+/// Whether the guest's DTB has the swap device's node.
+fn dtb_has_swap(h: &BlobHeader) -> bool {
+    const NODE: &[u8] = b"virtio@f8000600";
+    // SAFETY: the header was validated, so the DTB lies inside the blob,
+    // in mapped flash.
+    let dtb = unsafe { core::slice::from_raw_parts((BLOB_ADDR + h.dtb_off as usize) as *const u8, h.dtb_len as usize) };
+    dtb.windows(NODE.len()).any(|w| w == NODE)
 }
 
-impl<const N: usize> Ring<N> {
-    const fn new() -> Self {
-        Ring { buf: [0; N], head: 0, len: 0 }
-    }
-    fn push(&mut self, b: u8) {
-        if self.len == N {
-            self.head = (self.head + 1) % N;
-            self.len -= 1;
-        }
-        self.buf[(self.head + self.len) % N] = b;
-        self.len += 1;
-    }
-    fn pop(&mut self) -> Option<u8> {
-        if self.len == 0 {
-            return None;
-        }
-        let b = self.buf[self.head];
-        self.head = (self.head + 1) % N;
-        self.len -= 1;
-        Some(b)
-    }
-    /// The oldest contiguous run of bytes.
-    fn front(&self) -> &[u8] {
-        let end = (self.head + self.len).min(N);
-        &self.buf[self.head..end]
-    }
-    fn consume(&mut self, n: usize) {
-        self.head = (self.head + n) % N;
-        self.len -= n;
-    }
+/// How long the radio may take to come up (and the guest wait for its MAC).
+const RADIO_BRING_UP_MS: u32 = 5000;
+
+// ------------------------------------------------------------------ core0's devices
+
+/// The UART's host side: core1's rings.
+struct RingConsole {
+    /// How long `putc` waits for room before dropping a byte (core1 parked
+    /// or wedged).
+    wait_cycles: u64,
 }
 
-/// Console output while no terminal is connected. A static, not a field:
-/// `main` moves the console into the platform and the bus by value, and a
-/// 16 KB ring in each of those stack slots overflowed the stack.
-static mut TX_RING: Ring<16384> = Ring::new();
-
-struct UsbConsole {
-    tx: &'static mut Ring<16384>,
-    rx: Ring<256>,
-}
-
-impl Console for UsbConsole {
+impl Console for RingConsole {
+    #[unsafe(link_section = ".data.rvemu_hot")]
     fn putc(&mut self, b: u8) {
-        self.tx.push(b);
+        if !CON_OUT.push(b) {
+            // full: core1 is sending to a terminal (or about to drop old
+            // output)
+            let t0 = board::mcycle64();
+            while !CON_OUT.push(b) && board::mcycle64() - t0 < self.wait_cycles {
+                core1::notify_core1();
+            }
+        }
+        core1::notify_core1();
     }
     fn rx_ready(&self) -> bool {
-        self.rx.len != 0
+        !CON_IN.is_empty()
     }
     fn getc(&mut self) -> Option<u8> {
-        self.rx.pop()
+        CON_IN.pop()
     }
 }
 
-struct PicoBus<'a> {
-    plat: Platform<UsbConsole, MemDisk, WifiLink>,
-    radio: Radio<'a>,
-    usb: UsbDevice<'static, hal::usb::UsbBus>,
-    serial: SerialPort<'static, hal::usb::UsbBus>,
+/// The guest's Ethernet: frames through core1's rings to the radio.
+struct RingLink {
+    /// How long the guest's first look at the MAC may wait for the radio.
+    wait_cycles: u64,
+}
+
+impl NetLink for RingLink {
+    fn mac(&self) -> [u8; 6] {
+        let t0 = board::mcycle64();
+        while wifi::RADIO.load(Ordering::Acquire) == wifi::RADIO_STARTING && board::mcycle64() - t0 < self.wait_cycles {
+            core::hint::spin_loop();
+        }
+        if wifi::RADIO.load(Ordering::Acquire) != wifi::RADIO_UP {
+            return [0; 6];
+        }
+        let (a, b) = (wifi::MAC[0].load(Ordering::Relaxed).to_le_bytes(), wifi::MAC[1].load(Ordering::Relaxed).to_le_bytes());
+        [a[0], a[1], a[2], a[3], b[0], b[1]]
+    }
+    fn link_up(&self) -> bool {
+        wifi::LINK_UP.load(Ordering::Acquire)
+    }
+    /// Dropped when core1 is behind by two frames, as a busy NIC would.
+    fn send(&mut self, frame: &[u8]) {
+        wifi::NET_TX.push_with(|slot| {
+            let n = frame.len().min(slot.len());
+            slot[..n].copy_from_slice(&frame[..n]);
+            Some(n)
+        });
+        core1::notify_core1();
+    }
+    /// A freed slot lets core1 hand over the next frame: wake it.
+    fn recv(&mut self, buf: &mut [u8; FRAME_MAX]) -> Option<usize> {
+        let r = wifi::NET_RX.pop_with(|f| {
+            let n = f.len().min(FRAME_MAX);
+            buf[..n].copy_from_slice(&f[..n]);
+            n
+        });
+        if r.is_some() {
+            core1::notify_core1();
+        }
+        r
+    }
+}
+
+struct PicoBus {
+    plat: Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>, BoardPins>,
     sys_hz: u32,
+    /// The last `core1::events()` acted on.
+    seen: u32,
 }
 
-impl PicoBus<'_> {
-    /// Service USB: take input, send buffered output, honour the 1200-baud
-    /// "touch" that asks for BOOTSEL. Run the radio driver. Then refresh the
-    /// guest's interrupt lines (which also delivers received frames).
+impl PicoBus {
+    /// Refresh the guest's interrupt lines (which also delivers received
+    /// frames) when core1 has handed over something new.
+    #[unsafe(link_section = ".data.rvemu_hot")]
+    #[inline]
     fn poll(&mut self) {
-        self.radio.poll();
-        if self.usb.poll(&mut [&mut self.serial]) {
-            let mut buf = [0u8; 64];
-            while let Ok(n) = self.serial.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                for &b in &buf[..n] {
-                    self.plat.con.rx.push(b);
-                }
-            }
+        let e = core1::events();
+        if e != self.seen {
+            self.seen = e;
+            self.plat.update_irqs();
         }
-        if self.serial.line_coding().data_rate() == 1200 && !self.serial.dtr() {
-            board::reboot_to_bootsel();
-        }
-        if self.serial.dtr() {
-            while self.plat.con.tx.len != 0 {
-                match self.serial.write(self.plat.con.tx.front()) {
-                    Ok(n) if n > 0 => self.plat.con.tx.consume(n),
-                    _ => break,
-                }
-            }
-        }
-        self.plat.update_irqs();
+        // GPIO edges (only lines the guest armed; one register read otherwise)
+        self.plat.poll_pins();
     }
 }
 
-impl Bus for PicoBus<'_> {
+impl Bus for PicoBus {
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
         self.plat.mmio_load(pa, size)
     }
@@ -228,6 +347,8 @@ impl Bus for PicoBus<'_> {
     }
     /// Interactive policy (as the Mac host's): wait in real time, at most
     /// 100 ms, for input or the timer deadline, then skip to the deadline.
+    /// core1 bumps its event word when input or a frame arrives, which ends
+    /// the wait at once.
     fn wfi(&mut self, cpu: &mut Cpu) {
         self.poll();
         if cpu.sip_value(self) & cpu.sie != 0 {
@@ -241,17 +362,93 @@ impl Bus for PicoBus<'_> {
         let ticks = cpu.stimecmp - now;
         let wait = (ticks.saturating_mul(hz) / u64::from(TIMEBASE_HZ)).min(hz / 10);
         let t0 = board::mcycle64();
+        // Erase one dirty swap sector (about 45 ms) unless the guest wakes
+        // within 2 ms. Erasing stalls everything, so idle time is the place.
+        let mut erased = false;
+        if wait >= hz / 500
+            && let Some(w) = &mut self.plat.swap
+            && w.disk.wants_erase()
+        {
+            w.disk.idle_erase();
+            erased = true;
+        }
         while board::mcycle64() - t0 < wait {
-            self.poll();
-            if cpu.sip_value(self) & cpu.sie != 0 {
+            if core1::events() != self.seen {
+                self.poll();
+                if cpu.sip_value(self) & cpu.sie != 0 {
+                    return;
+                }
+            }
+            // a GPIO edge the guest armed ends the wait too
+            self.plat.poll_pins();
+            if self.plat.plic.irq && cpu.sip_value(self) & cpu.sie != 0 {
                 return;
             }
         }
         if cpu.stimecmp == u64::MAX {
             return; // no timer armed: keep waiting for input
         }
+        // an erase can outlast the wait: keep guest time with wall time
+        let ticks = if erased {
+            ticks.max((board::mcycle64() - t0) * u64::from(TIMEBASE_HZ) / hz)
+        } else {
+            ticks
+        };
         cpu.time_skip += ticks;
         cpu.stats.idle_ticks += ticks;
+    }
+}
+
+/// What core1 runs: the console, the radio, a status line on RTT.
+struct Io<F> {
+    console: usbcon::UsbConsole,
+    radio: wifi::RadioService<F>,
+    status: Status,
+}
+
+impl<F: core::future::Future<Output = ()>> core1::Service for Io<F> {
+    #[unsafe(link_section = ".data.core1")]
+    fn poll(&mut self) {
+        self.console.poll();
+        self.radio.poll();
+        self.status.poll();
+    }
+}
+
+unsafe extern "C" {
+    /// core0's stack (riscv-rt's link.x): from `_estack` up to `_sstack`.
+    static _estack: u32;
+    static _sstack: u32;
+}
+
+fn core0_stack() -> (usize, usize) {
+    (&raw const _estack as usize, &raw const _sstack as usize)
+}
+
+/// Every `STATUS_S` seconds: how deep both stacks have been, on RTT.
+struct Status {
+    next: u64,
+    period: u64,
+}
+
+const STATUS_S: u32 = 10;
+
+impl Status {
+    #[unsafe(link_section = ".data.core1")]
+    fn poll(&mut self) {
+        let now = core1::now();
+        if now < self.next {
+            return;
+        }
+        self.next = now + self.period;
+        let (lo, hi) = core0_stack();
+        rprintln!(
+            "[core1] stack use: core0 {} of {} B, core1 {} of {} B",
+            core1::painted_stack_used(lo, hi),
+            hi - lo,
+            core1::stack_used(),
+            core1::STACK_BYTES
+        );
     }
 }
 
@@ -280,12 +477,13 @@ fn fail(msg: &str) -> ! {
 
 #[inline(never)]
 #[unsafe(link_section = ".data.rvemu_hot")]
-fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus<'_>) {
+fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus) {
     let mut events: u32 = 0;
     while cpu.halt.is_none() {
         jit.run_one(cpu, bus);
         events = events.wrapping_add(1);
-        // ~1-2 ms at today's dispatch rate: often enough for USB
+        // ~1-2 ms at today's dispatch rate; one SRAM load unless core1 has
+        // something for the guest, plus the pins' pending check
         if events & 0xFF == 0 {
             bus.poll();
         }
@@ -294,6 +492,23 @@ fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus<'_>) {
 
 #[hal::entry]
 fn main() -> ! {
+    let (jit, cpu, bus, sys_hz) = setup();
+    jit_loop(jit, cpu, bus);
+    let why = match cpu.halt {
+        Some(Halt::Shutdown) => "guest shut down",
+        _ => "guest stopped",
+    };
+    // let the last output reach the terminal
+    let t0 = board::mcycle64();
+    while !CON_OUT.is_empty() && board::mcycle64() - t0 < u64::from(sys_hz) {}
+    fail(why);
+}
+
+/// Everything before the guest runs: the board, core1, the guest's devices
+/// and the translator. Not inlined, so its temporaries (pin setup, device
+/// construction) leave the stack before `jit_loop`.
+#[inline(never)]
+fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus, u32) {
     board::bootsel_if_requested();
     rtt_init_print!(ChannelMode::NoBlockSkip, 1024);
     let mut pac = hal::pac::Peripherals::take().unwrap();
@@ -302,10 +517,11 @@ fn main() -> ! {
         board::init_clocks(pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB, &mut pac.RESETS, &mut watchdog);
     board::timer_ignore_debug_halt();
     board::enable_counters();
-    let sio = hal::Sio::new(pac.SIO);
+    let mut sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
     use hal::Clock as _;
     let sys_hz = clocks.system_clock.freq().to_Hz();
+    flash::set_sys_hz(sys_hz);
     rprintln!("\n=== rvemu-pico shell: Hazard3 @ {} MHz{} ===", sys_hz / 1_000_000, board::CLOCK_NOTE);
 
     let psram = match board::psram_init(pins.gpio0, sys_hz) {
@@ -317,19 +533,58 @@ fn main() -> ! {
         rprintln!("no valid guest blob at {:#010x}", BLOB_ADDR);
         fail("run scripts/pico-shell.sh");
     }
+    let seed = trng_seed(&pac.TRNG, &mut pac.RESETS);
 
-    // The radio first: the guest reads its MAC when it probes the NIC.
     let radio_pins = RadioPins { pwr: pins.gpio23, dio: pins.gpio24, cs: pins.gpio25, clk: pins.gpio29 };
     let creds = Creds::from_flash();
-    let driver: Pin<&mut dyn Future<Output = ()>> =
-        pin!(wifi::driver(pac.PIO0, &mut pac.RESETS, sys_hz, radio_pins, creds));
-    let mut radio = Radio::new(driver);
-    if !radio.bring_up(5_000_000) {
-        rprintln!("[wifi] radio did not come up; the guest's eth0 stays down");
-    }
     if let Some(c) = creds {
         rprintln!("[wifi] joining {:?} in the background", c.ssid());
     }
+
+    // The guest's GPIO, I2C, SPI, PWM and ADC (rvcore::periph, pins.rs).
+    let peri_hz = clocks.peripheral_clock.freq().to_Hz();
+    let mut gp: [Option<Gp>; rvcore::periph::NGPIO as usize] = [const { None }; rvcore::periph::NGPIO as usize];
+    macro_rules! free {
+        ($($n:literal $f:ident),*) => { $( gp[$n] = Some(Gp::new(pins.$f)); )* };
+    }
+    free!(1 gpio1, 2 gpio2, 3 gpio3, 8 gpio8, 9 gpio9, 10 gpio10, 11 gpio11, 12 gpio12, 13 gpio13, 14 gpio14,
+        15 gpio15, 20 gpio20, 21 gpio21, 22 gpio22, 26 gpio26, 27 gpio27, 28 gpio28, 30 gpio30, 31 gpio31,
+        32 gpio32, 33 gpio33, 34 gpio34, 35 gpio35, 36 gpio36, 37 gpio37, 38 gpio38, 39 gpio39);
+    debug_assert!((0..rvcore::periph::NGPIO as usize).all(|n| gp[n].is_some() == (rvcore::periph::FREE_PINS >> n & 1 != 0)));
+    use hal::fugit::RateExtU32;
+    let i2c0 = hal::I2C::i2c0(
+        pac.I2C0,
+        pins.gpio4.reconfigure(),
+        pins.gpio5.reconfigure(),
+        pins::i2c_hz(),
+        &mut pac.RESETS,
+        sys_hz.Hz(),
+    );
+    let i2c1 = hal::I2C::i2c1(
+        pac.I2C1,
+        pins.gpio6.reconfigure(),
+        pins.gpio7.reconfigure(),
+        pins::i2c_hz(),
+        &mut pac.RESETS,
+        sys_hz.Hz(),
+    );
+    let spi = hal::spi::Spi::<_, _, _, 8>::new(
+        pac.SPI0,
+        (pins.gpio19.reconfigure(), pins.gpio16.reconfigure(), pins.gpio18.reconfigure()),
+    )
+    .init(&mut pac.RESETS, peri_hz.Hz(), 1.MHz(), pins::SPI_MODE);
+    let adc_pins = [
+        pins.gpio40.into_floating_disabled().into_dyn_pin(),
+        pins.gpio41.into_floating_disabled().into_dyn_pin(),
+        pins.gpio42.into_floating_disabled().into_dyn_pin(),
+        pins.gpio43.into_floating_disabled().into_dyn_pin(),
+        pins.gpio44.into_floating_disabled().into_dyn_pin(),
+        pins.gpio45.into_floating_disabled().into_dyn_pin(),
+        pins.gpio46.into_floating_disabled().into_dyn_pin(),
+        pins.gpio47.into_floating_disabled().into_dyn_pin(),
+    ];
+    let set = PinSet { gp, i2c0, i2c1, spi, spi_cs: pins.gpio17.reconfigure(), adc_pins };
+    let board_pins = BoardPins::new(set, pac.PWM, pac.ADC, &mut pac.RESETS, sys_hz, peri_hz);
 
     // SAFETY: initialised once, here, before anything borrows it.
     let usb_bus: &'static UsbBusAllocator<hal::usb::UsbBus> = unsafe {
@@ -350,28 +605,59 @@ fn main() -> ! {
         .unwrap()
         .device_class(usbd_serial::USB_CLASS_CDC)
         .build();
-    // SAFETY: the one reference to TX_RING.
-    let con = UsbConsole { tx: unsafe { &mut *addr_of_mut!(TX_RING) }, rx: Ring::new() };
+    let ms = |n: u32| u64::from(sys_hz / 1000) * u64::from(n);
+    core1::paint_stack(core0_stack().0, 256);
+    // The radio comes up on core1 while the guest boots; the guest waits
+    // for its MAC (at most `RADIO_BRING_UP_MS`) when it probes the NIC.
+    let resets = &mut pac.RESETS;
+    core1::launch(&mut sio.fifo, &mut pac.PSM, sys_hz, move || Io {
+        console: usbcon::UsbConsole::new(usb, serial, sys_hz),
+        radio: wifi::RadioService::new(
+            wifi::driver(pac.PIO0, resets, sys_hz, radio_pins, creds),
+            sys_hz,
+            RADIO_BRING_UP_MS,
+        ),
+        status: Status { next: 0, period: u64::from(sys_hz) * u64::from(STATUS_S) },
+    });
+    // Self-test of what flash writes use.
+    let t0 = board::mcycle64();
+    core1::park();
+    core1::unpark();
+    rprintln!("core1 running; park/unpark took {} cycles", board::mcycle64() - t0);
+    let con = RingConsole { wait_cycles: ms(1000) };
     let disk = flash_disk();
     let disk_kib = disk.as_ref().map_or(0, |d| d.sectors() / 2);
     if disk.is_none() && h.initrd_len == 0 {
         fail("no root filesystem: no initramfs in the blob and no squashfs at 0x10600000");
     }
     let gmem = GuestMem { ptr: h.ram_host() as *mut u8, base: 0, size: h.ram_size, ro: h.text_len };
-    let mut plat = Platform::new(con).with_net(WifiLink, gmem);
-    if let Some(d) = disk {
-        plat = plat.with_disk(d, gmem);
-    }
-    let mut bus = PicoBus {
-        plat,
-        radio,
-        usb,
-        serial,
-        sys_hz,
+    // SAFETY: written once, here, before anything borrows it.
+    let bus = unsafe {
+        (*addr_of_mut!(BUS)).write(PicoBus { plat: Platform::new(con), sys_hz, seen: core1::events().wrapping_sub(1) })
     };
+    add_devices(bus, board_pins, disk, gmem, ms(RADIO_BRING_UP_MS));
 
     // SAFETY: guest RAM is the mapped, writable PSRAM; the header was checked.
     let dtb = unsafe { h.load() };
+    // SAFETY: the DTB `load` just copied into guest RAM (PSRAM).
+    let dtb_bytes = unsafe { core::slice::from_raw_parts_mut((h.ram_host() + dtb as usize) as *mut u8, h.dtb_len as usize) };
+    if patch_rng_seed(dtb_bytes, &seed) {
+        rprintln!("[rvemu-pico] rng-seed filled from the TRNG");
+    } else {
+        rprintln!("[rvemu-pico] the DTB has no rng-seed to fill from the TRNG");
+    }
+    // The swap device, only when the DTB has it; after `load`, which clears
+    // guest RAM. Writes start at a different sector each boot, which spreads
+    // erases over the region across boots.
+    let swap_on = dtb_has_swap(&h) && h.dtb_len as usize <= 0x10000 - SWAP_TABLES;
+    if swap_on {
+        let at = (h.ram_host() + h.ram_size as usize - SWAP_TABLES) as *mut FlashSwap<SwapFlash>;
+        // SAFETY: the top page of guest RAM (PSRAM, page aligned), reserved
+        // from the guest by its DTB and above the DTB itself.
+        let swap = unsafe { FlashSwap::init_at(at, SwapFlash::new(sys_hz), SWAP_SPARE) };
+        swap.set_head(board::mcycle64() as u32);
+        bus.plat.swap = Some(VirtioBlk::new(swap, gmem));
+    }
     // SAFETY: CPU and the translator tables are used only from here on.
     let cpu = unsafe {
         let p = (*addr_of_mut!(CPU)).as_mut_ptr();
@@ -379,14 +665,43 @@ fn main() -> ! {
         c.set_readonly_prefix(h.text_len);
         c
     };
-    // SAFETY: as above.
-    let mut jit = unsafe {
-        Jit::new(
+    let jit = make_jit(cpu);
+    // Guest RAM is PSRAM, where Hazard3 AMOs fault.
+    jit.native_amo = false;
+    rprintln!(
+        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
+        h.ram_size >> 10,
+        CODE_WORDS * 4 / 1024,
+        STORE_WORDS * 4 / 1024,
+        disk_kib,
+        if swap_on { "on" } else { "off" }
+    );
+    (jit, cpu, bus, sys_hz)
+}
+
+/// The guest's devices, built straight into the static bus (a `with_*`
+/// chain would keep a copy of the whole Platform per step on the stack), in
+/// a frame of their own.
+#[inline(never)]
+fn add_devices(bus: &mut PicoBus, pins: BoardPins, disk: Option<MemDisk>, gmem: GuestMem, radio_wait: u64) {
+    bus.plat.net = Some(VirtioNet::new(RingLink { wait_cycles: radio_wait }, gmem));
+    bus.plat.nor = Some(NorDev::new(BoardNor, gmem));
+    bus.plat.io = Some(rvcore::periph::Io::new(pins, gmem));
+    if let Some(d) = disk {
+        bus.plat.blk = Some(VirtioBlk::new(d, gmem));
+    }
+}
+
+/// The translator, in the static `JIT`, in a frame of its own.
+#[inline(never)]
+fn make_jit(cpu: &mut Cpu) -> &'static mut Jit<'static> {
+    // SAFETY: the translator tables are used only by this Jit, from here on.
+    unsafe {
+        (*addr_of_mut!(JIT)).write(Jit::new(
             cpu,
             JitMem {
                 code: &mut *addr_of_mut!(CODE),
                 buckets: &mut *addr_of_mut!(BUCKETS),
-                blocks: &mut *addr_of_mut!(BLOCKS),
                 code_pages: &mut *addr_of_mut!(CODE_PAGES),
                 jump_cache: &mut *addr_of_mut!(JUMP_CACHE),
                 regions: REGIONS,
@@ -396,28 +711,8 @@ fn main() -> ! {
                 store: core::slice::from_raw_parts_mut(STORE as *mut u32, STORE_WORDS),
                 store_epochs: &mut *addr_of_mut!(STORE_EPOCHS),
             },
-        )
-    };
-    // Guest RAM is PSRAM, where Hazard3 AMOs fault.
-    jit.native_amo = false;
-    rprintln!(
-        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB; console on USB",
-        h.ram_size >> 10,
-        CODE_WORDS * 4 / 1024,
-        STORE_WORDS * 4 / 1024,
-        disk_kib
-    );
-    jit_loop(&mut jit, cpu, &mut bus);
-    let why = match cpu.halt {
-        Some(Halt::Shutdown) => "guest shut down",
-        _ => "guest stopped",
-    };
-    // let the last output reach the terminal
-    let t0 = board::mcycle64();
-    while board::mcycle64() - t0 < u64::from(sys_hz) {
-        bus.poll();
+        ))
     }
-    fail(why);
 }
 
 #[unsafe(link_section = ".bi_entries")]

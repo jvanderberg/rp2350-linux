@@ -1,0 +1,7 @@
+config BR2_PACKAGE_MICROPYTHON_MACHINE
+	bool "micropython-machine"
+	depends on BR2_PACKAGE_MICROPYTHON
+	help
+	  MicroPython's machine module (Pin, I2C, SPI, PWM, ADC) on the
+	  Linux GPIO character device, i2c-dev, spidev, the PWM class and
+	  IIO, plus the fcntl.ioctl it needs, built into MicroPython.

@@ -11,7 +11,18 @@ pub mod cpu;
 pub mod dev;
 pub mod instrument;
 mod mmu;
+pub mod nor;
+pub mod periph;
 mod sbi;
+pub mod swapdev;
 pub mod virtio;
 
 pub use cpu::*;
+
+/// The `rng-seed` the generated device trees carry in `/chosen`, so the guest
+/// kernel's CRNG is ready at boot instead of never (it has no other entropy
+/// source, and without it every `get_random_*` re-extracts its pool). These
+/// fixed bytes keep batch runs and the benchmark deterministic; whatever
+/// boots a guest for interactive use (the shell firmware, the Mac host
+/// without `-B`) overwrites them in the DTB with real randomness.
+pub const DTB_RNG_SEED: [u8; 32] = *b"rvemu: fixed DTB rng-seed bytes!";

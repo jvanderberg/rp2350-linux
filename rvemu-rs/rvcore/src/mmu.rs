@@ -178,6 +178,22 @@ impl Cpu {
         Err(PFAULT[acc])
     }
 
+    /// A TLB miss in translated code: the host address of `va` once an entry
+    /// for it is installed, or None (MMIO, a fault, a write to a code page)
+    /// for the interpreter to do the access. Changes nothing the
+    /// interpreter's own fill would not.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn tlb_refill(&mut self, va: u32, acc: usize) -> Option<usize> {
+        let smc = self.smc_page;
+        match self.tlb_fill(va, acc) {
+            Ok((_, Some(h))) if self.tlb_lookup(va, acc).is_some() => Some(h),
+            _ => {
+                self.smc_page = smc;
+                None
+            }
+        }
+    }
+
     /// TLB miss: translate and, if the target is RAM, install an entry.
     /// Returns the physical address and the host address (None for MMIO).
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]

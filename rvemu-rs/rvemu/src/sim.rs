@@ -32,7 +32,7 @@ use std::io::{BufWriter, Write};
 
 use rvcore::instrument::XipCache;
 use rvcore::{ACC_R, ACC_W, ACC_X, Cpu, Priv};
-use rvjit::{Block, BlockEnd, JcEntry, Jit, JitMem, PreludeLayout};
+use rvjit::{BlockEnd, JcEntry, Jit, JitMem, PreludeLayout};
 
 const BUDGET_CAP: i64 = 1 << 20;
 /// Where code fetched through XIP sits in the cache model: away from guest
@@ -954,7 +954,6 @@ impl Sim {
             JitMem {
                 code: leak(0u32, 64 * 1024),
                 buckets: leak(0u32, 1024),
-                blocks: leak(Block::EMPTY, 16),
                 code_pages: leak(0u8, pages / 8 + 1),
                 jump_cache: leak(JcEntry::EMPTY, 1024),
                 regions: 1,

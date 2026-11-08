@@ -18,6 +18,9 @@ pub const VIRTIO_IRQ: u32 = 2;
 /// Network device registers.
 pub const VIRTIO_NET_BASE: u32 = 0xF800_0200;
 pub const VIRTIO_NET_IRQ: u32 = 3;
+/// Swap device registers (a second, writable block device).
+pub const VIRTIO_SWAP_BASE: u32 = 0xF800_0600;
+pub const VIRTIO_SWAP_IRQ: u32 = 5;
 
 const MAGIC: u32 = 0x7472_6976; // "virt"
 const DEVICE_NET: u32 = 1;
@@ -40,6 +43,7 @@ const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 
 const BLK_F_RO: u32 = 1 << 5;
+const BLK_F_BLK_SIZE: u32 = 1 << 6;
 const BLK_T_IN: u32 = 0;
 const BLK_T_OUT: u32 = 1;
 const BLK_T_FLUSH: u32 = 4;
@@ -64,10 +68,39 @@ pub trait Disk {
     fn read_only(&self) -> bool {
         true
     }
+    /// Logical block size offered to the driver (a power of two, >= 512).
+    fn block_size(&self) -> u32 {
+        512
+    }
+    /// The device ID (`/sys/block/vdX/serial` in the guest), NUL padded.
+    fn id(&self) -> [u8; 20] {
+        *b"rvemu-disk\0\0\0\0\0\0\0\0\0\0"
+    }
     /// Fill `buf` from byte offset `sector * 512`; false on error.
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> bool;
     fn write(&mut self, _sector: u64, _buf: &[u8]) -> bool {
         false
+    }
+}
+
+impl<D: Disk + ?Sized> Disk for &mut D {
+    fn sectors(&self) -> u64 {
+        (**self).sectors()
+    }
+    fn read_only(&self) -> bool {
+        (**self).read_only()
+    }
+    fn block_size(&self) -> u32 {
+        (**self).block_size()
+    }
+    fn id(&self) -> [u8; 20] {
+        (**self).id()
+    }
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> bool {
+        (**self).read(sector, buf)
+    }
+    fn write(&mut self, sector: u64, buf: &[u8]) -> bool {
+        (**self).write(sector, buf)
     }
 }
 
@@ -155,7 +188,7 @@ pub struct GuestMem {
 }
 
 impl GuestMem {
-    fn range(&self, pa: u64, len: usize) -> Option<*mut u8> {
+    pub(crate) fn range(&self, pa: u64, len: usize) -> Option<*mut u8> {
         let off = pa.checked_sub(self.base as u64)?;
         (off.checked_add(len as u64)? <= self.size as u64).then(|| {
             // SAFETY: in bounds of guest RAM (checked above).
@@ -163,7 +196,7 @@ impl GuestMem {
         })
     }
     /// As `range`, for a device write.
-    fn range_mut(&self, pa: u64, len: usize) -> Option<*mut u8> {
+    pub(crate) fn range_mut(&self, pa: u64, len: usize) -> Option<*mut u8> {
         if pa < self.base as u64 + self.ro as u64 {
             return None;
         }
@@ -179,7 +212,7 @@ impl GuestMem {
     fn u16(&self, pa: u64) -> Option<u16> {
         self.read::<2>(pa).map(u16::from_le_bytes)
     }
-    fn u32(&self, pa: u64) -> Option<u32> {
+    pub(crate) fn u32(&self, pa: u64) -> Option<u32> {
         self.read::<4>(pa).map(u32::from_le_bytes)
     }
     fn u64(&self, pa: u64) -> Option<u64> {
@@ -450,7 +483,8 @@ pub struct VirtioBlk<D: Disk> {
 impl<D: Disk> VirtioBlk<D> {
     pub fn new(disk: D, mem: GuestMem) -> Self {
         let ro = if disk.read_only() { BLK_F_RO } else { 0 };
-        VirtioBlk { disk, t: Transport::new(mem, DEVICE_BLK, &[BLK_QUEUE], ro) }
+        let bs = if disk.block_size() != 512 { BLK_F_BLK_SIZE } else { 0 };
+        VirtioBlk { disk, t: Transport::new(mem, DEVICE_BLK, &[BLK_QUEUE], ro | bs) }
     }
 
     pub fn irq_line(&self) -> bool {
@@ -463,8 +497,12 @@ impl<D: Disk> VirtioBlk<D> {
 
     pub fn load(&mut self, off: u32, size: u32) -> Result<u32, u32> {
         if off >= 0x100 {
-            // virtio_blk_config: u64 capacity, then fields we don't offer
-            return Ok(config_read(&self.disk.sectors().to_le_bytes(), off - 0x100, size));
+            // virtio_blk_config: u64 capacity, size_max, seg_max, geometry,
+            // blk_size; the rest isn't offered
+            let mut cfg = [0u8; 24];
+            cfg[..8].copy_from_slice(&self.disk.sectors().to_le_bytes());
+            cfg[20..].copy_from_slice(&self.disk.block_size().to_le_bytes());
+            return Ok(config_read(&cfg, off - 0x100, size));
         }
         if size != 4 {
             return Err(crate::cpu::exc::LOAD_FAULT);
@@ -547,7 +585,7 @@ impl<D: Disk> VirtioBlk<D> {
             }
             BLK_T_FLUSH => BLK_S_OK,
             BLK_T_GET_ID => {
-                let id = b"rvemu-disk\0\0\0\0\0\0\0\0\0\0";
+                let id = self.disk.id();
                 match data.first() {
                     Some(d) if d.flags & DESC_F_WRITE != 0 => {
                         let len = (d.len as usize).min(id.len());

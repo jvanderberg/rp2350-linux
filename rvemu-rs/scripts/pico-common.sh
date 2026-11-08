@@ -3,8 +3,13 @@
 # RP2350 into USB BOOTSEL and load the guest blob + firmware with picotool.
 
 P=${PROBE_RS:-$HOME/git/toolchains/probe-rs-master/bin/probe-rs}
+# What was last written to the board's flash, and when the firmware was last
+# started (target/ is never tracked).
+mkdir -p target
 BLOB_STAMP=target/pico-linux-blob.sha256
 DISK_STAMP=target/pico-linux-disk.sha256
+TEXT_STAMP=target/pico-linux-text.sha256
+LAUNCH=target/pico-last-launch
 
 in_bootsel() { picotool info >/dev/null 2>&1; }
 wait_bootsel() { for _ in $(seq 1 "$1"); do in_bootsel && return 0; sleep 1; done; return 1; }
@@ -39,11 +44,11 @@ ensure_bootsel() {
   request_bootsel || { echo "pico: target never appeared in BOOTSEL (USB data connection?)"; exit 1; }
 }
 
-# Flash map (16 MB): firmware, Wi-Fi settings in the 4 KB at 0x103FF000,
+# Flash map (16 MB): firmware, /home (jffs2, written only by the firmware) at
+# 0x10100000, swap at 0x10200000, Wi-Fi settings in the 4 KB at 0x103FF000,
 # guest blob at 0x10400000 (2 MB), root filesystem at 0x10600000, kernel text
 # in the last bytes before 0x11000000 (guest_blob.rs).
 WIFI_ADDR=0x103ff000
-OLD_WIFI_ADDR=0x10ff0000   # before the kernel text moved to the end of flash
 
 # load_at FILE ADDR STAMP WHAT: write FILE to flash at ADDR unless STAMP says it is there
 load_at() {
@@ -67,22 +72,6 @@ load_text() {
   local n; n=$(wc -c < "$1" | tr -d ' ')
   load_at "$1" "$(printf '0x%x' $((0x11000000 - n)))" "$TEXT_STAMP" "kernel text"
 }
-TEXT_STAMP=target/pico-linux-text.sha256
-
-# keep_wifi: once, copy Wi-Fi settings stored at the old address to the new
-# one (picotool wants both range bounds in hex; a failed read stops the load)
-keep_wifi() {
-  local t; t=$(mktemp -d)
-  picotool save -r $WIFI_ADDR "$(printf 0x%x $((WIFI_ADDR + 4096)))" "$t/new.bin" -t bin >/dev/null
-  if [ "$(head -c 4 "$t/new.bin" 2>/dev/null)" != WIFI ]; then
-    picotool save -r $OLD_WIFI_ADDR "$(printf 0x%x $((OLD_WIFI_ADDR + 4096)))" "$t/old.bin" -t bin >/dev/null
-    if [ "$(head -c 4 "$t/old.bin" 2>/dev/null)" = WIFI ]; then
-      echo "pico: moving the stored Wi-Fi network to $WIFI_ADDR"
-      picotool load -t bin "$t/old.bin" -o $WIFI_ADDR >/dev/null
-    fi
-  fi
-  rm -rf "$t"
-}
 
 # text_len IMAGE: bytes of the Image that are pure text (from its System.map):
 # _etext - _start, rounded down to a page (that page also holds .init)
@@ -99,13 +88,21 @@ print((e-s)//4096*4096)" "$m"
 
 # pack_guest IMAGE INITRD RAM_MB BLOB_OUT TEXT_OUT: device tree as the Mac host
 # makes it, then the blob and the kernel text. INITRD "-" means none: root on
-# the disk (pass its image as DISK=). NET=1 adds the network device node.
+# the disk (pass its image as DISK=). NET=1 adds the network device node,
+# NOR=1 the flash device node (/home in the storage region 0x10100000).
+# IO=1 the pin devices (GPIO, I2C, SPI, PWM, ADC).
 pack_guest() {
   local dts dtb initrd=$2 src tl; dts=$(mktemp); dtb=$(mktemp)
   tl=$(text_len "$1")
   if [ "$initrd" = - ]; then src=(-d "$DISK"); initrd=/dev/null; else src=(-i "$initrd"); fi
   # NET=1: the firmware has the Wi-Fi virtio-net device
   [ "${NET:-0}" = 1 ] && src+=(-N)
+  # NOR=1: the firmware has the /home flash device (-D never opens the file)
+  [ "${NOR:-0}" = 1 ] && src+=(-F /dev/null)
+  # SWAP=1: the swap device node (rvemu-pico-shell's flash swap, /dev/vdb)
+  [ "${SWAP:-0}" = 1 ] && src+=(-W)
+  # IO=1: the firmware drives the board's pins (rvemu-pico/src/pins.rs)
+  [ "${IO:-0}" = 1 ] && src+=(-G)
   ./target/release/rvemu -D -m "$3" -X "$tl" "${src[@]}" > "$dts"
   dtc -q -I dts -O dtb -o "$dtb" "$dts"
   python3 ../rp2350/tools/pack-guest.py "$1" "$initrd" "$dtb" "$3" "$tl" "$4" "$5"

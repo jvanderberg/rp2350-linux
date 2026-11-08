@@ -7,12 +7,21 @@ use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use rvcore::dev::{Console, PLIC_BASE, PLIC_SIZE, Platform, UART_BASE, UART_IRQ, UART_SIZE};
-use rvcore::virtio::{GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE};
+use norfile::FileNor;
+use rvcore::nor::{NOR_BASE, NOR_SIZE};
+use rvcore::swapdev::{CHUNK, Flash, FlashSwap, PAGE};
+use rvcore::virtio::{
+    GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE, VIRTIO_SWAP_BASE,
+    VIRTIO_SWAP_IRQ,
+};
 use stubnet::StubNet;
-use rvcore::{Bus, Cpu, Halt, Priv, TIMEBASE_HZ};
+use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, Priv, TIMEBASE_HZ};
+use stubpins::StubPins;
 
+mod norfile;
 mod sim;
 mod stubnet;
+mod stubpins;
 
 const DTB_RESERVE: u32 = 0x10000; // top 64 KiB of RAM holds the DTB
 
@@ -130,10 +139,62 @@ impl Console for TermConsole {
     }
 }
 
+// ------------------------------------------------------------------ swap
+
+/// The board's swap region (0x10200000-0x103FEFFF) as host memory, with
+/// W25Q128 datasheet-typical erase and program times on a 348 MHz cycle
+/// count, so the swap statistics estimate what the board would stall.
+struct ModelFlash {
+    data: Vec<u8>,
+    cycles: u64,
+}
+
+const SWAP_SECTORS: u32 = 511;
+/// Sectors kept free for bursts of writes (the board's choice too).
+const SWAP_SPARE: u32 = 63;
+const MODEL_HZ: u32 = 348_000_000;
+/// With -W, the guest's top page of RAM is reserved (the board's swap map).
+const SWAP_TABLES_SIZE: u32 = 0x1000;
+
+impl ModelFlash {
+    fn new() -> Self {
+        // old contents: every sector needs an erase before its first use
+        ModelFlash { data: vec![0; SWAP_SECTORS as usize * PAGE], cycles: 0 }
+    }
+}
+
+impl Flash for ModelFlash {
+    fn sectors(&self) -> u32 {
+        SWAP_SECTORS
+    }
+    fn erase(&mut self, sector: u32) -> bool {
+        let o = sector as usize * PAGE;
+        self.data[o..o + PAGE].fill(0xFF);
+        self.cycles += u64::from(MODEL_HZ) * 45 / 1000;
+        true
+    }
+    fn program(&mut self, off: u32, data: &[u8; CHUNK]) -> bool {
+        for (f, &d) in self.data[off as usize..off as usize + CHUNK].iter_mut().zip(data) {
+            *f &= d; // NOR: programming only clears bits
+        }
+        self.cycles += u64::from(MODEL_HZ) * 7 / 10_000;
+        true
+    }
+    fn read(&self, off: u32, buf: &mut [u8]) {
+        buf.copy_from_slice(&self.data[off as usize..off as usize + buf.len()]);
+    }
+    fn cycles(&self) -> u64 {
+        self.cycles
+    }
+    fn hz(&self) -> u32 {
+        MODEL_HZ
+    }
+}
+
 // ------------------------------------------------------------------ bus
 
 struct HostBus {
-    plat: Platform<TermConsole, MemDisk, StubNet>,
+    plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>, StubPins>,
     interactive: bool,
 }
 
@@ -141,6 +202,7 @@ impl HostBus {
     fn poll(&mut self) {
         self.plat.con.read_input();
         self.plat.update_irqs();
+        self.plat.poll_pins();
     }
 }
 
@@ -171,6 +233,10 @@ impl Bus for HostBus {
         if cpu.sip_value(self) & cpu.sie != 0 {
             return;
         }
+        // as the board does: erase a dirty swap sector while the guest idles
+        if let Some(w) = &mut self.plat.swap {
+            w.disk.idle_erase();
+        }
         let now = cpu.time();
         if cpu.stimecmp <= now {
             return;
@@ -200,7 +266,40 @@ impl Bus for HostBus {
 
 // ------------------------------------------------------------------ setup
 
-fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u32)>, disk: bool, net: bool) -> String {
+/// Bytes as a DTS byte string body: `72 76 ...`.
+fn dts_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+fn os_random() -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut b = [0u8; 32];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| format!("/dev/urandom: {e}"))?;
+    Ok(b)
+}
+
+/// What the generated device tree describes; each optional device adds a node.
+#[derive(Clone, Copy)]
+struct DtsOpts<'a> {
+    ram_base: u32,
+    ram_size: u32,
+    bootargs: &'a str,
+    /// [start, end) of the initramfs in guest physical memory
+    initrd: Option<(u32, u32)>,
+    /// virtio-blk at VIRTIO_BASE
+    disk: bool,
+    /// virtio-net at VIRTIO_NET_BASE
+    net: bool,
+    /// NOR flash (`rvemu,flash`) at NOR_BASE
+    nor: bool,
+    /// swap virtio-blk at VIRTIO_SWAP_BASE, and the top RAM page reserved
+    swap: bool,
+    /// the pin devices at IO_BASE (gpio)
+    gpio: bool,
+}
+
+fn make_dts(o: &DtsOpts) -> String {
+    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap, gpio } = *o;
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -223,6 +322,36 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     if net {
         virtio += &node(VIRTIO_NET_BASE, VIRTIO_NET_IRQ);
     }
+    let seed = dts_bytes(&DTB_RNG_SEED);
+    if nor {
+        virtio += &format!(
+            r#"    flash@{NOR_BASE:x} {{
+      compatible = "rvemu,flash";
+      reg = <0x{NOR_BASE:x} 0x{NOR_SIZE:x}>;
+    }};
+"#
+        );
+    }
+    // the swap device, and the top page of RAM kept from the guest: the
+    // board keeps the swap map there (rvemu-pico-shell, SWAP_TABLES)
+    let mut reserved = String::new();
+    if swap {
+        virtio += &node(VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ);
+        let at = ram_base + ram_size - SWAP_TABLES_SIZE;
+        reserved = format!(
+            r#"  reserved-memory {{
+    #address-cells = <1>;
+    #size-cells = <1>;
+    ranges;
+    swap-tables@{at:x} {{
+      reg = <0x{at:x} 0x{SWAP_TABLES_SIZE:x}>;
+      no-map;
+    }};
+  }};
+"#
+        );
+    }
+    let (io_root, io_soc) = if gpio { io_nodes() } else { (String::new(), String::new()) };
     format!(
         r#"/dts-v1/;
 / {{
@@ -230,9 +359,10 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
   #size-cells = <1>;
   model = "rvemu";
   compatible = "rvemu";
-  chosen {{
+{io_root}  chosen {{
     bootargs = "{bootargs}";
     stdout-path = "/soc/serial@f4000000";
+    rng-seed = [{seed}];
 {initrd}  }};
   cpus {{
     #address-cells = <1>;
@@ -257,7 +387,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     device_type = "memory";
     reg = <0x{ram_base:x} 0x{ram_size:x}>;
   }};
-  soc {{
+{reserved}  soc {{
     #address-cells = <1>;
     #size-cells = <1>;
     compatible = "simple-bus";
@@ -279,10 +409,93 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
       clock-frequency = <5000000>;
       no-loopback-test;
     }};
-{virtio}  }};
+{virtio}{io_soc}  }};
 }};
 "#
     )
+}
+
+/// The board's pins (`-G`, rvcore::periph): root-level nodes (aliases fixing
+/// the bus numbers) and the devices on the soc.
+fn io_nodes() -> (String, String) {
+    use rvcore::periph::*;
+    // RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc: only these (for measuring)
+    let only = std::env::var("RVEMU_IO").ok();
+    let want = |d: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == d));
+    let names = LINE_NAMES.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+    let (mut root, mut soc, mut aliases) = (String::new(), String::new(), String::new());
+    if want("gpio") {
+        soc += &format!(
+            r#"    gpio@{GPIO_BASE:x} {{
+      compatible = "rvemu,gpio";
+      reg = <0x{GPIO_BASE:x} 0x{GPIO_SIZE:x}>;
+      interrupts = <{GPIO_IRQ}>;
+      interrupt-parent = <&plic0>;
+      gpio-controller;
+      #gpio-cells = <2>;
+      interrupt-controller;
+      #interrupt-cells = <2>;
+      gpio-line-names = {names};
+    }};
+"#
+        );
+    }
+    for (k, base) in I2C_BASE.into_iter().enumerate() {
+        if !want(&format!("i2c{k}")) {
+            continue;
+        }
+        aliases += &format!("    i2c{k} = &i2c{k};\n");
+        soc += &format!(
+            r#"    i2c{k}: i2c@{base:x} {{
+      compatible = "rvemu,i2c";
+      reg = <0x{base:x} 0x{I2C_SIZE:x}>;
+      #address-cells = <1>;
+      #size-cells = <0>;
+    }};
+"#
+        );
+    }
+    if want("spi") {
+        aliases += "    spi0 = &spi0;\n";
+        soc += &format!(
+            r#"    spi0: spi@{SPI_BASE:x} {{
+      compatible = "rvemu,spi";
+      reg = <0x{SPI_BASE:x} 0x{SPI_SIZE:x}>;
+      #address-cells = <1>;
+      #size-cells = <0>;
+      spidev@0 {{
+        compatible = "rohm,dh2228fv";
+        reg = <0>;
+        spi-max-frequency = <{SPI_MAX_HZ}>;
+      }};
+    }};
+"#
+        );
+    }
+    if want("pwm") {
+        soc += &format!(
+            r#"    pwm@{PWM_BASE:x} {{
+      compatible = "rvemu,pwm";
+      reg = <0x{PWM_BASE:x} 0x{PWM_SIZE:x}>;
+      #pwm-cells = <3>;
+    }};
+"#
+        );
+    }
+    if want("adc") {
+        soc += &format!(
+            r#"    adc@{ADC_BASE:x} {{
+      compatible = "rvemu,adc";
+      reg = <0x{ADC_BASE:x} 0x{ADC_SIZE:x}>;
+      #io-channel-cells = <1>;
+    }};
+"#
+        );
+    }
+    if !aliases.is_empty() {
+        root = format!("  aliases {{\n{aliases}  }};\n{root}");
+    }
+    (root, soc)
 }
 
 fn compile_dts(dts: &str) -> Result<Vec<u8>, String> {
@@ -404,6 +617,14 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  guest/post-build-disk.sh)
   -N             virtio network device on a stub LAN: gateway 10.0.2.2
                  answers ARP and ping (the guest is 52:54:00:12:34:56)
+  -F FILE        NOR flash device (the board's /home region, 1 MB) backed by
+                 FILE, created blank if missing; with -D, any FILE adds the node
+  -W             swap device (/dev/vdb in the disk guest): the board's flash
+                 swap on a modelled flash (511 sectors), statistics in the
+                 page after the swap area (flashswap-stats)
+  -G             the board's pins: GPIO, I2C, SPI, PWM, ADC on a simulated
+                 board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins,
+                 RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc picks the devices)
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size (default 64)
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only
@@ -436,8 +657,11 @@ struct Opts {
     sim_out: String,
     corpus: Option<String>,
     disk: Option<String>,
+    nor: Option<String>,
     bootargs_set: bool,
     net: bool,
+    swap: bool,
+    io: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -457,8 +681,11 @@ fn parse_args() -> Result<Opts, String> {
         sim_out: "sim.json".into(),
         corpus: None,
         disk: None,
+        nor: None,
         bootargs_set: false,
         net: false,
+        swap: false,
+        io: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -485,6 +712,9 @@ fn parse_args() -> Result<Opts, String> {
             }
             "-d" => o.disk = Some(val()?),
             "-N" => o.net = true,
+            "-F" => o.nor = Some(val()?),
+            "-W" => o.swap = true,
+            "-G" => o.io = true,
             "-u" => o.until = Some(val()?),
             "-n" => o.max_insns = val()?.parse().map_err(|_| "bad -n")?,
             "-M" => o.model = true,
@@ -532,18 +762,24 @@ fn run() -> Result<(), String> {
         }
         None => 0,
     };
-    let dts = make_dts(
+    let dts = make_dts(&DtsOpts {
         ram_base,
         ram_size,
-        &o.bootargs,
-        initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
-        o.disk.is_some(),
-        o.net,
-    );
+        bootargs: &o.bootargs,
+        initrd: initrd.as_ref().map(|d| (ram_base + initrd_addr, ram_base + initrd_addr + d.len() as u32)),
+        disk: o.disk.is_some(),
+        net: o.net,
+        nor: o.nor.is_some(),
+        swap: o.swap,
+        gpio: o.io,
+    });
     if o.dump_dts {
         print!("{dts}");
         return Ok(());
     }
+    // interactive: a real seed (batch runs keep the fixed one, to stay
+    // deterministic)
+    let dts = if o.batch { dts } else { dts.replace(&dts_bytes(&DTB_RNG_SEED), &dts_bytes(&os_random()?)) };
 
     let mut ram = vec![0u8; ram_size as usize].into_boxed_slice();
     let kimg = read(o.kernel.as_deref().unwrap())?;
@@ -584,6 +820,15 @@ fn run() -> Result<(), String> {
     }
     if o.net {
         plat = plat.with_net(StubNet::default(), gmem);
+    }
+    if let Some(path) = &o.nor {
+        plat = plat.with_nor(FileNor::open(path)?, gmem);
+    }
+    if o.swap {
+        plat = plat.with_swap(FlashSwap::new(ModelFlash::new(), SWAP_SPARE), gmem);
+    }
+    if o.io {
+        plat = plat.with_io(StubPins::new(), gmem);
     }
     let mut bus = HostBus { plat, interactive: !o.batch };
 

@@ -1,0 +1,51 @@
+From e3d476fc20b956f50c25d7554e7d5f711946c84c Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 01:19:56 -0600
+Subject: [PATCH 5/7] riscv32: hidden return pointer is not a parameter in
+ gfunc_call
+
+With a struct or long double returned through a hidden first argument,
+each real argument was matched against the parameter before it, so the
+last named one was taken as variadic: a double went to an even register
+pair (a2:a3 instead of a1:a2).
+---
+ riscv32-gen.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/riscv32-gen.c b/riscv32-gen.c
+index 0dc7d9a4..f555405a 100644
+--- a/riscv32-gen.c
++++ b/riscv32-gen.c
+@@ -413,12 +413,19 @@ ST_FUNC void gfunc_call(int nb_args)
+     int i, align, size, areg;
+     int *info = tcc_malloc((nb_args + 1) * sizeof (int));
+     int stack_adj = 0, tempspace = 0, stack_add, ofs, splitofs = 0;
+-    int old = (vtop[-nb_args].type.ref->f.func_type == FUNC_OLD);
++    int old = (vtop[-nb_args].type.ref->f.func_type == FUNC_OLD), hidden;
++    CType *rt;
+     SValue *sv;
+     Sym *sa;
+ 
+     areg = 0;
+     sa = vtop[-nb_args].type.ref->next;
++    /* a returned struct or long double over 8 bytes: the hidden pointer
++       to it is the first argument, and not one of the parameters */
++    rt = &vtop[-nb_args].type.ref->type;
++    hidden = nb_args && ((rt->t & VT_BTYPE) == VT_STRUCT
++                         || (rt->t & VT_BTYPE) == VT_LDOUBLE)
++             && type_size(rt, &align) > 2 * XLEN;
+     for (i = 0; i < nb_args; i++) {
+         int nregs, byref = 0, tempofs;
+         sv = &vtop[1 + i - nb_args];
+@@ -456,7 +463,7 @@ ST_FUNC void gfunc_call(int nb_args)
+             }
+         }
+         info[i] |= byref;
+-        if (sa)
++        if (sa && !(i == 0 && hidden))
+           sa = sa->next;
+     }
+     stack_adj = (stack_adj + 15) & -16;
+-- 
+2.38.1
+

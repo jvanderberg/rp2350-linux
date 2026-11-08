@@ -1,0 +1,59 @@
+From e2e9b82e62999e7e35bbfbc5652e5295601365df Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 01:03:46 -0600
+Subject: [PATCH 4/7] riscv64-asm: fix srl, blez/bgez, sraw/sraiw encodings
+
+srl was assembled as xor, blez and bgez had their operands swapped, and
+sraw/sraiw lacked bit 30 (they were srlw/srliw). Checked against llvm-mc
+for every rv32ima instruction and pseudo-instruction.
+---
+ riscv64-asm.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/riscv64-asm.c b/riscv64-asm.c
+index 7fd605db..315d2f4c 100644
+--- a/riscv64-asm.c
++++ b/riscv64-asm.c
+@@ -1063,13 +1063,13 @@ static void asm_branch_opcode(TCCState *s1, int token, int argc)
+         asm_emit_b(token, 0x63 | (0 << 12), &ops[0], &zero, &ops[1]);
+         return;
+     case TOK_ASM_blez:
+-        /* bge rs, zero, offset */
+-        asm_emit_b(token, 0x63 | (5 << 12), &ops[0], &zero, &ops[1]);
+-        return;
+-    case TOK_ASM_bgez:
+         /* bge zero, rs, offset */
+         asm_emit_b(token, 0x63 | (5 << 12), &zero, &ops[0], &ops[1]);
+         return;
++    case TOK_ASM_bgez:
++        /* bge rs, zero, offset */
++        asm_emit_b(token, 0x63 | (5 << 12), &ops[0], &zero, &ops[1]);
++        return;
+     case TOK_ASM_bltz:
+         /* blt rs, zero, offset */
+         asm_emit_b(token, 0x63 | (4 << 12), &ops[0], &zero, &ops[1]);
+@@ -1094,7 +1094,7 @@ static void asm_ternary_opcode(TCCState *s1, int token)
+         asm_emit_i(token, (4 << 2) | 3 | (1 << 12), &ops[0], &ops[1], &ops[2]);
+         return;
+     case TOK_ASM_srl:
+-        asm_emit_r(token, (0xC << 2) | 3 | (4 << 12), &ops[0], &ops[1], &ops[2]);
++        asm_emit_r(token, (0xC << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
+         return;
+     case TOK_ASM_srli:
+         asm_emit_i(token, (0x4 << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
+@@ -1118,10 +1118,10 @@ static void asm_ternary_opcode(TCCState *s1, int token)
+         asm_emit_i(token, (0x6 << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
+         return;
+     case TOK_ASM_sraw:
+-        asm_emit_r(token, (0xE << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
++        asm_emit_r(token, (0xE << 2) | 3 | (5 << 12) | (32 << 25), &ops[0], &ops[1], &ops[2]);
+         return;
+     case TOK_ASM_sraiw:
+-        asm_emit_i(token, (0x6 << 2) | 3 | (5 << 12), &ops[0], &ops[1], &ops[2]);
++        asm_emit_i(token, (0x6 << 2) | 3 | (5 << 12) | (32 << 25), &ops[0], &ops[1], &ops[2]);
+         return;
+ 
+     // Arithmetic (RD,RS1,(RS2|IMM)); R-format, I-format or U-format
+-- 
+2.38.1
+

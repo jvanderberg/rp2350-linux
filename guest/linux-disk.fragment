@@ -38,3 +38,45 @@ CONFIG_BASE_SMALL=y
 CONFIG_INET_TABLE_PERTURB_ORDER=8
 # overlayfs wants xattrs on its tmpfs upper layer
 CONFIG_TMPFS_XATTR=y
+# /home: jffs2 on the rvemu NOR flash device (guest/linux/rvemu-flash.c),
+# the board's 1 MB flash region at 0x10100000. No write buffer (plain
+# bit-writable NOR), no zlib (its deflate workspace is ~270 KiB of vmalloc).
+CONFIG_MTD=y
+CONFIG_MTD_RVEMU_FLASH=y
+# no partitions on it
+# CONFIG_MTD_OF_PARTS is not set
+CONFIG_JFFS2_FS=y
+# CONFIG_JFFS2_FS_WRITEBUFFER is not set
+CONFIG_JFFS2_COMPRESSION_OPTIONS=y
+# CONFIG_JFFS2_ZLIB is not set
+# CONFIG_JFFS2_LZO is not set
+CONFIG_JFFS2_RTIME=y
+# CONFIG_JFFS2_RUBIN is not set
+CONFIG_JFFS2_CMODE_PRIORITY=y
+# the board's pins (rvemu-rs/rvcore/src/periph.rs, drivers/rvemu): GPIO, I2C,
+# SPI, PWM and the ADC
+CONFIG_GPIOLIB=y
+CONFIG_GPIO_CDEV=y
+# CONFIG_GPIO_CDEV_V1 is not set
+CONFIG_RVEMU_GPIO=y
+CONFIG_I2C=y
+CONFIG_I2C_CHARDEV=y
+CONFIG_RVEMU_I2C=y
+# CONFIG_I2C_HELPER_AUTO is not set
+CONFIG_SPI=y
+CONFIG_SPI_MASTER=y
+CONFIG_RVEMU_SPI=y
+CONFIG_SPI_SPIDEV=y
+CONFIG_PWM=y
+CONFIG_RVEMU_PWM=y
+CONFIG_IIO=y
+# CONFIG_IIO_BUFFER is not set
+# CONFIG_IIO_TRIGGER is not set
+CONFIG_RVEMU_ADC=y
+# No keyboard, mouse or display, only the serial console: no virtual
+# terminals, input layer, serio (PS/2) or HID, which tinyconfig + olddefconfig
+# would otherwise switch on (with every PS/2 mouse protocol and HID over I2C)
+# CONFIG_VT is not set
+# CONFIG_INPUT is not set
+# CONFIG_SERIO is not set
+# CONFIG_HID_SUPPORT is not set

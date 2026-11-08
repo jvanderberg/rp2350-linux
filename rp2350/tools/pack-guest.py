@@ -37,6 +37,8 @@ def main():
     mb, tlen = int(sys.argv[4]), int(sys.argv[5], 0)
     blob_out, text_out = sys.argv[6], sys.argv[7]
     assert tlen % 4096 == 0 and tlen <= len(k), "TEXT_LEN must be a page multiple inside the Image"
+    # rvemu-pico guest_blob::TEXT_MAX: a longer text is refused at boot
+    assert tlen <= 7 << 19, f"kernel text {tlen} B is over the firmware's TEXT_MAX (3.5 MiB)"
     text, rest = k[:tlen], k[tlen:]
 
     def al(x):

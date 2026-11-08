@@ -1,11 +1,15 @@
 //! Platform devices: 16550-style UART, a single-context SiFive PLIC (hart 0,
-//! S-mode) and optional virtio-mmio block and network devices. The host
-//! supplies the console, the disk and the network link.
+//! S-mode), optional virtio-mmio block and network devices, an optional
+//! NOR flash device (`nor.rs`) and optionally the board's pins (`periph`).
+//! The host supplies the console, the disk, the network link, the flash and
+//! the pins.
 
 use crate::cpu::exc;
+use crate::nor::{NOR_BASE, NOR_SIZE, NoNor, NorDev, NorFlash};
+use crate::periph::{GPIO_IRQ, IO_BASE, IO_SIZE, Io, NoPins, Pins};
 use crate::virtio::{
     Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE,
-    VirtioBlk, VirtioNet,
+    VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ, VirtioBlk, VirtioNet,
 };
 
 pub const PLIC_BASE: u32 = 0xF000_0000;
@@ -186,20 +190,49 @@ impl Uart {
     }
 }
 
-/// UART + PLIC (+ disk, + network) wired together, generic over the host
-/// console, disk and network link.
-pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet> {
+/// UART + PLIC (+ disk, + network, + flash, + swap, + pins) wired together,
+/// generic over the host console, disk, network link, flash, swap backend and
+/// pins.
+pub struct Platform<
+    C: Console,
+    D: Disk = NoDisk,
+    N: NetLink = NoNet,
+    F: NorFlash = NoNor,
+    W: Disk = NoDisk,
+    P: Pins = NoPins,
+> {
     pub uart: Uart,
     pub plic: Plic,
     pub con: C,
     pub blk: Option<VirtioBlk<D>>,
     pub net: Option<VirtioNet<N>>,
+    pub nor: Option<NorDev<F>>,
+    pub swap: Option<VirtioBlk<W>>,
+    pub io: Option<Io<P>>,
 }
 
-impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
+impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C, D, N, F, W, P> {
     /// UART and PLIC only.
     pub fn new(con: C) -> Self {
-        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None }
+        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, nor: None, swap: None, io: None }
+    }
+
+    /// Add the NOR flash device at `NOR_BASE` on `flash`, copying to and from `mem`.
+    pub fn with_nor(mut self, flash: F, mem: GuestMem) -> Self {
+        self.nor = Some(NorDev::new(flash, mem));
+        self
+    }
+
+    /// Add a writable virtio block device for swap at `VIRTIO_SWAP_BASE`.
+    pub fn with_swap(mut self, disk: W, mem: GuestMem) -> Self {
+        self.swap = Some(VirtioBlk::new(disk, mem));
+        self
+    }
+
+    /// Add the GPIO, I2C, SPI, PWM and ADC devices at `IO_BASE` on `pins`.
+    pub fn with_io(mut self, pins: P, mem: GuestMem) -> Self {
+        self.io = Some(Io::new(pins, mem));
+        self
     }
 
     /// Add a virtio block device at `VIRTIO_BASE` reading and writing `mem`.
@@ -228,11 +261,31 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
         }
     }
 
+    /// Pick up the pins' edges (GPIO interrupts) and refresh their line. Not
+    /// part of `update_irqs`, which the device MMIO paths run and the board
+    /// keeps inlined in its SRAM code: hosts call this from their periodic
+    /// poll, and the pin devices' own accesses do it themselves.
+    pub fn poll_pins(&mut self) {
+        if let Some(io) = &mut self.io {
+            io.poll();
+            self.plic.set_level(GPIO_IRQ, io.irq_line());
+        }
+    }
+
     pub fn take_dma_write(&mut self) -> Option<(u32, u32)> {
         if let Some(r) = self.blk.as_mut().and_then(|b| b.take_dma_write()) {
             return Some(r);
         }
-        self.net.as_mut().and_then(|n| n.take_dma_write())
+        if let Some(r) = self.net.as_mut().and_then(|n| n.take_dma_write()) {
+            return Some(r);
+        }
+        if let Some(r) = self.swap.as_mut().and_then(|w| w.take_dma_write()) {
+            return Some(r);
+        }
+        if let Some(r) = self.nor.as_mut().and_then(|f| f.take_dma_write()) {
+            return Some(r);
+        }
+        self.io.as_mut().and_then(|io| io.take_dma_write())
     }
 
     pub fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
@@ -255,6 +308,23 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
             && pa.wrapping_sub(VIRTIO_NET_BASE) < VIRTIO_SIZE
         {
             return n.load(pa - VIRTIO_NET_BASE, size);
+        }
+        if let Some(f) = &mut self.nor
+            && pa.wrapping_sub(NOR_BASE) < NOR_SIZE
+        {
+            return f.load(pa - NOR_BASE, size);
+        }
+        if let Some(w) = &mut self.swap
+            && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
+        {
+            return w.load(pa - VIRTIO_SWAP_BASE, size);
+        }
+        if let Some(io) = &mut self.io
+            && pa.wrapping_sub(IO_BASE) < IO_SIZE
+        {
+            let r = io.load(pa, size);
+            self.poll_pins();
+            return r;
         }
         Err(exc::LOAD_FAULT)
     }
@@ -282,6 +352,31 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
         {
             let r = n.store(pa - VIRTIO_NET_BASE, size, v);
             self.update_irqs();
+            return r;
+        }
+        if let Some(f) = &mut self.nor
+            && pa.wrapping_sub(NOR_BASE) < NOR_SIZE
+        {
+            return f.store(pa - NOR_BASE, size, v);
+        }
+        if let Some(w) = &mut self.swap
+            && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
+        {
+            // Only its own register stores change the swap device's line
+            // (requests complete in the queue notify; the guest acks with
+            // InterruptACK), so it stays out of `update_irqs`, which the
+            // device MMIO paths run and which must stay small enough to inline
+            // into the SRAM interpreter.
+            let r = w.store(pa - VIRTIO_SWAP_BASE, size, v);
+            self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
+            self.update_irqs();
+            return r;
+        }
+        if let Some(io) = &mut self.io
+            && pa.wrapping_sub(IO_BASE) < IO_SIZE
+        {
+            let r = io.store(pa, size, v);
+            self.poll_pins();
             return r;
         }
         Err(exc::STORE_FAULT)

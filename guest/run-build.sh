@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 BR_TAG=2026.08.1
 [ -d src/buildroot ] || git clone --depth 1 --branch "$BR_TAG" https://gitlab.com/buildroot.org/buildroot.git src/buildroot
 mkdir -p out out-disk
+# Build trees live in the Docker volume rvemu-guest-work, so rebuilds are incremental
 docker build -q -t rvemu-guest . >/dev/null
 docker volume create rvemu-guest-work >/dev/null
 docker run --rm -v "$PWD/src:/src" -v "$PWD/out:/out" -v "$PWD/out-disk:/out-disk" -v "$PWD:/guest:ro" \
