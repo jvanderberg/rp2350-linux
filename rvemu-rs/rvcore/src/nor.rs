@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | 0x00 | MAGIC | "RVFL" |
 //! | 0x04 | SIZE | bytes |
-//! | 0x08 | ERASESIZE | 4096 |
+//! | 0x08 | ERASESIZE | 16384: four flash sectors (see `ERASESIZE`) |
 //! | 0x0c | WRITESIZE | 1: bit-writable NOR, as jffs2 expects of plain NOR |
 //! | 0x10 | OFFSET | flash offset of the next command |
 //! | 0x14 | ADDR | guest physical address of the buffer |
@@ -29,7 +29,13 @@ pub const NOR_BASE: u32 = 0xF800_0400;
 pub const NOR_SIZE: u32 = 0x200;
 
 const MAGIC: u32 = 0x4C46_5652; // "RVFL"
-pub const ERASESIZE: u32 = 4096;
+/// The erase block the guest sees: four 4 KB flash sectors. jffs2 keeps a
+/// node-reference array (256 bytes) for every erase block holding a node
+/// and a table entry per block, so 4 KB blocks cost the guest about 80 KiB
+/// more RAM than 16 KB ones for the same 1 MB; its reserve is four blocks.
+pub const ERASESIZE: u32 = 16384;
+/// What `NorFlash::erase` clears.
+pub const SECTOR: u32 = 4096;
 pub const WRITESIZE: u32 = 1;
 
 const CMD_READ: u32 = 1;
@@ -45,7 +51,7 @@ pub trait NorFlash {
     fn read(&mut self, off: u32, buf: &mut [u8]) -> bool;
     /// AND `data` into the flash at `off`.
     fn program(&mut self, off: u32, data: &[u8]) -> bool;
-    /// Set the `ERASESIZE` sector at `off` to 0xFF.
+    /// Set the `SECTOR` bytes at `off` to 0xFF.
     fn erase(&mut self, off: u32) -> bool;
     /// Counter `i` of `STATS` (0 when the backend doesn't keep it).
     fn stat(&self, _i: u32) -> u32 {
@@ -153,7 +159,7 @@ impl<F: NorFlash> NorDev<F> {
                 if off % ERASESIZE != 0 || len % ERASESIZE != 0 {
                     return ST_ARGS;
                 }
-                (off..off + len).step_by(ERASESIZE as usize).all(|s| self.flash.erase(s))
+                (off..off + len).step_by(SECTOR as usize).all(|s| self.flash.erase(s))
             }
             _ => return ST_ARGS,
         };

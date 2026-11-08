@@ -9,7 +9,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use rvcore::nor::{ERASESIZE, NorFlash};
+use rvcore::nor::{NorFlash, SECTOR};
 
 pub const SIZE: u32 = 1 << 20;
 
@@ -18,6 +18,8 @@ pub struct FileNor {
     data: Vec<u8>,
     ops: u64,
     cut_at: u64,
+    erases: u32,
+    pages: u32,
 }
 
 impl FileNor {
@@ -33,7 +35,7 @@ impl FileNor {
             file.write_all(&data).map_err(err)?;
         }
         let cut_at = std::env::var("RVEMU_NOR_CUT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        Ok(FileNor { file, data, ops: 0, cut_at })
+        Ok(FileNor { file, data, ops: 0, cut_at, erases: 0, pages: 0 })
     }
 
     fn flush(&mut self, off: u32, len: usize) -> bool {
@@ -65,6 +67,8 @@ impl NorFlash for FileNor {
     fn program(&mut self, off: u32, data: &[u8]) -> bool {
         let cut = self.cut();
         let n = if cut { data.len() / 2 } else { data.len() };
+        let first = off / 256;
+        self.pages += (off + data.len() as u32).div_ceil(256) - first;
         for (d, s) in self.data[off as usize..].iter_mut().zip(&data[..n]) {
             *d &= *s;
         }
@@ -76,12 +80,21 @@ impl NorFlash for FileNor {
     }
     fn erase(&mut self, off: u32) -> bool {
         let cut = self.cut();
-        let n = if cut { ERASESIZE as usize / 2 } else { ERASESIZE as usize };
+        let n = if cut { SECTOR as usize / 2 } else { SECTOR as usize };
+        self.erases += 1;
         self.data[off as usize..off as usize + n].fill(0xFF);
-        let ok = self.flush(off, ERASESIZE as usize);
+        let ok = self.flush(off, SECTOR as usize);
         if cut {
             self.die();
         }
         ok
+    }
+    /// Erases and pages programmed, as the board counts them (no stalls here).
+    fn stat(&self, i: u32) -> u32 {
+        match i {
+            0 => self.erases,
+            2 => self.pages,
+            _ => 0,
+        }
     }
 }

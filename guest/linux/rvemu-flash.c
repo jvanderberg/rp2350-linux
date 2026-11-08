@@ -24,6 +24,8 @@
 #define RVFL_LEN	0x18
 #define RVFL_CMD	0x1c
 #define RVFL_STATUS	0x20
+#define RVFL_STATS	0x40
+#define RVFL_NSTATS	5
 
 #define RVFL_MAGIC_VAL	0x4c465652	/* "RVFL" */
 #define RVFL_CMD_READ	1
@@ -51,7 +53,7 @@ static int rvfl_cmd(struct rvfl *f, u32 cmd, loff_t off, const void *buf, size_t
 			n = min_t(size_t, len, PAGE_SIZE - offset_in_page(buf));
 			pa = page_to_phys(vmalloc_to_page(buf)) + offset_in_page(buf);
 		} else if (buf) {
-			pa = virt_to_phys(buf);
+			pa = virt_to_phys((void *)buf);
 		}
 		writel(off, f->regs + RVFL_OFFSET);
 		writel(pa, f->regs + RVFL_ADDR);
@@ -94,6 +96,28 @@ static int rvfl_erase(struct mtd_info *mtd, struct erase_info *instr)
 		instr->fail_addr = instr->addr;
 	return ret;
 }
+
+/*
+ * The device's counters: erases, erases skipped (sector already blank),
+ * pages programmed, longest stall (us), total stall (ms).
+ */
+static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rvfl *f = dev_get_drvdata(dev);
+	int i, n = 0;
+
+	for (i = 0; i < RVFL_NSTATS; i++)
+		n += sysfs_emit_at(buf, n, "%u%c", readl(f->regs + RVFL_STATS + 4 * i),
+				   i == RVFL_NSTATS - 1 ? '\n' : ' ');
+	return n;
+}
+static DEVICE_ATTR_RO(stats);
+
+static struct attribute *rvfl_attrs[] = {
+	&dev_attr_stats.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(rvfl);
 
 static int rvfl_probe(struct platform_device *pdev)
 {
@@ -141,6 +165,7 @@ static struct platform_driver rvfl_driver = {
 	.driver = {
 		.name = "rvemu-flash",
 		.of_match_table = rvfl_of_match,
+		.dev_groups = rvfl_groups,
 	},
 };
 module_platform_driver(rvfl_driver);

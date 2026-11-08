@@ -48,7 +48,8 @@ ensure_bootsel() {
   request_bootsel || { echo "pico: target never appeared in BOOTSEL (USB data connection?)"; exit 1; }
 }
 
-# Flash map (16 MB): firmware, Wi-Fi settings in the 4 KB at 0x103FF000,
+# Flash map (16 MB): firmware, /home (jffs2, written only by the firmware) at
+# 0x10100000, swap at 0x10200000, Wi-Fi settings in the 4 KB at 0x103FF000,
 # guest blob at 0x10400000 (2 MB), root filesystem at 0x10600000, kernel text
 # in the last bytes before 0x11000000 (guest_blob.rs).
 WIFI_ADDR=0x103ff000
@@ -109,13 +110,16 @@ print((e-s)//4096*4096)" "$m"
 
 # pack_guest IMAGE INITRD RAM_MB BLOB_OUT TEXT_OUT: device tree as the Mac host
 # makes it, then the blob and the kernel text. INITRD "-" means none: root on
-# the disk (pass its image as DISK=). NET=1 adds the network device node.
+# the disk (pass its image as DISK=). NET=1 adds the network device node,
+# NOR=1 the flash device node (/home in the storage region 0x10100000).
 pack_guest() {
   local dts dtb initrd=$2 src tl; dts=$(mktemp); dtb=$(mktemp)
   tl=$(text_len "$1")
   if [ "$initrd" = - ]; then src=(-d "$DISK"); initrd=/dev/null; else src=(-i "$initrd"); fi
   # NET=1: the firmware has the Wi-Fi virtio-net device
   [ "${NET:-0}" = 1 ] && src+=(-N)
+  # NOR=1: the firmware has the /home flash device (-D never opens the file)
+  [ "${NOR:-0}" = 1 ] && src+=(-F /dev/null)
   ./target/release/rvemu -D -m "$3" -X "$tl" "${src[@]}" > "$dts"
   dtc -q -I dts -O dtb -o "$dtb" "$dts"
   python3 ../rp2350/tools/pack-guest.py "$1" "$initrd" "$dtb" "$3" "$tl" "$4" "$5"

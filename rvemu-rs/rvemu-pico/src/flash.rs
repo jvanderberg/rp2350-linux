@@ -6,8 +6,7 @@
 //! XIP access to either chip select may happen, so every operation:
 //! - refuses any range outside `REGIONS`: never the firmware, the Wi-Fi
 //!   sector at 0x103FF000, the guest blob, the squashfs or the kernel text;
-//! - parks core 1 in SRAM through the hooks its service registers
-//!   (`set_parker`);
+//! - parks core 1 in SRAM (`park_core1`, where core 1's guard plugs in);
 //! - masks interrupts and runs from SRAM: it saves the QMI window settings
 //!   (the board's 348 MHz flash timing, the PSRAM's QPI setup on CS1), the
 //!   QSPI pads and XIP_CTRL, calls the bootrom's `connect_internal_flash`,
@@ -56,7 +55,7 @@ pub enum Error {
     Range,
     /// An erase not on a sector boundary.
     Align,
-    /// Core 1's parker reported that it could not park.
+    /// Core 1 could not be parked.
     Core1,
     /// XIP is in a mode the restore can't handle (continuous read, no
     /// command prefix); set up by something other than the bootrom.
@@ -90,7 +89,7 @@ fn in_regions(addr: u32, len: u32) -> bool {
 /// Erase the 4 KB sector at `addr`. A sector that is already blank is left
 /// alone (no erase cycle spent, no stall).
 pub fn erase_sector(addr: u32) -> Result<(), Error> {
-    if addr % SECTOR != 0 {
+    if !addr.is_multiple_of(SECTOR) {
         return Err(Error::Align);
     }
     if !in_regions(addr, SECTOR) {
@@ -125,9 +124,7 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), Error> {
         let src = &data[done as usize..(done + n) as usize];
         buf[off as usize..(off + n) as usize].copy_from_slice(src);
         if src.iter().any(|&b| b != 0xFF) {
-            run(Op::Program, page, buf.as_ptr())?;
-            // SAFETY: core 0 only.
-            unsafe { (*core::ptr::addr_of_mut!(STATS)).pages += 1 };
+            program_page(page, &buf)?;
         }
         done += n;
     }
@@ -137,7 +134,7 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), Error> {
 /// Program one whole 256-byte page at `addr` (page aligned) from `page`,
 /// which must be in SRAM.
 pub fn program_page(addr: u32, page: &[u8; PAGE as usize]) -> Result<(), Error> {
-    if addr % PAGE != 0 {
+    if !addr.is_multiple_of(PAGE) {
         return Err(Error::Align);
     }
     if !in_regions(addr, PAGE) {
@@ -165,28 +162,14 @@ pub fn is_erased(addr: u32, len: u32) -> bool {
 
 // ------------------------------------------------------------------ core 1
 
-/// How a flash operation keeps core 1 off XIP: `park` returns once core 1
-/// spins in SRAM (false: it could not), `unpark` lets it go. The core 1
-/// service registers these (wrapping its `core1::park()` guard) when it
-/// starts; until then there is nothing to park.
-#[derive(Clone, Copy)]
-pub struct Parker {
-    pub park: fn() -> bool,
-    pub unpark: fn(),
+/// Keep core 1 off XIP for one operation: true once it spins in SRAM.
+/// Core 1 doesn't run flash code yet; the core 1 service's `core1::park()`
+/// guard goes here (and its release in `unpark_core1`).
+fn park_core1() -> bool {
+    true
 }
 
-static mut PARKER: Option<Parker> = None;
-
-/// Register core 1's park/unpark, once, before core 1 runs flash code.
-pub fn set_parker(p: Parker) {
-    // SAFETY: called once at start-up, before any flash operation.
-    unsafe { *core::ptr::addr_of_mut!(PARKER) = Some(p) };
-}
-
-fn parker() -> Option<Parker> {
-    // SAFETY: written once before use (`set_parker`).
-    unsafe { core::ptr::addr_of!(PARKER).read() }
-}
+fn unpark_core1() {}
 
 /// System clock, for converting `Stats` cycles; set by the firmware at start.
 static mut SYS_HZ: u32 = 150_000_000;
@@ -280,10 +263,7 @@ fn run(op: Op, addr: u32, page: *const u8) -> Result<(), Error> {
         erase: rom_data::flash_range_erase::ptr(),
         program: rom_data::flash_range_program::ptr(),
     };
-    let parker = parker();
-    if let Some(p) = parker
-        && !(p.park)()
-    {
+    if !park_core1() {
         return Err(Error::Core1);
     }
     let mie = irq_off();
@@ -292,9 +272,7 @@ fn run(op: Op, addr: u32, page: *const u8) -> Result<(), Error> {
     unsafe { in_ram(&rom, op, addr - XIP_BASE, page) };
     let dt = u32::try_from(board::mcycle64() - t0).unwrap_or(u32::MAX);
     irq_restore(mie);
-    if let Some(p) = parker {
-        (p.unpark)();
-    }
+    unpark_core1();
     // SAFETY: core 0 only.
     unsafe {
         let s = &mut *core::ptr::addr_of_mut!(STATS);

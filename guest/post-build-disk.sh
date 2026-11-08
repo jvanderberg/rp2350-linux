@@ -18,7 +18,7 @@ cd /overlay/root
 # kept across reboots; /root lives in it as /home/root. jffs2 formats blank
 # or foreign flash itself (it erases what it can't parse, in the background).
 mkdir -p home
-if mount -t jffs2 -o noatime mtd0 home 2>/dev/null; then
+if mount -t jffs2 -o noatime mtd0 home; then
   [ -d home/root ] || { mkdir -m 700 home/root && cp -a /root/. home/root/; }
   mount --bind home/root root
 else
