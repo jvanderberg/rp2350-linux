@@ -289,33 +289,39 @@ fn classify(insn: u32, pc: u32) -> Kind {
     }
 }
 
-/// Pass 1 of translation: the instructions of the block starting at `pc0`.
+/// Pass 1 of translation: the extent of the block starting at `pc0`. Pass 2
+/// reads and classifies the instructions again (cheaper than keeping them).
 struct Scan {
-    insns: [u32; MAX_BLOCK],
-    kinds: [Kind; MAX_BLOCK],
+    /// host address of the instruction at `pc0`
+    host0: usize,
     n: usize,
+    /// kind of the last instruction (Interp if n == 0)
+    last: Kind,
     /// stopped before an instruction only the interpreter runs
     end_interp: bool,
 }
 
+/// Instruction `k` of the block at host address `host0`.
+#[inline(always)]
+fn insn_at(host0: usize, k: usize) -> u32 {
+    // SAFETY: callers stay within the block's guest RAM page.
+    unsafe { ((host0 + 4 * k) as *const u32).read() }
+}
+
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn scan(cpu: &Cpu, pc0: u32, pa0: u32) -> Scan {
-    let page_end = (pc0 & !0xFFF).wrapping_add(0x1000);
     let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
-    let mut s = Scan { insns: [0; MAX_BLOCK], kinds: [Kind::Interp; MAX_BLOCK], n: 0, end_interp: false };
-    let mut pc = pc0;
-    while s.n < MAX_BLOCK && pc != page_end {
-        // SAFETY: within the same guest RAM page as pa0.
-        let insn = unsafe { ((host0 + (pc - pc0) as usize) as *const u32).read() };
-        let k = classify(insn, pc);
+    // instructions left in the page
+    let max = (((0x1000 - (pc0 & 0xFFF)) >> 2) as usize).min(MAX_BLOCK);
+    let mut s = Scan { host0, n: 0, last: Kind::Interp, end_interp: false };
+    while s.n < max {
+        let k = classify(insn_at(host0, s.n), pc0.wrapping_add(4 * s.n as u32));
         if k == Kind::Interp {
             s.end_interp = true;
             break;
         }
-        s.insns[s.n] = insn;
-        s.kinds[s.n] = k;
+        s.last = k;
         s.n += 1;
-        pc = pc.wrapping_add(4);
         if matches!(k, Kind::Branch | Kind::Jal | Kind::Jalr) {
             break;
         }
@@ -1025,7 +1031,7 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         // pass 1: find the block
-        let Scan { insns, kinds, n, end_interp } = scan(cpu, pc0, pa0);
+        let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0);
         let pc = pc0.wrapping_add(4 * n as u32);
 
         // room for the worst case (measuring never keeps the block)
@@ -1043,10 +1049,11 @@ impl<'m> Jit<'m> {
         let r = self.r;
         let mut a = Asm::at(self.code, self.code_base, self.pos);
 
+        // `jal link, routine` (the buffer is at most 1 MiB, so always in range)
         macro_rules! call {
             ($link:expr, $to:expr) => {{
-                let c = a.emit(j_type($link, 0));
-                a.fix(c, $to);
+                let off = ($to as isize - a.pos() as isize) * 4;
+                a.emit(j_type($link, off as i32));
             }};
         }
 
@@ -1068,13 +1075,14 @@ impl<'m> Jit<'m> {
         }
 
         for k in 0..n {
-            let insn = insns[k];
+            let insn = insn_at(host0, k);
             let pc = pc0.wrapping_add(4 * k as u32);
+            let kind = classify(insn, pc);
             let rd = (insn >> 7) & 31;
             let rs1 = (insn >> 15) & 31;
             let rs2 = (insn >> 20) & 31;
             let f3 = (insn >> 12) & 7;
-            match kinds[k] {
+            match kind {
                 Kind::Alu { rs1: u1, rs2: u2 } => {
                     let mut w = insn;
                     if u1 && spilled(rs1) {
@@ -1104,7 +1112,7 @@ impl<'m> Jit<'m> {
                     }
                 }
                 Kind::Load | Kind::Store => {
-                    let store = kinds[k] == Kind::Store;
+                    let store = kind == Kind::Store;
                     let imm = if store { imm_s(insn) } else { imm_i(insn) };
                     if spilled(rs1) {
                         a.lw(K0, S, xoff(rs1));
@@ -1256,7 +1264,6 @@ impl<'m> Jit<'m> {
         }
 
         // block end without a terminator
-        let last = kinds[n - 1];
         if !matches!(last, Kind::Branch | Kind::Jal | Kind::Jalr) {
             if end_interp {
                 call!(K1, r.interp_exit);
@@ -1494,7 +1501,7 @@ impl<'m> Jit<'m> {
         let sc = scan(cpu, va, pa);
         let end = match sc.n {
             0 => BlockEnd::Interp,
-            n => match sc.kinds[n - 1] {
+            _ => match sc.last {
                 Kind::Branch => BlockEnd::Branch,
                 Kind::Jal => BlockEnd::Jal,
                 Kind::Jalr => BlockEnd::Jalr,
