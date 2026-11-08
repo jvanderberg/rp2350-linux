@@ -1,0 +1,14 @@
+[package]
+name = "rvcore"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Put the interpreter / MMU hot paths in .data (copied to SRAM at boot on
+# RP2350) so they do not compete with guest RAM for the XIP cache.
+ram-code = []
+# Host-side instrumentation: unique-code bitmaps and the XIP cache model.
+# Needs `alloc`; leave off for the RP2350 build.
+instrument = []
+
+[dependencies]

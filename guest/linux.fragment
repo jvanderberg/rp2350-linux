@@ -1,0 +1,67 @@
+# Applied on top of `make tinyconfig`. Target: rvemu / RP2350 (rv32ima, Sv32, 1 hart)
+CONFIG_NONPORTABLE=y
+CONFIG_ARCH_RV32I=y
+CONFIG_MMU=y
+# CONFIG_SMP is not set
+# CONFIG_RISCV_ISA_C is not set
+# EFI selects RISCV_ISA_C
+# CONFIG_EFI is not set
+# CONFIG_FPU is not set
+# CONFIG_RISCV_ISA_V is not set
+# CONFIG_RISCV_ISA_ZBA is not set
+# CONFIG_RISCV_ISA_ZBB is not set
+# CONFIG_RISCV_ISA_ZBC is not set
+# CONFIG_RISCV_ISA_ZICBOM is not set
+# CONFIG_RISCV_ISA_ZICBOZ is not set
+# CONFIG_RISCV_ISA_ZAWRS is not set
+# CONFIG_RISCV_ISA_ZACAS is not set
+# CONFIG_RISCV_ISA_SVNAPOT is not set
+CONFIG_RISCV_SBI=y
+CONFIG_HZ_100=y
+# Do not time misaligned accesses at boot: the probe loop runs for a fixed
+# guest time and every access in it is a translator exit. Treat them as slow.
+# CONFIG_RISCV_PROBE_UNALIGNED_ACCESS is not set
+CONFIG_RISCV_SLOW_UNALIGNED_ACCESS=y
+# no self-patching code (matters for the translator)
+# CONFIG_JUMP_LABEL is not set
+# CONFIG_MODULES is not set
+# CONFIG_FTRACE is not set
+# CONFIG_KPROBES is not set
+# CONFIG_STRICT_KERNEL_RWX is not set
+# CONFIG_RELOCATABLE is not set
+# console
+CONFIG_PRINTK=y
+CONFIG_PRINTK_TIME=y
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_OF_PLATFORM=y
+CONFIG_SERIAL_EARLYCON=y
+CONFIG_SERIAL_8250_NR_UARTS=1
+CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+CONFIG_SIFIVE_PLIC=y
+# userspace basics
+CONFIG_BLK_DEV_INITRD=y
+# CONFIG_RD_GZIP is not set
+# CONFIG_RD_BZIP2 is not set
+# CONFIG_RD_LZMA is not set
+# CONFIG_RD_XZ is not set
+# CONFIG_RD_LZO is not set
+# CONFIG_RD_LZ4 is not set
+# CONFIG_RD_ZSTD is not set
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_MULTIUSER=y
+CONFIG_FUTEX=y
+CONFIG_POSIX_TIMERS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_TMPFS=y
+CONFIG_SHMEM=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_UNIX98_PTYS=y
+# 256 legacy BSD ptys = 512 /dev nodes, which exhausts devtmpfs inodes at 8 MiB
+# CONFIG_LEGACY_PTYS is not set
+# CONFIG_NET is not set
+# CONFIG_DEBUG_INFO is not set

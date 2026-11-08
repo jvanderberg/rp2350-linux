@@ -1,0 +1,13 @@
+[package]
+name = "rvemu-virt"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rvemu-virt"
+test = false
+bench = false
+
+[dependencies]
+rvcore = { path = "../rvcore" }
+rvjit = { path = "../rvjit" }

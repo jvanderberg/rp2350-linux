@@ -1,0 +1,44 @@
+# Root filesystem on the virtio disk (squashfs, LZ4) with a tmpfs overlay.
+# Same CPU as buildroot.defconfig; shared libraries so the packages share one
+# copy of musl and ncurses in the page cache.
+BR2_riscv=y
+BR2_riscv_custom=y
+BR2_RISCV_ISA_RVM=y
+BR2_RISCV_ISA_RVA=y
+BR2_RISCV_32=y
+BR2_RISCV_USE_MMU=y
+BR2_RISCV_ABI_ILP32=y
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+BR2_KERNEL_HEADERS_6_12=y
+BR2_SHARED_LIBS=y
+BR2_OPTIMIZE_S=y
+BR2_STRIP_strip=y
+BR2_TARGET_GENERIC_HOSTNAME="rp2350"
+BR2_TARGET_GENERIC_ISSUE="rvemu guest"
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_DEVTMPFS=y
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
+BR2_TARGET_GENERIC_GETTY_TERM="xterm-256color"
+BR2_ROOTFS_POST_BUILD_SCRIPT="/guest/post-build-disk.sh"
+# BR2_TARGET_ROOTFS_TAR is not set
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS4_LZ4=y
+# 16K blocks: at 8 MiB file pages are evicted and read back thousands of
+# times per boot, and each read-back decompresses a whole block
+BR2_TARGET_ROOTFS_SQUASHFS_BS_16K=y
+BR2_TARGET_ROOTFS_SQUASHFS_EXTREME_COMP=y
+BR2_TARGET_ROOTFS_SQUASHFS_PAD=y
+# packages
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+BR2_PACKAGE_NCURSES_ADDITIONAL_TERMINFO="t/tmux t/tmux-256color x/xterm-color"
+BR2_PACKAGE_NANO=y
+BR2_PACKAGE_MG=y
+BR2_PACKAGE_MICROPYTHON=y
+BR2_PACKAGE_LUA=y
+BR2_PACKAGE_LUA_5_4=y
+BR2_PACKAGE_HTOP=y
+BR2_PACKAGE_TMUX=y
+BR2_PACKAGE_LRZSZ=y
+BR2_PACKAGE_BC=y
+BR2_PACKAGE_NCDU=y
+BR2_PACKAGE_LSOF=y
+BR2_PACKAGE_LESS=y

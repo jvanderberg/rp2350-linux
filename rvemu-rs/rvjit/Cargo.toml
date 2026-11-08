@@ -1,0 +1,11 @@
+[package]
+name = "rvjit"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Same for the dispatcher and translator.
+ram-code = ["rvcore/ram-code"]
+
+[dependencies]
+rvcore = { path = "../rvcore" }

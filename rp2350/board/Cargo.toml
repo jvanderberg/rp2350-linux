@@ -1,0 +1,14 @@
+[package]
+name = "rp2350-board"
+version = "0.1.0"
+edition = "2021"
+description = "RP2350B board support shared by the bring-up tests and the emulator: clocks, PSRAM on QMI CS1 (GP0), Hazard3 counters"
+
+[dependencies]
+rp235x-hal = { version = "0.4", features = ["rt", "critical-section-impl"] }
+fugit = "0.3"
+
+[features]
+default = ["overclock"]
+# 348 MHz core at 1.20 V, PSRAM at 116 MHz (divider 3).
+overclock = []

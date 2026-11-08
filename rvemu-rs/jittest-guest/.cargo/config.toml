@@ -1,0 +1,6 @@
+[build]
+# rv32im has a prebuilt core without compressed instructions; +a for AMOs.
+target = "riscv32im-unknown-none-elf"
+
+[target.riscv32im-unknown-none-elf]
+rustflags = ["-C", "target-feature=+a", "-C", "link-arg=-Tguest.x"]

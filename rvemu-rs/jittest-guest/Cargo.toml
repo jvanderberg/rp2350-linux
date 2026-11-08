@@ -1,0 +1,23 @@
+[package]
+name = "jittest-guest"
+version = "0.1.0"
+edition = "2024"
+description = "Bare-metal S-mode guest that exercises the rvemu interpreter and translator"
+
+# Built for the guest (rv32ima, no C), not part of the host workspace.
+[workspace]
+
+[[bin]]
+name = "jittest-guest"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 2
+debug = true
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

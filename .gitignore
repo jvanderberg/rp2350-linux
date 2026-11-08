@@ -1,0 +1,18 @@
+# build outputs
+target/
+build/
+*.o
+# third-party reference checkouts (semu, rp-hal, prebuilt images)
+/ref/
+# buildroot tree and guest build outputs
+/guest/src/
+/guest/out/
+/guest/out-disk/
+/guest/out-probe/
+# build logs
+/guest/*.log
+# junk
+.DS_Store
+*.swp
+*~
+__pycache__/

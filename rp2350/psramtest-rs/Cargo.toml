@@ -1,0 +1,23 @@
+[package]
+name = "psramtest"
+version = "0.1.0"
+edition = "2021"
+description = "PSRAM bring-up and soak test for RP2350B (Hazard3 RISC-V), PSRAM CS1 on GP0"
+
+[dependencies]
+rp235x-hal = { version = "0.4", features = ["rt", "critical-section-impl", "binary-info"] }
+embedded-hal = "1.0"
+fugit = "0.3"
+rtt-target = "0.6"
+panic-rtt-target = "0.2"
+
+[features]
+default = ["overclock"]
+# 348 MHz core at 1.20 V, PSRAM at 116 MHz (divider 3).
+overclock = []
+
+[profile.release]
+opt-level = 3
+debug = true
+lto = true
+codegen-units = 1

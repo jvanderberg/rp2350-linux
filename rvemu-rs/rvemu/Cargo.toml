@@ -1,0 +1,9 @@
+[package]
+name = "rvemu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rvcore = { path = "../rvcore", features = ["instrument"] }
+rvjit = { path = "../rvjit" }
+libc = "0.2"

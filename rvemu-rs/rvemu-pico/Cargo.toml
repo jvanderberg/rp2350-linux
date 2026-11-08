@@ -1,0 +1,41 @@
+[package]
+name = "rvemu-pico"
+version = "0.1.0"
+edition = "2024"
+description = "rvemu on the RP2350B's Hazard3 cores: guest RAM in PSRAM, output over RTT"
+
+[[bin]]
+name = "rvemu-pico"
+test = false
+bench = false
+
+[[bin]]
+name = "rvemu-pico-shell"
+path = "src/bin/shell.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "rvemu-pico-linux"
+path = "src/bin/linux.rs"
+test = false
+bench = false
+
+[dependencies]
+rvcore = { path = "../rvcore", features = ["ram-code"] }
+rvjit = { path = "../rvjit", features = ["ram-code"] }
+rp2350-board = { path = "../../rp2350/board" }
+rp235x-hal = { version = "0.4", features = ["rt", "critical-section-impl", "binary-info"] }
+riscv-rt = "0.12"
+rtt-target = "0.6"
+panic-rtt-target = "0.2"
+usb-device = "0.3"
+usbd-serial = "0.2"
+# Wi-Fi (RM2 / CYW43439): the embassy driver, polled without an executor
+cyw43 = "0.7.0"
+embassy-net-driver = "0.2"
+embassy-time = "0.5.1"
+embassy-time-driver = "0.2.2"
+embassy-futures = "0.1.2"
+embedded-hal = "1.0"
+pio = "0.3"
