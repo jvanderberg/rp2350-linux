@@ -4,26 +4,21 @@
 #   screen /dev/cu.usbmodemrvemu1 115200        (Ctrl-A k to quit)
 # The board goes back to BOOTSEL on `stty -f PORT 1200`, which this script
 # also uses to replace a running shell.
-#   scripts/pico-shell.sh [-m RAM_MB] [-i] [-b] [-w] [-C] [-d DIR]
+#   scripts/pico-shell.sh [-m RAM] [-i] [-b] [-w] [-d DIR]
 # Default: guest/out-disk, root on a squashfs in flash (nano, tmux,
 # MicroPython, ...; guest/run-build.sh disk). -i: the small initramfs guest in
 # guest/out. -b: (re)build that guest in Docker first (guest/run-build.sh;
 # incremental once the first Buildroot build is done). -w: give the guest
 # the flash swap device in 0x10200000-0x103FEFFF (/dev/vdb, or /dev/vda with
 # -i; 1788 KiB of swap). -d DIR: a disk guest other than guest/out-disk
-# (DIR has its Image, System.map, linux.config and rootfs.squashfs).
+# (DIR has its Image, System.map, linux.config and rootfs.squashfs). -m RAM:
+# guest RAM in MiB, or KiB as NK (default 8128K: the PSRAM's 8 MiB less the
+# native engine's 64 KiB).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/pico-common.sh
-M=8; INITRAMFS=0; BUILD=0; SWAP=0; CRYPTO=0; GUEST=../guest/out-disk
-while getopts "m:ibwCd:" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; w) SWAP=1;; C) CRYPTO=1;; d) GUEST=$OPTARG;; *) exit 2;; esac; done
-# -C enables the experimental native buffer engine and reserves the top 64 KiB
-# of PSRAM. The existing guest packer takes whole MiB, so use at most 7 MiB.
-FEATURES=()
-if [ "$CRYPTO" = 1 ]; then
-  FEATURES=(--features pv-buffers)
-  [ "$M" -le 7 ] || M=7
-fi
+M=8128K; INITRAMFS=0; BUILD=0; SWAP=0; GUEST=../guest/out-disk
+while getopts "m:ibwd:" o; do case $o in m) M=$OPTARG;; i) INITRAMFS=1;; b) BUILD=1;; w) SWAP=1;; d) GUEST=$OPTARG;; *) exit 2;; esac; done
 if [ $BUILD = 1 ]; then
   if [ $INITRAMFS = 1 ]; then ../guest/run-build.sh all; else ../guest/run-build.sh disk; fi
 fi
@@ -37,7 +32,7 @@ ELF=target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 cargo build --locked -q --release -p rvemu
-cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf "${FEATURES[@]}"
+cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 # the pin devices only for a kernel with their drivers (the disk guest's)
 IO=0; grep -q '^CONFIG_RVEMU_GPIO=y' "$(dirname "$K")/linux.config" 2>/dev/null && IO=1
 NET=1 NOR=1 SWAP=$SWAP IO=$IO pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"

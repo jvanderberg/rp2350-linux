@@ -9,11 +9,11 @@ DVER=2026.94
 mkdir -p /eval
 if [ ! -d /eval/linux ]; then cp -a "/work/linux-$KVER" /eval/linux; fi
 cd /eval/linux
-cp /repo/guest/linux/rvemu-ssh.c /repo/guest/linux/rvemu-ssh.h drivers/char/
-cp /repo/guest/linux/rvemu-crypto.c /repo/guest/linux/rvemu-crypto.h /repo/guest/linux/rvemu-native.h drivers/char/
-grep -q rvemu-ssh.o drivers/char/Makefile || echo 'obj-y += rvemu-ssh.o' >> drivers/char/Makefile
-grep -q rvemu-crypto.o drivers/char/Makefile || echo 'obj-y += rvemu-crypto.o' >> drivers/char/Makefile
-scripts/config --enable NET --enable INET --enable UNIX
+# the native engine's drivers, as guest/build.sh adds them to the disk kernel
+rm -rf drivers/rvemu && cp -r /repo/guest/linux/drivers/rvemu drivers/rvemu
+grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
+grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
+scripts/config --enable NET --enable INET --enable UNIX --enable RVEMU_CRYPTO --enable RVEMU_SSH --enable RVEMU_BENCH
 make ARCH=riscv CROSS_COMPILE="$CROSS" olddefconfig
 make ARCH=riscv CROSS_COMPILE="$CROSS" -j"$(nproc)" Image
 cp arch/riscv/boot/Image /out/Image
@@ -33,10 +33,10 @@ if [ ! -f Makefile ]; then
   ./configure --host=riscv32-buildroot-linux-musl --disable-harden --disable-zlib \
     --enable-bundled-libtom --disable-wtmp --disable-lastlog CC="${CROSS}gcc" CFLAGS='-Os' LDFLAGS='-static'
 fi
-cp /repo/guest/tests/dropbear/rvemu-offload.inc /repo/guest/linux/rvemu-ssh.h src/
-cp /repo/guest/tests/dropbear/rvemu-bench.h /repo/guest/tests/dropbear/rvemu-bench.inc src/
-cp /repo/guest/tests/dropbear/rvemu-crypto.inc /repo/guest/linux/rvemu-crypto.h src/
-python3 /repo/guest/tests/dropbear/patch.py .
+# the disk guest's adapters (guest/br-external/package/dropbear/dropbear-rvemu.mk)
+D=/repo/guest/br-external/package/dropbear
+cp "$D"/rvemu-bench.h "$D"/rvemu-*.inc /repo/guest/linux/drivers/rvemu/rvemu-crypto.h /repo/guest/linux/drivers/rvemu/rvemu-ssh.h src/
+python3 "$D/patch.py" .
 sum=$(cat src/chachapoly.c src/chachapoly.h src/common-session.c src/cli-main.c src/cli-session.c src/cli-auth.c src/common-kex.c src/curve25519.c src/sntrup761.c src/rvemu-*.inc src/rvemu-*.h localoptions.h | sha256sum)
 if [ "$(cat .rvemu-source-sum 2>/dev/null || true)" != "$sum" ]; then
   make clean
@@ -54,9 +54,9 @@ install -m755 "/eval/dropbear-$DVER/dropbearmulti" usr/sbin/dropbear
 "${CROSS}strip" usr/sbin/dropbear
 ln -sf ../sbin/dropbear usr/bin/dbclient
 ln -sf ../sbin/dropbear usr/bin/dropbearkey
-"${CROSS}gcc" -static -Os -Wall -Wextra -I/repo/guest/linux /repo/guest/tests/ssh-ioctl-test.c -o usr/bin/ssh-ioctl-test
+"${CROSS}gcc" -static -Os -Wall -Wextra -I/repo/guest/linux/drivers/rvemu /repo/guest/tests/ssh-ioctl-test.c -o usr/bin/ssh-ioctl-test
 "${CROSS}strip" usr/bin/ssh-ioctl-test
-"${CROSS}gcc" -static -Os -Wall -Wextra -I/repo/guest/linux /repo/guest/tests/crypto-ioctl-test.c -o usr/bin/crypto-ioctl-test
+"${CROSS}gcc" -static -Os -Wall -Wextra -I/repo/guest/linux/drivers/rvemu /repo/guest/tests/crypto-ioctl-test.c -o usr/bin/crypto-ioctl-test
 "${CROSS}strip" usr/bin/crypto-ioctl-test
 install -m755 /repo/guest/tests/ssh-init init
 find . -print0 | cpio --null -o -H newc > /out/rootfs.cpio

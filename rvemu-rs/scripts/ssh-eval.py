@@ -123,7 +123,9 @@ if __name__=='__main__':
     counts=re.search(r'native buffer calls \[([^]]+)\]',text)
     calls=[int(n) for n in counts[1].split(',')] if counts else []
     threshold=10 if a.test=='integration' else 1
-    passed=passed and len(calls)==13 and ((not any(calls)) if a.offload=='off' or a.without_extension else (calls[4]>threshold and calls[5]>threshold))
+    # without the extension the Mac host prints no native counters at all
+    if a.without_extension: passed=passed and not any(calls)
+    else: passed=passed and len(calls)==13 and ((not any(calls)) if a.offload=='off' else (calls[4]>threshold and calls[5]>threshold))
     if a.offload!='off' and not a.without_extension: passed=passed and 'SSH IOCTL BOUNDS AND AUTH PASS' in text
     if a.test=='integration' and a.offload!='off' and not a.without_extension:
         passed=passed and 'GENERIC CRYPTO ABI PASS' in text

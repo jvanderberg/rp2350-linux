@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Experimental SSH packet offload. Per-open contiguous buffers avoid
- * allocating/wiping whole slabs for each packet. Never pass user pointers
- * or vmapped kernel-stack addresses to firmware. */
+/* /dev/rvemu-ssh: one SSH chacha20-poly1305@openssh.com packet per ioctl
+ * (rvemu-ssh.h), sealed or opened by the rvemu machine's native engine.
+ * Each open owns contiguous kernel buffers that the firmware reads and
+ * writes by physical address; user pointers never reach it. */
 #include <linux/init.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
@@ -13,7 +14,6 @@
 #include <asm/io.h>
 #include "rvemu-ssh.h"
 #include "rvemu-native.h"
-#define EXT 0x0a000001
 #define MAX_BYTES 32768
 
 struct rvemu_ssh_context {
@@ -88,10 +88,8 @@ static long rvemu_ssh_ioctl(struct file *file, unsigned int cmd, unsigned long a
     ret = copy_to_user((void __user *)(unsigned long)r.destination, c->output, outlen) ? -EFAULT : 0;
 unlock:
     memzero_explicit(c->params, 72);
-    if (ret) {
-        memzero_explicit(c->input, r.length);
-        memzero_explicit(c->output, outlen);
-    }
+    memzero_explicit(c->input, r.length);
+    memzero_explicit(c->output, outlen);
     mutex_unlock(&c->lock);
 done:
     memzero_explicit(&r, sizeof(r));
@@ -111,39 +109,9 @@ static struct miscdevice rvemu_ssh_dev = {
 };
 static int __init rvemu_ssh_init(void)
 {
-    if (sbi_probe_extension(EXT) <= 0) return -ENODEV;
+    if (sbi_probe_extension(RVEMU_NATIVE_EXT) <= 0) return -ENODEV;
     return misc_register(&rvemu_ssh_dev);
 }
 device_initcall(rvemu_ssh_init);
 
-/* Measurement is a separate device so software-only firmware can benchmark
- * the same connection boundaries. No crypto buffers or keys are involved. */
-static long rvemu_bench_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-    __u32 tag;
-    struct sbiret r;
-    if (cmd == RVEMU_BENCH_REPORT) {
-        r = sbi_ecall(0x0a000002, 1, 0, 0, 0, 0, 0, 0);
-        if (r.error) return r.error == SBI_ERR_NOT_SUPPORTED ? -EOPNOTSUPP : -EIO;
-        return r.value;
-    }
-    if (cmd != RVEMU_BENCH_POINT) return -ENOTTY;
-    if (copy_from_user(&tag, (void __user *)arg, sizeof(tag))) return -EFAULT;
-    if (tag > 3) return -EINVAL;
-    r = sbi_ecall(0x0a000002, 0, tag, 0, 0, 0, 0, 0);
-    return r.error ? -EIO : 0;
-}
-static const struct file_operations rvemu_bench_ops = {
-    .owner = THIS_MODULE, .unlocked_ioctl = rvemu_bench_ioctl,
-};
-static struct miscdevice rvemu_bench_dev = {
-    .minor = MISC_DYNAMIC_MINOR, .name = "rvemu-bench",
-    .fops = &rvemu_bench_ops, .mode = 0600,
-};
-static int __init rvemu_bench_init(void)
-{
-    if (sbi_probe_extension(0x0a000002) <= 0) return -ENODEV;
-    return misc_register(&rvemu_bench_dev);
-}
-device_initcall(rvemu_bench_init);
 MODULE_LICENSE("GPL");

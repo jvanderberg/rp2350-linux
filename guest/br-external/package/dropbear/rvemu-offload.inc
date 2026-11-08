@@ -1,4 +1,4 @@
-/* Included by chachapoly.c in the experimental test build. */
+/* Included by chachapoly.c: SSH packets through /dev/rvemu-ssh. */
 #include <sys/ioctl.h>
 #include "rvemu-ssh.h"
 

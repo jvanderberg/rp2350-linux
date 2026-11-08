@@ -54,3 +54,10 @@ BR2_PACKAGE_I2C_TOOLS=y
 BR2_PACKAGE_SPIDEV_TEST=y
 BR2_PACKAGE_MICROPYTHON_MACHINE=y
 BR2_PACKAGE_PINS_EXAMPLES=y
+# SSH: Dropbear and its client on the native engine
+# (guest/br-external/package/dropbear), public-key logins only, host keys in
+# /home/dropbear (post-build-disk.sh)
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_DROPBEAR_CLIENT=y
+BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
+BR2_PACKAGE_DROPBEAR_LOCALOPTIONS_FILE="/guest/br-external/package/dropbear/localoptions.h"

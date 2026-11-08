@@ -80,3 +80,9 @@ CONFIG_RVEMU_ADC=y
 # CONFIG_INPUT is not set
 # CONFIG_SERIO is not set
 # CONFIG_HID_SUPPORT is not set
+# the firmware's native engine (drivers/rvemu): /dev/rvemu-crypto for
+# Dropbear's key exchange and signatures, /dev/rvemu-ssh for its packets,
+# /dev/rvemu-bench for benchmark points
+CONFIG_RVEMU_CRYPTO=y
+CONFIG_RVEMU_SSH=y
+CONFIG_RVEMU_BENCH=y

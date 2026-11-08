@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Apply exact, idempotent edits to the pinned Dropbear 2026.94 test source."""
+"""Dropbear 2026.94 on the rvemu native engine: exact, idempotent edits that
+hook the rvemu-*.inc adapters into its source. Usage: patch.py SOURCE_DIR"""
 from pathlib import Path
 import sys
 root=Path(sys.argv[1])

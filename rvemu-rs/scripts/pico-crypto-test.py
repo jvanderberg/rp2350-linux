@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Native crypto on the board: boot the crypto test guest (guest/out-crypto,
-guest/tests/build-board-crypto.sh) with `pico-shell.sh -C`, log in on the
+guest/tests/build-board-crypto.sh) with `pico-shell.sh -d`, log in on the
 USB console and run the on-device tests. Results (JSON) and the console
 transcript go to target/pico-crypto/.
 
@@ -104,8 +104,8 @@ def shell_port():
 
 def boot(log):
     """(Re)boot the board into the crypto guest; a logged-in console."""
-    r = subprocess.run(['bash', 'scripts/pico-shell.sh', '-C', '-d', str(GUEST)], cwd=ROOT, capture_output=True, text=True)
-    log.write(f'\n=== pico-shell.sh -C -d {GUEST}\n{r.stdout}{r.stderr}\n')
+    r = subprocess.run(['bash', 'scripts/pico-shell.sh', '-d', str(GUEST)], cwd=ROOT, capture_output=True, text=True)
+    log.write(f'\n=== pico-shell.sh -d {GUEST}\n{r.stdout}{r.stderr}\n')
     if r.returncode:
         raise SystemExit(f'pico-shell.sh failed:\n{r.stdout}{r.stderr}')
     t0 = time.monotonic()
@@ -316,8 +316,14 @@ def board_ip(c):
 
 def ping_stats(ip, count, interval=0.2):
     r = subprocess.run(['ping', '-c', str(count), '-i', str(interval), ip], capture_output=True, text=True)
-    m = re.search(r'(\d+) packets transmitted, (\d+) packets received.*?\n.*?= ([\d.]+)/([\d.]+)/([\d.]+)', r.stdout, re.S)
-    return dict(sent=int(m[1]), received=int(m[2]), min_ms=float(m[3]), avg_ms=float(m[4]), max_ms=float(m[5])) if m else dict(raw=r.stdout)
+    n = re.search(r'(\d+) packets transmitted, (\d+) packets received', r.stdout)
+    if not n:
+        return dict(raw=r.stdout)
+    res = dict(sent=int(n[1]), received=int(n[2]))
+    t = re.search(r'= ([\d.]+)/([\d.]+)/([\d.]+)', r.stdout)
+    if t:
+        res.update(min_ms=float(t[1]), avg_ms=float(t[2]), max_ms=float(t[3]))
+    return res
 
 
 def cmd_responsive(a, log):
@@ -351,7 +357,7 @@ def cmd_responsive(a, log):
         iv = interval(*r['points'], r['sys_hz']) if len(r['points']) == 2 else None
         res[f'busy_{case}'] = dict(ping=p, console=e, native_us_per_call=round(iv['ms'] * 1000 / a.calls, 1) if iv else None,
                                    completed='BENCH DONE' in out)
-        check('BENCH DONE' in out and p.get('received') == p.get('sent'), f'{case} in a loop: no ping loss, console answers, op completes', res)
+        check('BENCH DONE' in out and p.get('sent') == p.get('received') == 50, f'{case} in a loop: no ping loss, console answers, op completes', res)
     # a process killed in the middle of a native operation: the kernel
     # aborts it; the next operations and the erased stack are unaffected
     before, _ = report(c)

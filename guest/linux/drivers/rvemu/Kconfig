@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0
-# Devices of the rvemu machine (rvemu-rs/rvcore/src/periph.rs): the RP2350's
-# GPIO, PWM and ADC as the emulator presents them. guest/build.sh copies this
-# directory into the kernel tree.
+# Devices of the rvemu machine: the RP2350's pins as the emulator presents
+# them (rvemu-rs/rvcore/src/periph.rs), and the firmware's native engine
+# (rvemu-rs/rvaccel). guest/build.sh copies this directory into the kernel
+# tree.
 
 config RVEMU_GPIO
 	bool "rvemu GPIO controller"
@@ -38,3 +39,27 @@ config RVEMU_SPI
 	help
 	  The rvemu machine's SPI controller: the RP2350's SPI0, driven
 	  synchronously by the emulator.
+
+config RVEMU_CRYPTO
+	bool "rvemu native crypto engine"
+	depends on RISCV_SBI
+	help
+	  /dev/rvemu-crypto: the rvemu machine's native buffer engine (SBI
+	  extension 0x0a000001): X25519, Ed25519, ChaCha20-Poly1305,
+	  sntrup761 and LZ4, run by the firmware in time slices. The device
+	  appears only when the firmware has the engine.
+
+config RVEMU_SSH
+	bool "rvemu SSH packet engine"
+	depends on RVEMU_CRYPTO
+	help
+	  /dev/rvemu-ssh: chacha20-poly1305@openssh.com packets sealed and
+	  opened by the native engine, for Dropbear.
+
+config RVEMU_BENCH
+	bool "rvemu benchmark points"
+	depends on RISCV_SBI
+	help
+	  /dev/rvemu-bench: points at which the firmware records its cycle
+	  counters (SBI extension 0x0a000002), and the report it prints on
+	  its console.

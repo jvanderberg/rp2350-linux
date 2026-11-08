@@ -102,7 +102,13 @@ int main(int argc, char **argv)
             printf("BENCH CASE %s op=%u calls=%d\n", v[i].name, v[i].op, reps);
             fflush(stdout);
             if (ioctl(b, RVEMU_BENCH_POINT, &t0)) { perror("benchmark point"); return 1; }
-            for (int r = 0; r < reps; r++) run(fd, &v[i], out, &len);
+            for (int r = 0; r < reps; r++) {
+                int e = run(fd, &v[i], out, &len);
+                if ((uint32_t)e != v[i].err || (!e && len != v[i].expected_len)) {
+                    printf("BENCH FAIL %s call %d: errno %d, %u bytes\n", v[i].name, r, e, len);
+                    return 1;
+                }
+            }
             if (ioctl(b, RVEMU_BENCH_POINT, &t1)) { perror("benchmark point"); return 1; }
             if (ioctl(b, RVEMU_BENCH_REPORT) < 0) { perror("benchmark report"); return 1; }
         }

@@ -1,4 +1,5 @@
-/* Generic fixed-width RV32 accelerator ABI. No SSH session state. */
+/* /dev/rvemu-crypto (crypto-rvemu.c): the rvemu machine's native buffer
+ * engine. Fixed-width RV32 ABI; addresses are the caller's. */
 #ifndef RVEMU_CRYPTO_H
 #define RVEMU_CRYPTO_H
 #include <linux/types.h>

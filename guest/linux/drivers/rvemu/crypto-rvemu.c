@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Generic synchronous buffer accelerator; keys/coins belong to the caller.
- * Each open owns physical bounce buffers; a mutex permits shared descriptors.
- * Firmware errors never copy output back; all used buffers are wiped. */
+/* /dev/rvemu-crypto: the rvemu machine's native buffer engine, one operation
+ * per ioctl (rvemu-crypto.h). Keys and random seeds come from the caller.
+ * Each open owns kernel bounce buffers, which a mutex serializes for shared
+ * descriptors; a failed operation copies nothing back, and every buffer used
+ * is wiped. */
 #include <linux/init.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
@@ -15,7 +17,6 @@
 #include <asm/io.h>
 #include "rvemu-crypto.h"
 #include "rvemu-native.h"
-#define EXT 0x0a000001
 /* Firmware pause protocol: an operation FID with MAY_PEND may return
  * PENDING after a time slice; CONTINUE runs the next slice, ABORT drops it.
  * The firmware runs one operation at a time. */
@@ -34,15 +35,15 @@ struct sbiret rvemu_native_call(unsigned long op, phys_addr_t out, unsigned long
 {
     struct sbiret r = { .error = RVEMU_NATIVE_INTERRUPTED };
     if (mutex_lock_killable(&native_lock)) return r;
-    r = sbi_ecall(EXT, op | MAY_PEND, out, cap, in, len, params, plen);
+    r = sbi_ecall(RVEMU_NATIVE_EXT, op | MAY_PEND, out, cap, in, len, params, plen);
     while (r.error == PENDING) {
         if (fatal_signal_pending(current)) {
-            sbi_ecall(EXT, ABORT, 0, 0, 0, 0, 0, 0);
+            sbi_ecall(RVEMU_NATIVE_EXT, ABORT, 0, 0, 0, 0, 0, 0);
             r.error = RVEMU_NATIVE_INTERRUPTED;
             break;
         }
         cond_resched();
-        r = sbi_ecall(EXT, CONTINUE, 0, 0, 0, 0, 0, 0);
+        r = sbi_ecall(RVEMU_NATIVE_EXT, CONTINUE, 0, 0, 0, 0, 0, 0);
     }
     mutex_unlock(&native_lock);
     return r;
@@ -105,7 +106,7 @@ static const struct file_operations crypto_ops={
 static struct miscdevice crypto_dev={.minor=MISC_DYNAMIC_MINOR,.name="rvemu-crypto",.fops=&crypto_ops,.mode=0600};
 static int __init crypto_init(void)
 {
-    if (sbi_probe_extension(EXT)<=0) return -ENODEV;
+    if (sbi_probe_extension(RVEMU_NATIVE_EXT)<=0) return -ENODEV;
     return misc_register(&crypto_dev);
 }
 device_initcall(crypto_init);

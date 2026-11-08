@@ -34,13 +34,15 @@ fresh_target() {   # BR_OUT FILES...
 
 # Buildroot rebuilds nothing when a package's .mk or patches change: after
 # defconfig, dirclean each external package whose files differ from the
-# last build in this tree.
+# last build in this tree (with the files under /guest its extra-sources
+# lists). A directory named after a Buildroot package (dropbear) holds hooks
+# on that package.
 ext_rebuild() {   # BR_OUT
   local o=$1 d p sum
   [[ -n $EXT ]] || return 0
   for d in "$EXT"/package/*/; do
     p=$(basename "$d")
-    sum=$(find "$d" -type f | sort | xargs cat | sha256sum | cut -d' ' -f1)
+    sum=$( { find "$d" -type f | sort; if [[ -f $d/extra-sources ]]; then sed 's|^|/guest/|' "$d/extra-sources"; fi; } | xargs cat | sha256sum | cut -d' ' -f1)
     if [[ "$(cat "$o/.ext-sum-$p" 2>/dev/null)" != "$sum" ]]; then
       make -C "$o" "$p-dirclean"
       echo "$sum" > "$o/.ext-sum-$p"

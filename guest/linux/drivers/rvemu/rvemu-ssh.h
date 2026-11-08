@@ -1,4 +1,5 @@
-/* Experimental fixed-width RV32 userspace ABI, shared with Dropbear. */
+/* /dev/rvemu-ssh (ssh-rvemu.c): SSH packets, and /dev/rvemu-bench
+ * (bench-rvemu.c): benchmark points. Fixed-width RV32 ABI. */
 #ifndef RVEMU_SSH_H
 #define RVEMU_SSH_H
 #include <linux/types.h>

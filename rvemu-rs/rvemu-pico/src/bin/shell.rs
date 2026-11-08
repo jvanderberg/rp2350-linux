@@ -71,19 +71,14 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 /// 1 MiB store made the boot slower (9.9 s against 8.0 s; XIP misses 3.7 M
 /// -> 12.7 M). With `STORE_WORDS = (1 << 20) / 4` the guest gets 7 MiB.
 const STORE_WORDS: usize = 0;
-#[cfg(feature = "pv-buffers")]
+/// The top 64 KiB of PSRAM: the native buffer engine's workspace
+/// (rvcore `NativeWorkspace`) and the benchmark log.
 const NATIVE_BYTES: usize = 64 * 1024;
-#[cfg(not(feature = "pv-buffers"))]
-const NATIVE_BYTES: usize = 0;
-#[cfg(feature = "pv-buffers")]
 const NATIVE_BASE: usize = board::PSRAM_CACHED + (8 << 20) - NATIVE_BYTES;
-#[cfg(feature = "pv-buffers")]
 const _: () = assert!(core::mem::size_of::<rvcore::NativeWorkspace>() <= NATIVE_BYTES);
 /// The benchmark log (`Bench`) sits in the same reservation, after the
 /// workspace.
-#[cfg(feature = "pv-buffers")]
 const BENCH_BASE: usize = (NATIVE_BASE + core::mem::size_of::<rvcore::NativeWorkspace>()).next_multiple_of(16);
-#[cfg(feature = "pv-buffers")]
 const _: () = assert!(BENCH_BASE + core::mem::size_of::<Bench>() <= NATIVE_BASE + NATIVE_BYTES);
 const RAM_MAX: u32 = (8 << 20) - (STORE_WORDS * 4 + NATIVE_BYTES) as u32;
 const STORE: usize = board::PSRAM_CACHED + RAM_MAX as usize;
@@ -322,35 +317,26 @@ struct PicoBus {
     sys_hz: u32,
     /// The last `core1::events()` acted on.
     seen: u32,
-    #[cfg(feature = "pv-buffers")]
     bench: &'static mut Bench,
     /// core0 cycles when the current native slice began, and `mie` then.
-    #[cfg(feature = "pv-buffers")]
     slice: (u64, u32),
 }
 
 /// How long a native operation runs before the guest gets the CPU back
 /// (`Bus::native_preemptible`): core0's SIO machine timer interrupts it after
 /// this many microseconds.
-#[cfg(feature = "pv-buffers")]
 const NATIVE_SLICE_US: u32 = 2000;
 /// core0's SIO RISC-V platform timer (MTIME is shared and runs at the
 /// system clock, core1.rs; MTIMECMP is each core's own).
-#[cfg(feature = "pv-buffers")]
 const SIO_MTIME: usize = 0xd000_01b0;
-#[cfg(feature = "pv-buffers")]
 const SIO_MTIMEH: usize = 0xd000_01b4;
-#[cfg(feature = "pv-buffers")]
 const SIO_MTIMECMP: usize = 0xd000_01b8;
-#[cfg(feature = "pv-buffers")]
 const SIO_MTIMECMPH: usize = 0xd000_01bc;
 /// mie.MTIE
-#[cfg(feature = "pv-buffers")]
 const MIE_MTIE: u32 = 1 << 7;
 
 /// Set core0's MTIMECMP (high word first parked at the maximum, so it never
 /// matches half-written).
-#[cfg(feature = "pv-buffers")]
 #[inline]
 fn set_mtimecmp(t: u64) {
     // SAFETY: core0's own SIO timer compare registers.
@@ -362,7 +348,6 @@ fn set_mtimecmp(t: u64) {
 }
 
 /// The SIO timer (system clock cycles).
-#[cfg(feature = "pv-buffers")]
 #[inline]
 fn mtime() -> u64 {
     loop {
@@ -384,7 +369,6 @@ fn mtime() -> u64 {
 /// enabled only while one runs (rvaccel enables them on its stack), so this
 /// interrupted it: pause it, back to the emulator. Returns when the guest
 /// continues the operation (`native_slice_begin` has re-armed the timer).
-#[cfg(feature = "pv-buffers")]
 #[unsafe(no_mangle)]
 extern "C" fn MachineTimer() {
     // SAFETY: mie is core0's; the workspace is the CPU's, at NATIVE_BASE.
@@ -395,9 +379,7 @@ extern "C" fn MachineTimer() {
 }
 
 /// XIP cache counters (hits, accesses; 32 bits, any write clears both).
-#[cfg(feature = "pv-buffers")]
 const XIP_CTR_HIT: usize = 0x400c_800c;
-#[cfg(feature = "pv-buffers")]
 const XIP_CTR_ACC: usize = 0x400c_8010;
 
 /// The board's side of the guest's benchmark points (SBI 0x0a000002): each
@@ -405,7 +387,6 @@ const XIP_CTR_ACC: usize = 0x400c_8010;
 /// PSRAM reservation and printed on the console only when the guest asks
 /// (`benchmark_report`), outside any measured interval. XIP counts are
 /// accumulated into 64 bits at every `poll` (about every millisecond).
-#[cfg(feature = "pv-buffers")]
 struct Bench {
     log: rvcore::benchmark::Log,
     host: [[u64; 4]; 32],
@@ -413,7 +394,6 @@ struct Bench {
     xip_acc: u64,
 }
 
-#[cfg(feature = "pv-buffers")]
 impl Bench {
     #[inline]
     fn sample_xip(&mut self) {
@@ -431,10 +411,8 @@ impl Bench {
 }
 
 /// `core::fmt::Write` onto the guest console's output ring.
-#[cfg(feature = "pv-buffers")]
 struct ConWriter<'a>(&'a mut RingConsole);
 
-#[cfg(feature = "pv-buffers")]
 impl core::fmt::Write for ConWriter<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
@@ -460,18 +438,15 @@ impl PicoBus {
         }
         // GPIO edges (only lines the guest armed; one register read otherwise)
         self.plat.poll_pins();
-        #[cfg(feature = "pv-buffers")]
         self.bench.sample_xip();
     }
 }
 
 impl Bus for PicoBus {
-    #[cfg(feature = "pv-buffers")]
     fn benchmark_supported(&self) -> bool {
         true
     }
     /// `host` is core0's cycle count, `ns` the same in nanoseconds.
-    #[cfg(feature = "pv-buffers")]
     #[inline(never)]
     fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
         let cycles = board::mcycle64();
@@ -487,7 +462,6 @@ impl Bus for PicoBus {
     }
     /// The points so far, the native operations' stack peaks and both
     /// cores' stack depth, on the console; then an empty log.
-    #[cfg(feature = "pv-buffers")]
     #[inline(never)]
     fn benchmark_report(&mut self, cpu: &Cpu) -> Option<u32> {
         use core::fmt::Write as _;
@@ -524,12 +498,10 @@ impl Bus for PicoBus {
         b.log.clear();
         Some(n as u32)
     }
-    #[cfg(feature = "pv-buffers")]
     fn native_preemptible(&self) -> bool {
         true
     }
     /// Arm core0's timer for one slice; only it may interrupt the operation.
-    #[cfg(feature = "pv-buffers")]
     fn native_slice_begin(&mut self) {
         let mie: u32;
         // SAFETY: core0's own interrupt enables; MIE stays off out here.
@@ -541,7 +513,6 @@ impl Bus for PicoBus {
     }
     /// Disarm the timer; the guest's clock moves on by the slice's real time
     /// (native work retires no guest instructions).
-    #[cfg(feature = "pv-buffers")]
     fn native_slice_end(&mut self, cpu: &mut Cpu) {
         // SAFETY: as above.
         unsafe { core::arch::asm!("csrw mie, {0}", in(reg) self.slice.1) };
@@ -861,9 +832,7 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
             seen: core1::events().wrapping_sub(1),
             // PSRAM is up (psram_init above); the reservation is outside
             // guest RAM (h.valid(RAM_MAX)) and used by nothing else.
-            #[cfg(feature = "pv-buffers")]
             slice: (0, 0),
-            #[cfg(feature = "pv-buffers")]
             bench: {
                 let at = BENCH_BASE as *mut Bench;
                 core::ptr::write_bytes(at, 0, 1);
@@ -898,7 +867,6 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     let cpu = unsafe {
         let p = (*addr_of_mut!(CPU)).as_mut_ptr();
         let c = Cpu::init(p, h.ram_host() as *mut u8, 0, h.ram_size, 0, dtb);
-        #[cfg(feature = "pv-buffers")]
         // PSRAM has been initialized and checked. h.valid(RAM_MAX) excludes
         // this reservation from both guest RAM and the translator store.
         c.set_native_workspace(rvcore::NativeWorkspace::init_at(NATIVE_BASE as *mut _));
@@ -962,7 +930,6 @@ pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 2] = [
     hal::binary_info::rp_program_description!(c"rvemu: interactive Linux, console on USB"),
 ];
 
-#[cfg(feature = "pv-buffers")]
 fn rvaccel_stack_bytes() -> usize {
     rvcore::NATIVE_STACK_BYTES
 }
