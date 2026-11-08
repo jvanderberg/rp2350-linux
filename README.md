@@ -81,7 +81,8 @@ cd /usr/share/examples/pins; ./i2c-scan 1   # C examples, built and as source
 MicroPython's `machine` module has `Pin` (with `irq()`), `I2C`, `SPI`, `PWM`
 and `ADC` (`ADC(Pin(40))`, `ADC(ADC.CORE_TEMP).read_temp()`), over the same
 interfaces. Details: [guest](guest/README.md#pins); the devices and the
-firmware side: [rvemu-rs](rvemu-rs/README.md#pins).
+firmware side: [rvemu-rs](rvemu-rs/README.md) (Machine, and Pins under
+rvemu-pico-shell).
 
 ## Prerequisites (macOS)
 

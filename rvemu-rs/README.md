@@ -28,6 +28,7 @@ is what lockstep testing and the board-against-Mac comparisons rely on.
 | `-k FILE` | kernel Image, loaded at the start of RAM |
 | `-i FILE` | initramfs (cpio) |
 | `-d FILE` | disk image for the read-only virtio-blk device. Without `-i`, the default command line roots on it: `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`. |
+| `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N. `RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc` picks which of them go in the device tree. |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
 | `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board |
 | `-m MB` | guest RAM (default 64) |
@@ -51,6 +52,11 @@ counters.
 | UART (16550) | 0xF4000000 | 1 |
 | virtio-blk | 0xF8000000 | 2 |
 | virtio-net | 0xF8000200 | 3 |
+| GPIO | 0xF8001000 | 8 |
+| I2C0, I2C1 | 0xF8001200, 0xF8001400 | |
+| SPI0 | 0xF8001600 | |
+| PWM | 0xF8001800 | |
+| ADC | 0xF8001A00 | |
 
 - **No M-mode.** The kernel runs in S-mode, and SBI is implemented in the
   emulator.
@@ -63,6 +69,28 @@ counters.
     queue while fewer than 19 (`MAX_SKB_FRAGS + 2`) descriptors are free.
     Backends implement `NetLink`: the stub LAN on the Mac, the Wi-Fi radio
     on the board.
+- **Pins** (`rvcore/src/periph.rs`, `-G`): small synchronous MMIO
+  devices with their own Linux drivers (`guest/linux/drivers/rvemu`), over a
+  `Pins` backend: `StubPins` on the Mac, `BoardPins` on the board.
+  - **GPIO:** 48 lines, one control word each (output, output enable,
+    pull-up, pull-down, rising/falling edge interrupt; the pad level reads
+    back in bit 8), set/clear/input/pending words for 32 lines at a time.
+    Lines the backend doesn't offer are invalid in the gpiochip. Edges come
+    from the backend's latched state, checked when the device poll runs;
+    there is no per-instruction cost.
+  - **I2C:** the driver writes a table of up to 16 messages (address,
+    read flag, length, buffer) and its count. The device runs the whole
+    transfer before that store returns, and leaves the messages done (and
+    a NACK flag) in a result register. Consecutive messages to one address
+    are one transaction with repeated starts.
+  - **SPI:** one transfer per write of GO: TX and RX buffers (guest
+    physical), length, clock rate and mode; chip select is a register of
+    its own. The Linux driver is an unqueued controller, so the SPI core
+    runs no message-pump thread.
+  - **PWM:** channel N is GPIO N. The backend answers with the period and
+    duty cycle it achieved, which `get_state` reports.
+  - **ADC:** one 12-bit result register per channel: 0-7 GP40-GP47, 8 the
+    temperature sensor (bit 31: conversion error).
 - **DMA and the translator:** each guest RAM range a device writes is
   reported separately (`take_dma_write`). The translator then drops only the
   code pages that were actually written.
@@ -140,6 +168,27 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
   BOOTSEL. So does the SWD request in `rp2350-board::bootsel_if_requested`.
 - **Disk.** The squashfs is read through flash's uncached, non-allocating
   XIP alias, so disk reads don't evict guest RAM from the XIP cache.
+
+### Pins (`rvemu-pico/src/pins.rs`)
+
+`BoardPins` puts the guest's pin devices on rp235x-hal's drivers; the pin
+map is in the top-level README.
+
+- **GPIO.** Free pins switch between SIO input and output (and PWM) as the
+  guest configures them; pulls and levels go straight to the pad. Edges
+  latch in IO_BANK0's raw interrupt registers. The device poll reads them
+  only when the IO_IRQ_BANK0 line is pending (one Xh3irq CSR read); that
+  interrupt is never taken.
+- **I2C.** `hal::I2C` at 100 kHz with the pads' pull-ups. The controller
+  can't send an address without data, so a zero-length write (i2cdetect's
+  probe) becomes a one-byte read.
+- **SPI.** `hal::spi::Spi`, 8-bit frames; the clock rate and mode change
+  per transfer. Chip select GP17 is a GPIO, held for the whole message.
+- **PWM.** The slice and channel that reach the pin, with the divider and
+  TOP worked out from the period. A slice's period can't change while
+  another of its pins is running.
+- **ADC.** rp235x-hal 0.4's ADC knows only the QFN-60 channels, so the
+  firmware selects the RP2350B's channels itself (AINSEL, START_ONCE).
 
 ### Wi-Fi (`rvemu-pico/src/wifi.rs`)
 
