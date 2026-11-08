@@ -1,5 +1,5 @@
 /* rvemu-pico-shell: what core1 runs, linked into SRAM (copied there at
- * startup by core1::copy_ram_text). This script is given before
+ * startup by core1::copy_core1_text). This script is given before
  * rp235x_riscv.x, so these patterns claim their input sections before
  * riscv-rt's `*(.text .text.*)` does; INSERT then places the section after
  * .data in SRAM, loaded from flash after .data's image. */

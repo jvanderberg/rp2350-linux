@@ -1,12 +1,12 @@
 //! Flash erase and program at run time, for everything in the firmware that
-//! writes flash: the guest's /home storage (`flashdev`) and swap.
+//! writes flash: the guest's /home (shell.rs `BoardNor`) and swap_flash.rs.
 //!
 //! The firmware and the guest's kernel text run from flash (XIP), and the
 //! PSRAM sits on the same QMI. While the flash is erasing or programming, no
 //! XIP access to either chip select may happen, so every operation:
 //! - refuses any range outside `REGIONS`: never the firmware, the Wi-Fi
 //!   sector at 0x103FF000, the guest blob, the squashfs or the kernel text;
-//! - parks core 1 in SRAM (`park_core1`, where core 1's guard plugs in);
+//! - parks core 1 in SRAM (`core1::park()`, so it can't fetch from flash);
 //! - masks interrupts and runs from SRAM: it saves the QMI window settings
 //!   (the board's 348 MHz flash timing, the PSRAM's QPI setup on CS1), the
 //!   QSPI pads and XIP_CTRL, calls the bootrom's `connect_internal_flash`,
@@ -42,7 +42,7 @@ pub struct Region {
     pub end: u32,
 }
 
-/// The guest's /home (the storage thread's flashdev): 1 MB.
+/// The guest's /home (the `rvemu,flash` device): 1 MB.
 pub const STORAGE: Region = Region { start: 0x1010_0000, end: 0x1020_0000 };
 /// Swap: up to the Wi-Fi settings sector at 0x103FF000, which stays untouched.
 pub const SWAP: Region = Region { start: 0x1020_0000, end: 0x103F_F000 };

@@ -6,7 +6,7 @@
 //! program and per-transaction sequence, with the CPU feeding the FIFOs where
 //! the original uses DMA. There is no executor: core1's service loop
 //! (`RadioService::poll`) polls the driver's futures with a no-op waker, and
-//! `embassy-time` reads the core's cycle counter.
+//! `embassy-time` reads core1's timer (`core1::now()`, at the system clock).
 //!
 //! All of this runs on core1 (`core1.rs`), from SRAM. Frames reach the
 //! guest's virtio-net on core0 through two `FrameRing`s (`NET_RX`, `NET_TX`);
@@ -33,8 +33,8 @@ use rtt_target::rprintln;
 
 // ------------------------------------------------------------------ time
 
-/// 2^32 / (cycles per microsecond): `now` multiplies instead of dividing,
-/// because the u64 division is a libcall in flash.
+/// 2^32 / (cycles per microsecond): `now` multiplies instead of making a
+/// u64 division (a libcall) on every call.
 static US_PER_CYCLE_Q32: AtomicU32 = AtomicU32::new(u32::MAX / 150);
 
 struct CycleClock;
@@ -45,7 +45,7 @@ impl embassy_time_driver::Driver for CycleClock {
         let m = u64::from(US_PER_CYCLE_Q32.load(Ordering::Relaxed));
         (c >> 32) * m + (((c & 0xFFFF_FFFF) * m) >> 32)
     }
-    /// Nothing to arm: every future is polled again on the next device poll.
+    /// Nothing to arm: every future is polled again on core1's next service pass.
     fn schedule_wake(&self, _at: u64, _waker: &Waker) {}
 }
 

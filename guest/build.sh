@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs inside the container. /src = guest/src (bind), /out = guest/out (bind),
+# Runs inside the container. /src = guest/src (bind), /out = guest/out and
+# /out-disk = guest/out-disk (bind), /guest = guest/ (read-only bind),
 # /work = docker volume for build trees.
 set -euo pipefail
 KVER=${KVER:-6.12.116}

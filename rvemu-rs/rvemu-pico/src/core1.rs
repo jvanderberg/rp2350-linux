@@ -284,8 +284,8 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// core0: park core1 in an SRAM loop (it never touches flash there), for
 /// flash erase and program; `unpark` lets it go. Waits until core1 is
-/// parked (at most one pass of its service loop). Don't nest. The pair
-/// fits storage's `flash::Parker { park, unpark }`. Always true.
+/// parked (at most one pass of its service loop). Don't nest. `flash.rs`
+/// calls the pair around every erase and program. Always true.
 #[unsafe(link_section = ".data.core1")]
 #[inline(never)]
 pub fn park() -> bool {

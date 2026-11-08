@@ -9,7 +9,8 @@
 # MicroPython, ...; guest/run-build.sh disk). -i: the small initramfs guest in
 # guest/out. -b: (re)build that guest in Docker first (guest/run-build.sh;
 # incremental once the first Buildroot build is done). -w: give the guest
-# the flash swap device (/dev/vdb, 1792 KiB in 0x10200000-0x103FEFFF).
+# the flash swap device in 0x10200000-0x103FEFFF (/dev/vdb, or /dev/vda with
+# -i; 1788 KiB of swap).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/pico-common.sh

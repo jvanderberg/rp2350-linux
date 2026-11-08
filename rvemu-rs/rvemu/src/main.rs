@@ -333,7 +333,7 @@ fn make_dts(o: &DtsOpts) -> String {
         );
     }
     // the swap device, and the top page of RAM kept from the guest: the
-    // board keeps the swap map there (rvemu-pico-shell, SWAP_TABLES_SIZE)
+    // board keeps the swap map there (rvemu-pico-shell, SWAP_TABLES)
     let mut reserved = String::new();
     if swap {
         virtio += &node(VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ);
@@ -620,9 +620,11 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
   -F FILE        NOR flash device (the board's /home region, 1 MB) backed by
                  FILE, created blank if missing; with -D, any FILE adds the node
   -W             swap device (/dev/vdb in the disk guest): the board's flash
-                 swap on a modelled 2 MB flash, statistics in its last page
+                 swap on a modelled flash (511 sectors), statistics in the
+                 page after the swap area (flashswap-stats)
   -G             the board's pins: GPIO, I2C, SPI, PWM, ADC on a simulated
-                 board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins)
+                 board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins,
+                 RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc picks the devices)
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size (default 64)
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only

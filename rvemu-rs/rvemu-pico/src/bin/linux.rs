@@ -46,8 +46,8 @@ const XIP_CTR_ACC: usize = 0x400c_8010;
 
 // ------------------------------------------------------------------ translator storage (SRAM)
 
-/// Same as rvemu-pico-shell: 384 KiB in a ring of 8 regions, plus the PSRAM
-/// backing store.
+/// 384 KiB in a ring of 8 regions, plus the PSRAM backing store. (The shell
+/// has 326 KiB: core1's code and buffers take the rest of its SRAM.)
 const CODE_WORDS: usize = 96 * 1024;
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;

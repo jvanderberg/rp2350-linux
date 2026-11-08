@@ -483,7 +483,7 @@ fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus) {
         jit.run_one(cpu, bus);
         events = events.wrapping_add(1);
         // ~1-2 ms at today's dispatch rate; one SRAM load unless core1 has
-        // something for the guest
+        // something for the guest, plus the pins' pending check
         if events & 0xFF == 0 {
             bus.poll();
         }
@@ -505,8 +505,8 @@ fn main() -> ! {
 }
 
 /// Everything before the guest runs: the board, core1, the guest's devices
-/// and the translator. Not inlined, so its temporaries (pin setup, the
-/// Platform builder chain) leave the stack before `jit_loop`.
+/// and the translator. Not inlined, so its temporaries (pin setup, device
+/// construction) leave the stack before `jit_loop`.
 #[inline(never)]
 fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus, u32) {
     board::bootsel_if_requested();

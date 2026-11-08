@@ -262,7 +262,7 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C,
     }
 
     /// Pick up the pins' edges (GPIO interrupts) and refresh their line. Not
-    /// part of `update_irqs`, which every MMIO access runs and the board
+    /// part of `update_irqs`, which the device MMIO paths run and the board
     /// keeps inlined in its SRAM code: hosts call this from their periodic
     /// poll, and the pin devices' own accesses do it themselves.
     pub fn poll_pins(&mut self) {
@@ -364,8 +364,8 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C,
         {
             // Only its own register stores change the swap device's line
             // (requests complete in the queue notify; the guest acks with
-            // InterruptACK), so it stays out of `update_irqs`, which runs
-            // after every MMIO access and must stay small enough to inline
+            // InterruptACK), so it stays out of `update_irqs`, which the
+            // device MMIO paths run and which must stay small enough to inline
             // into the SRAM interpreter.
             let r = w.store(pa - VIRTIO_SWAP_BASE, size, v);
             self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
