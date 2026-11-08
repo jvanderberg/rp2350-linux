@@ -235,6 +235,13 @@ impl<C: Console, D: Disk, N: NetLink, P: Pins> Platform<C, D, N, P> {
             n.poll();
             self.plic.set_level(VIRTIO_NET_IRQ, n.irq_line());
         }
+    }
+
+    /// Pick up the pins' edges (GPIO interrupts) and refresh their line. Not
+    /// part of `update_irqs`, which every MMIO access runs and the board
+    /// keeps inlined in its SRAM code: hosts call this from their periodic
+    /// poll, and the pin devices' own accesses do it themselves.
+    pub fn poll_pins(&mut self) {
         if let Some(io) = &mut self.io {
             io.poll();
             self.plic.set_level(GPIO_IRQ, io.irq_line());
@@ -276,7 +283,7 @@ impl<C: Console, D: Disk, N: NetLink, P: Pins> Platform<C, D, N, P> {
             && pa.wrapping_sub(IO_BASE) < IO_SIZE
         {
             let r = io.load(pa, size);
-            self.update_irqs();
+            self.poll_pins();
             return r;
         }
         Err(exc::LOAD_FAULT)
@@ -311,7 +318,7 @@ impl<C: Console, D: Disk, N: NetLink, P: Pins> Platform<C, D, N, P> {
             && pa.wrapping_sub(IO_BASE) < IO_SIZE
         {
             let r = io.store(pa, size, v);
-            self.update_irqs();
+            self.poll_pins();
             return r;
         }
         Err(exc::STORE_FAULT)

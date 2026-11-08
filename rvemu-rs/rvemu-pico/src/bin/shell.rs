@@ -208,6 +208,7 @@ impl PicoBus<'_> {
             }
         }
         self.plat.update_irqs();
+        self.plat.poll_pins();
     }
 }
 

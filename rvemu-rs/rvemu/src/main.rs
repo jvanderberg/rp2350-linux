@@ -143,6 +143,7 @@ impl HostBus {
     fn poll(&mut self) {
         self.plat.con.read_input();
         self.plat.update_irqs();
+        self.plat.poll_pins();
     }
 }
 
