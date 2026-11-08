@@ -34,7 +34,6 @@ cargo build -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 IO=0; grep -q '^CONFIG_RVEMU_GPIO=y' "$(dirname "$K")/linux.config" 2>/dev/null && IO=1
 NET=1 NOR=1 SWAP=$SWAP IO=$IO pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
 ensure_bootsel "$ELF"
-keep_wifi
 load_text "$T/text.bin"
 load_blob "$T/blob.bin"
 [ $INITRAMFS = 1 ] || load_disk "$DISK"

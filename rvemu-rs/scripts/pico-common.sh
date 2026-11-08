@@ -49,7 +49,6 @@ ensure_bootsel() {
 # guest blob at 0x10400000 (2 MB), root filesystem at 0x10600000, kernel text
 # in the last bytes before 0x11000000 (guest_blob.rs).
 WIFI_ADDR=0x103ff000
-OLD_WIFI_ADDR=0x10ff0000   # before the kernel text moved to the end of flash
 
 # load_at FILE ADDR STAMP WHAT: write FILE to flash at ADDR unless STAMP says it is there
 load_at() {
@@ -72,21 +71,6 @@ load_disk() { load_at "$1" 0x10600000 "$DISK_STAMP" "root filesystem"; }
 load_text() {
   local n; n=$(wc -c < "$1" | tr -d ' ')
   load_at "$1" "$(printf '0x%x' $((0x11000000 - n)))" "$TEXT_STAMP" "kernel text"
-}
-
-# keep_wifi: once, copy Wi-Fi settings stored at the old address to the new
-# one (picotool wants both range bounds in hex; a failed read stops the load)
-keep_wifi() {
-  local t; t=$(mktemp -d)
-  picotool save -r $WIFI_ADDR "$(printf 0x%x $((WIFI_ADDR + 4096)))" "$t/new.bin" -t bin >/dev/null
-  if [ "$(head -c 4 "$t/new.bin" 2>/dev/null)" != WIFI ]; then
-    picotool save -r $OLD_WIFI_ADDR "$(printf 0x%x $((OLD_WIFI_ADDR + 4096)))" "$t/old.bin" -t bin >/dev/null
-    if [ "$(head -c 4 "$t/old.bin" 2>/dev/null)" = WIFI ]; then
-      echo "pico: moving the stored Wi-Fi network to $WIFI_ADDR"
-      picotool load -t bin "$t/old.bin" -o $WIFI_ADDR >/dev/null
-    fi
-  fi
-  rm -rf "$t"
 }
 
 # text_len IMAGE: bytes of the Image that are pure text (from its System.map):
