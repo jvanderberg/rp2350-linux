@@ -229,6 +229,18 @@ must discard output on any error.
 | 11 | sntrup761 encapsulate | public key1158 | fresh random seed32 | ciphertext1039 + shared secret32 |
 | 12 | sntrup761 decapsulate | ciphertext1039 | secret key1763 | shared secret32 |
 
+Long operations do not hold up the guest. The kernel driver calls an
+operation with SBI FID `0x100 | FID`, which allows the firmware to pause it:
+on the board, core0's timer stops it after a 2 ms slice and the call returns
+error `-100`. The driver then lets other tasks and interrupts run
+(`cond_resched()`) and calls FID `0x200` to run the next slice, until the
+operation finishes. A fatal signal ends the wait: the driver calls FID
+`0x201`, which drops the operation and erases its stack and scratch, and the
+ioctl fails with `EINTR`. The firmware runs one operation at a time; a new
+one while another is paused fails with error `-7`, and the driver serializes
+all callers. FIDs 0–12 still run an operation to completion in one call.
+Native time advances the guest's clock.
+
 No keys, identities or SSH sessions are retained in the engine. Callers own
 nonce uniqueness and randomness. The KEM consumes a freshly sampled 32-byte
 CSPRNG seed for each keypair/encapsulation; its seeded ChaCha20 generator
@@ -495,13 +507,17 @@ library temporaries use the dedicated stack. No allocation occurs per call.
 The hosted convenience `rvaccel::run` still allocates scratch on its caller's
 stack; small-stack firmware must use the workspace entry point.
 
-The RV32 trampoline preserves the original stack and ABI, then calls the
-engine on the workspace stack. Between calls the execution stack holds a
-paint pattern; after each call the first word that differs from it is the
+The engine runs each operation on the workspace stack as a coroutine of the
+emulator: a switch saves the callee-saved registers on one stack and resumes
+the other. A preemptible operation runs with machine interrupts enabled;
+core0's timer interrupt is taken on the operation's own stack, and its
+handler switches back to the emulator, which returns the pause to the guest.
+Resuming switches back into the handler, which returns into the operation.
+Between operations the execution stack holds a paint pattern; after each call the first word that differs from it is the
 call's exact high-water mark, and the stack is repainted from there up, which
 erases everything the call left on it. KEM scratch is erased by the KEM
-operations. Every call records its stack watermark and checks a 256-byte
-low-water guard. That guard detects budget violations;
+operations. Every operation records its stack watermark and checks a 256-byte
+low-water guard, after every slice and when it finishes. That guard detects budget violations;
 it is not a hardware barrier and does not prevent an overflow. The regression
 suite requires every tested operation to stay below 20 KiB, leaving at least
 4 KiB of the 24 KiB allocation unused.
@@ -511,19 +527,17 @@ including dispatch/callback frames, repeated calls and rejection paths):
 
 | Operation | Native execution stack high-water |
 |---|---:|
-| LZ4 decode / encode | 636 / 8,972 |
-| IETF ChaCha20-Poly1305 seal / open | 1,308 / 1,308 |
-| SSH packet seal / open | 868 / 868 |
-| X25519 | 3,320 |
-| Ed25519 public / sign / verify | 4,792 / 4,792 / 8,376 |
-| sntrup761 keypair / encapsulate / decapsulate | 14,716 / 11,164 / 17,788 |
+| LZ4 decode / encode | 668 / 9,020 |
+| IETF ChaCha20-Poly1305 seal / open | 1,420 / 1,420 |
+| SSH packet seal / open | 972 / 972 |
+| X25519 | 3,484 |
+| Ed25519 public / sign / verify | 5,020 / 5,020 / 8,460 |
+| sntrup761 keypair / encapsulate / decapsulate | 14,764 / 11,996 / 17,740 |
 
-The former shared-stack build measured 30,988 bytes for isolated keypair and
-28,540 for decapsulation with the same measurement wrapper. The new maximum
-is 17,788 bytes, leaving 6,788 bytes in the execution stack. These are observed
-high-water marks for this compiler/profile and test corpus, not a formal bound
-for all builds or inputs. The SSH connection's separate QEMU control-stack
-high-water is now 21,688 bytes, including harness setup.
+On the board a paused operation's stack also holds the timer interrupt's
+frame; the board's largest peak is 17,888 bytes (decapsulation). These are
+observed high-water marks for this compiler/profile and test corpus, not a
+formal bound for all builds or inputs.
 
 QEMU reserves independent workspaces for the translator and reference CPU.
 The Pico **shell** feature `pv-buffers` reserves the top **64 KiB of PSRAM**,

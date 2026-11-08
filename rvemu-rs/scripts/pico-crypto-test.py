@@ -148,11 +148,15 @@ def parse_report(text):
                         xip_hit=int(b[4]), xip_acc=int(b[5]), native=[int(x) for x in m[6].split(',')]))
     hz = re.search(r'benchmark board sys_hz=(\d+)', text)
     calls = re.search(r'native buffer calls \[([^\]]*)\]', text)
+    pre = re.search(r'native preemptions (\d+)', text)
+    aborts = re.search(r'native aborts (\d+)', text)
     peaks = re.search(r'native stack peaks \[([^\]]*)\] of (\d+) B', text)
     erased = re.search(r'native stack erased (true|false)', text)
     stack = re.search(r'firmware stack use: core0 (\d+) of (\d+) B, core1 (\d+) of (\d+) B', text)
     return dict(points=pts, sys_hz=int(hz[1]) if hz else None,
                 native_calls=[int(x) for x in calls[1].split(',')] if calls else None,
+                native_preemptions=int(pre[1]) if pre else None,
+                native_aborts=int(aborts[1]) if aborts else None,
                 native_stack_peaks=[int(x) for x in peaks[1].split(',')] if peaks else None,
                 native_stack_bytes=int(peaks[2]) if peaks else None,
                 native_stack_erased=erased[1] == 'true' if erased else None,
@@ -229,6 +233,7 @@ def cmd_vectors(a, log):
                                                                     us_per_call=round(iv['ms'] * 1000 / int(m[3]), 1))
     res['op_costs'] = ops
     check(len(ops) > 20, 'per-operation cycle costs measured', res)
+    res['native_preemptions'] = rep['native_preemptions']
     rep, _ = report(c)
     res['final'] = rep
     c.close()
@@ -347,7 +352,19 @@ def cmd_responsive(a, log):
         res[f'busy_{case}'] = dict(ping=p, console=e, native_us_per_call=round(iv['ms'] * 1000 / a.calls, 1) if iv else None,
                                    completed='BENCH DONE' in out)
         check('BENCH DONE' in out and p.get('received') == p.get('sent'), f'{case} in a loop: no ping loss, console answers, op completes', res)
+    # a process killed in the middle of a native operation: the kernel
+    # aborts it; the next operations and the erased stack are unaffected
+    before, _ = report(c)
+    out, _ = c.run(f'crypto-vectors {VECTORS} --bench 5 sntrup761-keypair-seeded > /dev/null 2>&1 & p=$!; sleep 2; kill -9 $p; wait $p; echo "killed status $?"', 120)
+    killed = re.search(r'killed status (\d+)', out)
+    mid, _ = report(c)
+    vec, rc = c.run(f'crypto-vectors {VECTORS} 1', 900)
     rep, _ = report(c)
+    res['after_kill'] = dict(status=int(killed[1]) if killed else None, aborts=[before['native_aborts'], mid['native_aborts']],
+                             erased_after_abort=mid['native_stack_erased'], vectors=vec.strip(), erased=rep['native_stack_erased'])
+    check(killed and killed[1] == '137' and mid['native_aborts'] == before['native_aborts'] + 1 and mid['native_stack_erased'],
+          'kill -9 during a native keypair: the kernel aborts it, the stack is erased', res)
+    check(rc == 0 and 'CRYPTO VECTORS PASS' in vec and rep['native_stack_erased'], 'after the abort every vector passes', res)
     res['report'] = rep
     c.close()
     save('responsive', res)

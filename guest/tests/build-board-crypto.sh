@@ -23,7 +23,7 @@ cp "/work/linux-disk-$KVER/drivers/mtd/devices/rvemu-flash.c" drivers/mtd/device
 cp "/work/linux-disk-$KVER/fs/jffs2/background.c" fs/jffs2/
 cp "/work/linux-disk-$KVER/.config" .config
 cp /repo/guest/linux/rvemu-ssh.c /repo/guest/linux/rvemu-ssh.h drivers/char/
-cp /repo/guest/linux/rvemu-crypto.c /repo/guest/linux/rvemu-crypto.h drivers/char/
+cp /repo/guest/linux/rvemu-crypto.c /repo/guest/linux/rvemu-crypto.h /repo/guest/linux/rvemu-native.h drivers/char/
 grep -q rvemu-ssh.o drivers/char/Makefile || echo 'obj-y += rvemu-ssh.o' >> drivers/char/Makefile
 grep -q rvemu-crypto.o drivers/char/Makefile || echo 'obj-y += rvemu-crypto.o' >> drivers/char/Makefile
 make ARCH=riscv CROSS_COMPILE="$CROSS" olddefconfig

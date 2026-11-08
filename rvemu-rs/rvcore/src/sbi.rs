@@ -68,7 +68,7 @@ impl Cpu {
                 }
             }
             #[cfg(feature = "pv-buffers")]
-            crate::pv_buffers::EXT => (err, val) = self.pv_buffer(fid),
+            crate::pv_buffers::EXT => (err, val) = self.pv_buffer(fid, bus),
             #[cfg(feature = "pv-pages")]
             crate::pv_pages::EXT => err = self.pv_page(fid, a0, a1),
             EXT_BASE => match fid {

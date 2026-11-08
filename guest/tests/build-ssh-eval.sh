@@ -10,7 +10,7 @@ mkdir -p /eval
 if [ ! -d /eval/linux ]; then cp -a "/work/linux-$KVER" /eval/linux; fi
 cd /eval/linux
 cp /repo/guest/linux/rvemu-ssh.c /repo/guest/linux/rvemu-ssh.h drivers/char/
-cp /repo/guest/linux/rvemu-crypto.c /repo/guest/linux/rvemu-crypto.h drivers/char/
+cp /repo/guest/linux/rvemu-crypto.c /repo/guest/linux/rvemu-crypto.h /repo/guest/linux/rvemu-native.h drivers/char/
 grep -q rvemu-ssh.o drivers/char/Makefile || echo 'obj-y += rvemu-ssh.o' >> drivers/char/Makefile
 grep -q rvemu-crypto.o drivers/char/Makefile || echo 'obj-y += rvemu-crypto.o' >> drivers/char/Makefile
 scripts/config --enable NET --enable INET --enable UNIX

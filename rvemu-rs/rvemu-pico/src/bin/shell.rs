@@ -324,6 +324,74 @@ struct PicoBus {
     seen: u32,
     #[cfg(feature = "pv-buffers")]
     bench: &'static mut Bench,
+    /// core0 cycles when the current native slice began, and `mie` then.
+    #[cfg(feature = "pv-buffers")]
+    slice: (u64, u32),
+}
+
+/// How long a native operation runs before the guest gets the CPU back
+/// (`Bus::native_preemptible`): core0's SIO machine timer interrupts it after
+/// this many microseconds.
+#[cfg(feature = "pv-buffers")]
+const NATIVE_SLICE_US: u32 = 2000;
+/// core0's SIO RISC-V platform timer (MTIME is shared and runs at the
+/// system clock, core1.rs; MTIMECMP is each core's own).
+#[cfg(feature = "pv-buffers")]
+const SIO_MTIME: usize = 0xd000_01b0;
+#[cfg(feature = "pv-buffers")]
+const SIO_MTIMEH: usize = 0xd000_01b4;
+#[cfg(feature = "pv-buffers")]
+const SIO_MTIMECMP: usize = 0xd000_01b8;
+#[cfg(feature = "pv-buffers")]
+const SIO_MTIMECMPH: usize = 0xd000_01bc;
+/// mie.MTIE
+#[cfg(feature = "pv-buffers")]
+const MIE_MTIE: u32 = 1 << 7;
+
+/// Set core0's MTIMECMP (high word first parked at the maximum, so it never
+/// matches half-written).
+#[cfg(feature = "pv-buffers")]
+#[inline]
+fn set_mtimecmp(t: u64) {
+    // SAFETY: core0's own SIO timer compare registers.
+    unsafe {
+        core::ptr::write_volatile(SIO_MTIMECMPH as *mut u32, u32::MAX);
+        core::ptr::write_volatile(SIO_MTIMECMP as *mut u32, t as u32);
+        core::ptr::write_volatile(SIO_MTIMECMPH as *mut u32, (t >> 32) as u32);
+    }
+}
+
+/// The SIO timer (system clock cycles).
+#[cfg(feature = "pv-buffers")]
+#[inline]
+fn mtime() -> u64 {
+    loop {
+        // SAFETY: SIO timer registers.
+        let (hi, lo, hi2) = unsafe {
+            (
+                core::ptr::read_volatile(SIO_MTIMEH as *const u32),
+                core::ptr::read_volatile(SIO_MTIME as *const u32),
+                core::ptr::read_volatile(SIO_MTIMEH as *const u32),
+            )
+        };
+        if hi == hi2 {
+            return (u64::from(hi) << 32) | u64::from(lo);
+        }
+    }
+}
+
+/// core0's machine timer: a native operation's slice is over. Interrupts are
+/// enabled only while one runs (rvaccel enables them on its stack), so this
+/// interrupted it: pause it, back to the emulator. Returns when the guest
+/// continues the operation (`native_slice_begin` has re-armed the timer).
+#[cfg(feature = "pv-buffers")]
+#[unsafe(no_mangle)]
+extern "C" fn MachineTimer() {
+    // SAFETY: mie is core0's; the workspace is the CPU's, at NATIVE_BASE.
+    unsafe {
+        core::arch::asm!("csrc mie, {0}", in(reg) MIE_MTIE);
+        rvcore::NativeWorkspace::preempt(NATIVE_BASE as *mut rvcore::NativeWorkspace);
+    }
 }
 
 /// XIP cache counters (hits, accesses; 32 bits, any write clears both).
@@ -436,6 +504,8 @@ impl Bus for PicoBus {
             );
         }
         let _ = writeln!(w, "native buffer calls {:?}", cpu.stats.native_buffer_calls);
+        let _ = writeln!(w, "native preemptions {}", cpu.stats.native_preemptions);
+        let _ = writeln!(w, "native aborts {}", cpu.stats.native_aborts);
         if let Some(peaks) = cpu.native_stack_peaks() {
             let _ = writeln!(w, "native stack peaks {:?} of {} B", peaks, rvaccel_stack_bytes());
         }
@@ -453,6 +523,31 @@ impl Bus for PicoBus {
         );
         b.log.clear();
         Some(n as u32)
+    }
+    #[cfg(feature = "pv-buffers")]
+    fn native_preemptible(&self) -> bool {
+        true
+    }
+    /// Arm core0's timer for one slice; only it may interrupt the operation.
+    #[cfg(feature = "pv-buffers")]
+    fn native_slice_begin(&mut self) {
+        let mie: u32;
+        // SAFETY: core0's own interrupt enables; MIE stays off out here.
+        unsafe { core::arch::asm!("csrr {0}, mie", out(reg) mie) };
+        self.slice = (board::mcycle64(), mie);
+        set_mtimecmp(mtime() + u64::from(self.sys_hz / 1_000_000) * u64::from(NATIVE_SLICE_US));
+        // SAFETY: as above.
+        unsafe { core::arch::asm!("csrw mie, {0}", in(reg) MIE_MTIE) };
+    }
+    /// Disarm the timer; the guest's clock moves on by the slice's real time
+    /// (native work retires no guest instructions).
+    #[cfg(feature = "pv-buffers")]
+    fn native_slice_end(&mut self, cpu: &mut Cpu) {
+        // SAFETY: as above.
+        unsafe { core::arch::asm!("csrw mie, {0}", in(reg) self.slice.1) };
+        set_mtimecmp(u64::MAX);
+        let cycles = board::mcycle64() - self.slice.0;
+        cpu.time_skip += cycles * u64::from(TIMEBASE_HZ) / u64::from(self.sys_hz);
     }
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
         self.plat.mmio_load(pa, size)
@@ -766,6 +861,8 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
             seen: core1::events().wrapping_sub(1),
             // PSRAM is up (psram_init above); the reservation is outside
             // guest RAM (h.valid(RAM_MAX)) and used by nothing else.
+            #[cfg(feature = "pv-buffers")]
+            slice: (0, 0),
             #[cfg(feature = "pv-buffers")]
             bench: {
                 let at = BENCH_BASE as *mut Bench;

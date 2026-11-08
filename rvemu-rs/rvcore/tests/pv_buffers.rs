@@ -93,3 +93,28 @@ fn range_checks_and_failure_notification() {
     assert_eq!(ram, before);
     assert_eq!(c.take_native_write(), None);
 }
+#[test]
+#[cfg(feature = "pv-buffers")]
+fn pause_protocol_without_preemption() {
+    use rvcore::{NATIVE_ABORT, NATIVE_CONTINUE, NATIVE_MAY_PEND};
+    let mut ram = vec![0xa5a5a5a5u32; 16384];
+    ram[0] = 0x73;
+    ram[1024] = u32::from_le_bytes(*b"\x50hel");
+    ram[1025] = u32::from_le_bytes(*b"lo!!");
+    let mut c = unsafe { Cpu::new(ram.as_mut_ptr().cast(), BASE, 65536, BASE, 0) };
+    let args = [BASE + 8192, 16, BASE + 4096, 6, 0, 0];
+    for workspace in [false, true] {
+        if workspace {
+            c.set_native_workspace(Box::leak(Box::new(rvcore::NativeWorkspace::new())));
+        }
+        // Nothing to continue; abort is harmless.
+        assert_eq!(call(&mut c, EXT, NATIVE_CONTINUE, [0; 6]), (-3, 0));
+        assert_eq!(call(&mut c, EXT, NATIVE_ABORT, [0; 6]), (0, 0));
+        // A bus that does not preempt runs a may-pend operation to completion.
+        assert_eq!(call(&mut c, EXT, NATIVE_MAY_PEND, args), (0, 5));
+        assert_eq!(c.take_native_write(), Some((BASE + 8192, BASE + 8208)));
+        assert_eq!(call(&mut c, EXT, NATIVE_MAY_PEND | 13, args), (-2, 0));
+        assert_eq!(call(&mut c, EXT, NATIVE_CONTINUE, [0; 6]), (-3, 0));
+    }
+    assert_eq!(c.stats.native_preemptions, 0);
+}

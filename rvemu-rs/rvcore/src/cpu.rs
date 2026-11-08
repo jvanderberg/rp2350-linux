@@ -80,6 +80,14 @@ pub trait Bus {
     /// Optional: print the recorded points and host diagnostics, then clear
     /// the log. `None`: not provided (the SBI call fails NOT_SUPPORTED).
     fn benchmark_report(&mut self, _cpu: &Cpu) -> Option<u32> { None }
+    /// Whether a native operation that may pend runs preemptibly: the bus
+    /// arms an interrupt in `native_slice_begin` whose handler calls
+    /// `rvaccel::Workspace::preempt`.
+    fn native_preemptible(&self) -> bool { false }
+    /// Around every slice of a native operation (also one that runs to
+    /// completion): arm and disarm the preemption timer, account the time.
+    fn native_slice_begin(&mut self) {}
+    fn native_slice_end(&mut self, _cpu: &mut Cpu) {}
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32>;
     fn mmio_store(&mut self, pa: u32, size: u32, val: u32) -> Result<(), u32>;
     /// Level of the PLIC's S-mode external interrupt output.
@@ -163,6 +171,8 @@ pub struct Cpu {
     pub smc_page: Option<u32>,
     #[cfg(feature = "pv-buffers")]
     pub(crate) native_write: Option<(u32, u32)>,
+    /// Output range of the native operation in progress (pv-buffers).
+    pub(crate) native_job_dst: Option<(u32, u32)>,
     #[cfg(feature = "pv-buffers")]
     pub(crate) native_workspace: *mut rvaccel::Workspace,
 
@@ -263,6 +273,7 @@ impl Cpu {
             smc_page: None,
             #[cfg(feature = "pv-buffers")]
             native_write: None,
+            native_job_dst: None,
             halt: None,
             stats: Stats::new(),
             inst: Instrument::new(ram_size),

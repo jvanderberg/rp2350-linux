@@ -9,10 +9,44 @@
 #include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <asm/sbi.h>
 #include <asm/io.h>
 #include "rvemu-crypto.h"
+#include "rvemu-native.h"
 #define EXT 0x0a000001
+/* Firmware pause protocol: an operation FID with MAY_PEND may return
+ * PENDING after a time slice; CONTINUE runs the next slice, ABORT drops it.
+ * The firmware runs one operation at a time. */
+#define MAY_PEND 0x100
+#define CONTINUE 0x200
+#define ABORT 0x201
+#define PENDING (-100)
+
+static DEFINE_MUTEX(native_lock);
+
+/* Between slices the guest takes its interrupts and other tasks run; the
+ * caller's buffers (kernel-owned) stay put until the operation is done. */
+struct sbiret rvemu_native_call(unsigned long op, phys_addr_t out, unsigned long cap,
+                                phys_addr_t in, unsigned long len,
+                                phys_addr_t params, unsigned long plen)
+{
+    struct sbiret r = { .error = RVEMU_NATIVE_INTERRUPTED };
+    if (mutex_lock_killable(&native_lock)) return r;
+    r = sbi_ecall(EXT, op | MAY_PEND, out, cap, in, len, params, plen);
+    while (r.error == PENDING) {
+        if (fatal_signal_pending(current)) {
+            sbi_ecall(EXT, ABORT, 0, 0, 0, 0, 0, 0);
+            r.error = RVEMU_NATIVE_INTERRUPTED;
+            break;
+        }
+        cond_resched();
+        r = sbi_ecall(EXT, CONTINUE, 0, 0, 0, 0, 0, 0);
+    }
+    mutex_unlock(&native_lock);
+    return r;
+}
 #define MAX_BUFFER RVEMU_CRYPTO_MAX_BUFFER
 #define MAX_PARAMS RVEMU_CRYPTO_MAX_PARAMS
 struct crypto_context { struct mutex lock; unsigned char *in, *out, *params; };
@@ -47,9 +81,14 @@ static long crypto_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         copy_from_user(c->params,(void __user *)(unsigned long)r.parameters,r.parameters_len)) {
         ret=-EFAULT; goto done;
     }
-    result=sbi_ecall(EXT,r.operation,virt_to_phys(c->out),r.capacity,
+    if (r.operation>=MAY_PEND) { ret=-EOPNOTSUPP; goto done; }
+    result=rvemu_native_call(r.operation,virt_to_phys(c->out),r.capacity,
         virt_to_phys(c->in),r.source_len,virt_to_phys(c->params),r.parameters_len);
-    if (result.error) { ret=result.error==-2 ? -EOPNOTSUPP : result.error==-1 ? -EBADMSG : -EINVAL; goto done; }
+    if (result.error) {
+        ret=result.error==-2 ? -EOPNOTSUPP : result.error==-1 ? -EBADMSG :
+            result.error==RVEMU_NATIVE_INTERRUPTED ? -EINTR : -EINVAL;
+        goto done;
+    }
     if (result.value>r.capacity) { ret=-EIO; goto done; }
     r.output_len=result.value;
     if (copy_to_user((void __user *)(unsigned long)r.destination,c->out,r.output_len) ||

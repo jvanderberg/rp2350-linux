@@ -11,3 +11,14 @@ debug = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The native crypto runs from flash behind the 16 KB XIP cache it shares with
+# PSRAM: small code keeps a curve operation's hot loop and stack in cache.
+[profile.release.package.curve25519-dalek]
+opt-level = "s"
+[profile.release.package.x25519-dalek]
+opt-level = "s"
+[profile.release.package.ed25519-dalek]
+opt-level = "s"
+[profile.release.package.rvaccel]
+opt-level = "s"

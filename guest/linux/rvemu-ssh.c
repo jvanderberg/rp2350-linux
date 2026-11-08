@@ -12,6 +12,7 @@
 #include <asm/sbi.h>
 #include <asm/io.h>
 #include "rvemu-ssh.h"
+#include "rvemu-native.h"
 #define EXT 0x0a000001
 #define MAX_BYTES 32768
 
@@ -75,11 +76,12 @@ static long rvemu_ssh_ioctl(struct file *file, unsigned int cmd, unsigned long a
     memcpy(c->params, r.key, 64);
     memset(c->params + 64, 0, 4);
     for (i = 0; i < 4; i++) c->params[68+i] = r.sequence >> (24-8*i);
-    result = sbi_ecall(EXT, r.operation, virt_to_phys(c->output), outlen,
-                      virt_to_phys(c->input), r.length, virt_to_phys(c->params), 72);
+    result = rvemu_native_call(r.operation, virt_to_phys(c->output), outlen,
+                               virt_to_phys(c->input), r.length, virt_to_phys(c->params), 72);
     if (result.error) {
         ret = result.error == -2 ? -EOPNOTSUPP :
-              result.error == -1 ? -EBADMSG : -EINVAL;
+              result.error == -1 ? -EBADMSG :
+              result.error == RVEMU_NATIVE_INTERRUPTED ? -EINTR : -EINVAL;
         goto unlock;
     }
     if (result.value != outlen) { ret = -EIO; goto unlock; }

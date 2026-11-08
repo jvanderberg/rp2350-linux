@@ -12,6 +12,10 @@ pub struct Stats {
     pub interrupts: u64,
     pub sbi_calls: u64,
     pub native_buffer_calls: [u64; 13],
+    /// Native operation slices that ended preempted (`ERR_PENDING`).
+    pub native_preemptions: u64,
+    /// Paused native operations the guest dropped (`ABORT`).
+    pub native_aborts: u64,
     pub wfi: u64,
     pub idle_ticks: u64,
     pub unique_insns: u64,
@@ -37,6 +41,8 @@ impl Stats {
             interrupts: 0,
             sbi_calls: 0,
             native_buffer_calls: [0; 13],
+            native_preemptions: 0,
+            native_aborts: 0,
             wfi: 0,
             idle_ticks: 0,
             unique_insns: 0,
