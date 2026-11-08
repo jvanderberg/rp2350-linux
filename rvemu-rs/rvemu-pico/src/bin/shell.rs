@@ -30,6 +30,7 @@ use rp2350_board as board;
 use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
+use rvcore::swapdev::FlashSwap;
 use rvcore::virtio::{Disk as _, GuestMem, MemDisk};
 use rvcore::{Bus, Cpu, Halt, TIMEBASE_HZ};
 use rvjit::{Block, JcEntry, Jit, JitMem};
@@ -43,6 +44,9 @@ use guest_blob::{BLOB_ADDR, BlobHeader};
 
 #[path = "../wifi.rs"]
 mod wifi;
+#[path = "../swap_flash.rs"]
+mod swap_flash;
+use swap_flash::SwapFlash;
 use wifi::{Creds, Radio, RadioPins, WifiLink};
 
 #[unsafe(link_section = ".start_block")]
@@ -103,6 +107,11 @@ static mut CHAIN_LOG: [u32; REGIONS * 128] = [0; REGIONS * 128];
 static mut STORE_EPOCHS: [u8; (GUEST_MAX >> 12) as usize] = [0; (GUEST_MAX >> 12) as usize];
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 static mut USB_BUS: MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> = MaybeUninit::uninit();
+/// The swap device's backend (about 2 KB of tables): a static, so it isn't
+/// moved through `main`'s stack.
+static mut SWAP: MaybeUninit<FlashSwap<SwapFlash>> = MaybeUninit::uninit();
+/// Sectors kept free for bursts of swap writes: 448 of the 511 are swap.
+const SWAP_SPARE: u32 = 63;
 
 // ------------------------------------------------------------------ console
 
@@ -168,7 +177,7 @@ impl Console for UsbConsole {
 }
 
 struct PicoBus<'a> {
-    plat: Platform<UsbConsole, MemDisk, WifiLink>,
+    plat: Platform<UsbConsole, MemDisk, WifiLink, &'static mut FlashSwap<SwapFlash>>,
     radio: Radio<'a>,
     usb: UsbDevice<'static, hal::usb::UsbBus>,
     serial: SerialPort<'static, hal::usb::UsbBus>,
@@ -241,6 +250,16 @@ impl Bus for PicoBus<'_> {
         let ticks = cpu.stimecmp - now;
         let wait = (ticks.saturating_mul(hz) / u64::from(TIMEBASE_HZ)).min(hz / 10);
         let t0 = board::mcycle64();
+        // Erase one dirty swap sector (about 45 ms) unless the guest wakes
+        // within 2 ms. Erasing stalls everything, so idle time is the place.
+        let mut erased = false;
+        if wait >= hz / 500
+            && let Some(w) = &mut self.plat.swap
+            && w.disk.wants_erase()
+        {
+            w.disk.idle_erase();
+            erased = true;
+        }
         while board::mcycle64() - t0 < wait {
             self.poll();
             if cpu.sip_value(self) & cpu.sie != 0 {
@@ -250,6 +269,12 @@ impl Bus for PicoBus<'_> {
         if cpu.stimecmp == u64::MAX {
             return; // no timer armed: keep waiting for input
         }
+        // an erase can outlast the wait: keep guest time with wall time
+        let ticks = if erased {
+            ticks.max((board::mcycle64() - t0) * u64::from(TIMEBASE_HZ) / hz)
+        } else {
+            ticks
+        };
         cpu.time_skip += ticks;
         cpu.stats.idle_ticks += ticks;
     }
@@ -362,6 +387,13 @@ fn main() -> ! {
     if let Some(d) = disk {
         plat = plat.with_disk(d, gmem);
     }
+    // The swap device is always there; the guest uses it only when its DTB
+    // has the node (pico-shell.sh -w). Writes start at a different sector
+    // each boot, which spreads erases over the region across boots.
+    // SAFETY: initialised once, here; the bus holds the only reference.
+    let swap = unsafe { (*addr_of_mut!(SWAP)).write(FlashSwap::new(SwapFlash::new(sys_hz), SWAP_SPARE)) };
+    swap.set_head(board::mcycle64() as u32);
+    let plat = plat.with_swap(swap, gmem);
     let mut bus = PicoBus {
         plat,
         radio,

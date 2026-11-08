@@ -5,7 +5,7 @@
 use crate::cpu::exc;
 use crate::virtio::{
     Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE,
-    VirtioBlk, VirtioNet,
+    VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ, VirtioBlk, VirtioNet,
 };
 
 pub const PLIC_BASE: u32 = 0xF000_0000;
@@ -186,20 +186,27 @@ impl Uart {
     }
 }
 
-/// UART + PLIC (+ disk, + network) wired together, generic over the host
-/// console, disk and network link.
-pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet> {
+/// UART + PLIC (+ disk, + network, + swap) wired together, generic over the
+/// host console, disk, network link and swap backend.
+pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet, W: Disk = NoDisk> {
     pub uart: Uart,
     pub plic: Plic,
     pub con: C,
     pub blk: Option<VirtioBlk<D>>,
     pub net: Option<VirtioNet<N>>,
+    pub swap: Option<VirtioBlk<W>>,
 }
 
-impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
+impl<C: Console, D: Disk, N: NetLink, W: Disk> Platform<C, D, N, W> {
     /// UART and PLIC only.
     pub fn new(con: C) -> Self {
-        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None }
+        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, swap: None }
+    }
+
+    /// Add a writable virtio block device for swap at `VIRTIO_SWAP_BASE`.
+    pub fn with_swap(mut self, disk: W, mem: GuestMem) -> Self {
+        self.swap = Some(VirtioBlk::new(disk, mem));
+        self
     }
 
     /// Add a virtio block device at `VIRTIO_BASE` reading and writing `mem`.
@@ -222,6 +229,9 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
         if let Some(b) = &self.blk {
             self.plic.set_level(VIRTIO_IRQ, b.irq_line());
         }
+        if let Some(w) = &self.swap {
+            self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
+        }
         if let Some(n) = &mut self.net {
             n.poll();
             self.plic.set_level(VIRTIO_NET_IRQ, n.irq_line());
@@ -230,6 +240,9 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
 
     pub fn take_dma_write(&mut self) -> Option<(u32, u32)> {
         if let Some(r) = self.blk.as_mut().and_then(|b| b.take_dma_write()) {
+            return Some(r);
+        }
+        if let Some(r) = self.swap.as_mut().and_then(|w| w.take_dma_write()) {
             return Some(r);
         }
         self.net.as_mut().and_then(|n| n.take_dma_write())
@@ -256,6 +269,11 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
         {
             return n.load(pa - VIRTIO_NET_BASE, size);
         }
+        if let Some(w) = &mut self.swap
+            && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
+        {
+            return w.load(pa - VIRTIO_SWAP_BASE, size);
+        }
         Err(exc::LOAD_FAULT)
     }
 
@@ -281,6 +299,13 @@ impl<C: Console, D: Disk, N: NetLink> Platform<C, D, N> {
             && pa.wrapping_sub(VIRTIO_NET_BASE) < VIRTIO_SIZE
         {
             let r = n.store(pa - VIRTIO_NET_BASE, size, v);
+            self.update_irqs();
+            return r;
+        }
+        if let Some(w) = &mut self.swap
+            && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
+        {
+            let r = w.store(pa - VIRTIO_SWAP_BASE, size, v);
             self.update_irqs();
             return r;
         }
