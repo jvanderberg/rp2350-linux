@@ -31,7 +31,7 @@ use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
 use rvcore::swapdev::FlashSwap;
-use rvcore::virtio::{Disk as _, GuestMem, MemDisk};
+use rvcore::virtio::{Disk as _, GuestMem, MemDisk, VirtioBlk};
 use rvcore::{Bus, Cpu, Halt, TIMEBASE_HZ};
 use rvjit::{Block, JcEntry, Jit, JitMem};
 use usb_device::class_prelude::UsbBusAllocator;
@@ -107,11 +107,22 @@ static mut CHAIN_LOG: [u32; REGIONS * 128] = [0; REGIONS * 128];
 static mut STORE_EPOCHS: [u8; (GUEST_MAX >> 12) as usize] = [0; (GUEST_MAX >> 12) as usize];
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 static mut USB_BUS: MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> = MaybeUninit::uninit();
-/// The swap device's backend (about 2 KB of tables): a static, so it isn't
-/// moved through `main`'s stack.
-static mut SWAP: MaybeUninit<FlashSwap<SwapFlash>> = MaybeUninit::uninit();
 /// Sectors kept free for bursts of swap writes: 448 of the 511 are swap.
 const SWAP_SPARE: u32 = 63;
+/// With the swap device (`pico-shell.sh -w`), its backend (about 2.2 KB of
+/// tables) lives in the top page of guest RAM, which that DTB reserves
+/// (`rvemu -D -W`). Without it, swap costs no SRAM and no guest RAM.
+const SWAP_TABLES: usize = 0x1000;
+const _: () = assert!(core::mem::size_of::<FlashSwap<SwapFlash>>() <= SWAP_TABLES);
+
+/// Whether the guest's DTB has the swap device's node.
+fn dtb_has_swap(h: &BlobHeader) -> bool {
+    const NODE: &[u8] = b"virtio@f8000600";
+    // SAFETY: the header was validated, so the DTB lies inside the blob,
+    // in mapped flash.
+    let dtb = unsafe { core::slice::from_raw_parts((BLOB_ADDR + h.dtb_off as usize) as *const u8, h.dtb_len as usize) };
+    dtb.windows(NODE.len()).any(|w| w == NODE)
+}
 
 // ------------------------------------------------------------------ console
 
@@ -387,13 +398,6 @@ fn main() -> ! {
     if let Some(d) = disk {
         plat = plat.with_disk(d, gmem);
     }
-    // The swap device is always there; the guest uses it only when its DTB
-    // has the node (pico-shell.sh -w). Writes start at a different sector
-    // each boot, which spreads erases over the region across boots.
-    // SAFETY: initialised once, here; the bus holds the only reference.
-    let swap = unsafe { (*addr_of_mut!(SWAP)).write(FlashSwap::new(SwapFlash::new(sys_hz), SWAP_SPARE)) };
-    swap.set_head(board::mcycle64() as u32);
-    let plat = plat.with_swap(swap, gmem);
     let mut bus = PicoBus {
         plat,
         radio,
@@ -404,6 +408,18 @@ fn main() -> ! {
 
     // SAFETY: guest RAM is the mapped, writable PSRAM; the header was checked.
     let dtb = unsafe { h.load() };
+    // The swap device, only when the DTB has it; after `load`, which clears
+    // guest RAM. Writes start at a different sector each boot, which spreads
+    // erases over the region across boots.
+    let swap_on = dtb_has_swap(&h) && h.dtb_len as usize <= 0x10000 - SWAP_TABLES;
+    if swap_on {
+        let at = (h.ram_host() + h.ram_size as usize - SWAP_TABLES) as *mut FlashSwap<SwapFlash>;
+        // SAFETY: the top page of guest RAM (PSRAM, page aligned), reserved
+        // from the guest by its DTB and above the DTB itself.
+        let swap = unsafe { FlashSwap::init_at(at, SwapFlash::new(sys_hz), SWAP_SPARE) };
+        swap.set_head(board::mcycle64() as u32);
+        bus.plat.swap = Some(VirtioBlk::new(swap, gmem));
+    }
     // SAFETY: CPU and the translator tables are used only from here on.
     let cpu = unsafe {
         let p = (*addr_of_mut!(CPU)).as_mut_ptr();
@@ -433,11 +449,12 @@ fn main() -> ! {
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
     rprintln!(
-        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB; console on USB",
+        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
         h.ram_size >> 10,
         CODE_WORDS * 4 / 1024,
         STORE_WORDS * 4 / 1024,
-        disk_kib
+        disk_kib,
+        if swap_on { "on" } else { "off" }
     );
     jit_loop(&mut jit, cpu, &mut bus);
     let why = match cpu.halt {

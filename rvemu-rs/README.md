@@ -153,7 +153,8 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 With `pico-shell.sh -w` the guest gets `/dev/vdb`, 1792 KiB of swap in the
 flash region 0x10200000-0x103FEFFF, and its init (`/etc/init.d/S02swap`)
 runs mkswap and swapon. Without `-w` the DTB has no node: the guest pays
-nothing, and the firmware never erases or writes the region.
+nothing, and the firmware never erases or writes the region. With it the
+guest gives up 4 KiB of RAM plus the device's own kernel cost.
 
 - **Layout.** A guest page is 4 KiB, the size of a flash erase sector, so
   each page lives in a sector of its own: 511 sectors, 448 pages of swap
@@ -166,9 +167,12 @@ nothing, and the firmware never erases or writes the region.
 - **Wear levelling.** The head starts at a different sector every boot.
   Every 8th write also moves the live page nearest ahead of the head, so
   sectors that hold cold pages keep taking their turn at erases.
-- **Nothing persists.** Swap is empty at every boot, so the map is in SRAM
-  only (2 KB) and there's no on-flash metadata. Sectors start in an unknown
-  state; blank ones are found by reading them (about 0.1 ms).
+- **Nothing persists.** Swap is empty at every boot, so the map (2.2 KB)
+  lives only in the top page of guest RAM, which the `-w` DTB reserves
+  (`no-map`), and there's no on-flash metadata. Without `-w` the firmware
+  finds no swap node in the DTB and sets up no device: no SRAM, no guest
+  RAM. Sectors start in an unknown state; blank ones are found by reading
+  them (about 0.1 ms).
 - **Zero pages** take no flash. Data is stored inverted, so zero runs are
   erased flash and their 256-byte program operations are skipped.
 - **Flash access.** Erase (20h) and page program (02h) go through the QMI's

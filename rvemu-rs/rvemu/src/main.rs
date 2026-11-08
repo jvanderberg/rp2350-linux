@@ -148,6 +148,8 @@ const SWAP_SECTORS: u32 = 511;
 /// Sectors kept free for bursts of writes (the board's choice too).
 const SWAP_SPARE: u32 = 63;
 const MODEL_HZ: u32 = 348_000_000;
+/// With -W, the guest's top page of RAM is reserved (the board's swap map).
+const SWAP_TABLES_SIZE: u32 = 0x1000;
 
 impl ModelFlash {
     fn new() -> Self {
@@ -281,8 +283,24 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     if net {
         virtio += &node(VIRTIO_NET_BASE, VIRTIO_NET_IRQ);
     }
+    // the swap device, and the top page of RAM kept from the guest: the
+    // board keeps the swap map there (rvemu-pico-shell, SWAP_TABLES_SIZE)
+    let mut reserved = String::new();
     if swap {
         virtio += &node(VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ);
+        let at = ram_base + ram_size - SWAP_TABLES_SIZE;
+        reserved = format!(
+            r#"  reserved-memory {{
+    #address-cells = <1>;
+    #size-cells = <1>;
+    ranges;
+    swap-tables@{at:x} {{
+      reg = <0x{at:x} 0x{SWAP_TABLES_SIZE:x}>;
+      no-map;
+    }};
+  }};
+"#
+        );
     }
     format!(
         r#"/dts-v1/;
@@ -318,7 +336,7 @@ fn make_dts(ram_base: u32, ram_size: u32, bootargs: &str, initrd: Option<(u32, u
     device_type = "memory";
     reg = <0x{ram_base:x} 0x{ram_size:x}>;
   }};
-  soc {{
+{reserved}  soc {{
     #address-cells = <1>;
     #size-cells = <1>;
     compatible = "simple-bus";

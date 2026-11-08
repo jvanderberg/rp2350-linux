@@ -120,6 +120,35 @@ impl<F: Flash> FlashSwap<F> {
         }
     }
 
+    /// As `new`, built in place at `p` (for a host that keeps it outside its
+    /// stack and statics, so it costs nothing while swap is off).
+    ///
+    /// # Safety
+    /// `p` must be valid for writes of a `Self`, aligned, and not used by
+    /// anything else for `'a`.
+    pub unsafe fn init_at<'a>(p: *mut Self, flash: F, spare: u32) -> &'a mut Self {
+        let nsect = flash.sectors().min(MAX_SECTORS as u32);
+        // SAFETY: the caller's contract; every field is written before the
+        // reference is made, and the arrays are filled in place.
+        unsafe {
+            use core::ptr::addr_of_mut;
+            addr_of_mut!((*p).flash).write(flash);
+            addr_of_mut!((*p).pages).write(nsect.saturating_sub(spare.max(1)));
+            addr_of_mut!((*p).nsect).write(nsect);
+            addr_of_mut!((*p).map).cast::<u16>().write_bytes(0xFF, MAX_SECTORS); // UNMAPPED
+            let state = addr_of_mut!((*p).state).cast::<u16>();
+            state.write_bytes(0xFF, MAX_SECTORS); // ERASED
+            for i in 0..nsect as usize {
+                state.add(i).write(UNKNOWN);
+            }
+            addr_of_mut!((*p).head).write(0);
+            addr_of_mut!((*p).to_erase).write(nsect);
+            addr_of_mut!((*p).since_move).write(0);
+            addr_of_mut!((*p).stats).write(Stats::default());
+            &mut *p
+        }
+    }
+
     /// Where the first write goes; pick a different place each boot.
     pub fn set_head(&mut self, sector: u32) {
         self.head = sector % self.nsect.max(1);
