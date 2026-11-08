@@ -1,0 +1,2 @@
+FCNTL_MOD_DIR := $(USERMOD_DIR)
+SRC_USERMOD += $(FCNTL_MOD_DIR)/modfcntl.c

@@ -39,7 +39,17 @@ if [[ $stage == disk* ]]; then
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
     fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
     make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
+    # External packages can compile C modules into MicroPython (their cmod/,
+    # USER_C_MODULES), which Buildroot doesn't track: rebuild MicroPython when
+    # those differ from the ones its shared build directory was built with.
+    mp_sum=$(cd /guest && { find br-external/package -path '*/cmod/*' -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -c1-16)
+    for d in /work/br-disk/build/micropython-[0-9]*; do
+      if [[ -d $d && "$(cat "$d/.cmod-sum" 2>/dev/null)" != "$mp_sum" ]]; then
+        echo "build.sh: MicroPython's C modules changed: rebuilding it"; rm -rf "$d"
+      fi
+    done
     make -C /work/br-disk -j"$JOBS"
+    for d in /work/br-disk/build/micropython-[0-9]*; do [[ -d $d ]] && echo "$mp_sum" > "$d/.cmod-sum"; done
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
   if [[ $stage == disk || $stage == disk-kernel ]]; then
