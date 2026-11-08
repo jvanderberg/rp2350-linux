@@ -8,7 +8,7 @@ SECTIONS {
   {
     __score1_text = .;
     *(.text.*cyw43* .text.*embassy* .text.*usb_device* .text.*usbd_serial*)
-    *(.text.*rp235x_hal3usb* .text.*4wifi* .text.*6usbcon* .text.*5core1*)
+    *(.text.*rp235x_hal3usb* .text.*4wifi* .text.*6usbcon* .text.*5core1* .text.*8prefetch*)
     *(.text.*memcpy* .text.*memmove* .text.*memset* .text.__udivdi3 .text.__umoddi3 .text.*u64_div_rem*)
     *(.data.core1 .data.core1.*)
     *(.rodata.*cyw43* .rodata.*embassy* .rodata.*usb_device* .rodata.*usbd_serial*)

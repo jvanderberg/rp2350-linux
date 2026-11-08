@@ -475,7 +475,7 @@ impl<F: Future<Output = ()>> RadioService<F> {
 }
 
 impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
-    fn poll(&mut self) {
+    fn poll(&mut self) -> bool {
         let mut cx = Context::from_waker(core1::waker());
         // guest -> radio: as many frames as the driver takes
         if let Some(d) = net() {
@@ -494,9 +494,9 @@ impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
                 RADIO.store(RADIO_ABSENT, Ordering::Release);
                 core1::notify_core0();
             }
-            return;
+            return false;
         }
-        let Some(d) = net() else { return };
+        let Some(d) = net() else { return false };
         // radio -> guest, while there's room (the rest waits in the driver)
         let mut got = false;
         while NET_RX.has_room() {
@@ -527,5 +527,6 @@ impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
         if got {
             core1::notify_core0();
         }
+        false
     }
 }

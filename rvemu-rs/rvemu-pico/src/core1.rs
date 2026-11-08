@@ -36,10 +36,11 @@ use rp2350_board as board;
 use rp235x_hal as hal;
 
 /// What core1 runs: `poll` is called in a loop, forever. It must not block
-/// for long (the other services wait). `launch` builds it in a static slot
-/// where it never moves, so it may hold pinned futures.
+/// for long (the other services wait); it returns true to be called again
+/// at once, false to let core1 sleep until the next wake-up. `launch` builds
+/// it in a static slot where it never moves, so it may hold pinned futures.
 pub trait Service {
-    fn poll(&mut self);
+    fn poll(&mut self) -> bool;
 }
 
 // ------------------------------------------------------------------ rings
@@ -456,7 +457,9 @@ fn run<S: Service>(s: &mut S) -> ! {
         if PARK_REQ.load(Ordering::Acquire) {
             parked();
         }
-        s.poll();
+        if s.poll() {
+            continue;
+        }
         let t = now() + tick;
         wr(MTIMECMPH, u32::MAX);
         wr(MTIMECMP, t as u32);
