@@ -28,6 +28,7 @@ is what lockstep testing and the board-against-Mac comparisons rely on.
 | `-k FILE` | kernel Image, loaded at the start of RAM |
 | `-i FILE` | initramfs (cpio) |
 | `-d FILE` | disk image for the read-only virtio-blk device. Without `-i`, the default command line roots on it: `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`. |
+| `-W` | the swap device (below) on a modelled copy of the board's 2 MB swap flash, with datasheet-typical erase and program times in its statistics |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
 | `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board |
 | `-m MB` | guest RAM (default 64) |
@@ -51,14 +52,20 @@ counters.
 | UART (16550) | 0xF4000000 | 1 |
 | virtio-blk | 0xF8000000 | 2 |
 | virtio-net | 0xF8000200 | 3 |
+| virtio-blk, swap (only with `-W` / `pico-shell.sh -w`) | 0xF8000600 | 5 |
 
 - **No M-mode.** The kernel runs in S-mode, and SBI is implemented in the
   emulator.
 - **virtio** (`rvcore/src/virtio.rs`): one virtio-mmio v2 transport (split
-  virtqueues, no indirect descriptors) shared by both devices. Requests
+  virtqueues, no indirect descriptors) shared by the devices. Requests
   complete synchronously.
-  - **Block device:** read-only, with one 16-entry queue. Backends implement
-    `Disk`: `MemDisk` is a byte range, such as the squashfs in flash.
+  - **Block device:** one 16-entry queue. Backends implement `Disk`:
+    `MemDisk` is a read-only byte range, such as the squashfs in flash. A
+    backend can be writable and can offer a larger logical block size
+    (`VIRTIO_BLK_F_BLK_SIZE`) and its own device ID (GET_ID, the guest's
+    `/sys/block/vdX/serial`).
+  - **Swap device:** a second, writable block device whose backend is
+    `swapdev::FlashSwap` (below).
   - **Network device:** rx queue of 16, tx queue of 32. Linux stops a tx
     queue while fewer than 19 (`MAX_SKB_FRAGS + 2`) descriptors are free.
     Backends implement `NetLink`: the stub LAN on the Mac, the Wi-Fi radio
@@ -141,6 +148,47 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 - **Disk.** The squashfs is read through flash's uncached, non-allocating
   XIP alias, so disk reads don't evict guest RAM from the XIP cache.
 
+### Flash swap (`rvcore/src/swapdev.rs`, `rvemu-pico/src/swap_flash.rs`)
+
+With `pico-shell.sh -w` the guest gets `/dev/vdb`, 1792 KiB of swap in the
+flash region 0x10200000-0x103FEFFF, and its init (`/etc/init.d/S02swap`)
+runs mkswap and swapon. Without `-w` the DTB has no node: the guest pays
+nothing, and the firmware never erases or writes the region.
+
+- **Layout.** A guest page is 4 KiB, the size of a flash erase sector, so
+  each page lives in a sector of its own: 511 sectors, 448 pages of swap
+  and 63 spare. A write goes to the next erased sector after a moving head
+  and the sector it replaces becomes dirty. Nothing is copied, so write
+  amplification is 1.
+- **Erases wait for idle.** The firmware erases one dirty sector per guest
+  WFI when the guest won't wake within 2 ms. A write erases synchronously
+  only when no erased sector is left.
+- **Wear levelling.** The head starts at a different sector every boot.
+  Every 8th write also moves the live page nearest ahead of the head, so
+  sectors that hold cold pages keep taking their turn at erases.
+- **Nothing persists.** Swap is empty at every boot, so the map is in SRAM
+  only (2 KB) and there's no on-flash metadata. Sectors start in an unknown
+  state; blank ones are found by reading them (about 0.1 ms).
+- **Zero pages** take no flash. Data is stored inverted, so zero runs are
+  erased flash and their 256-byte program operations are skipped.
+- **Flash access.** Erase (20h) and page program (02h) go through the QMI's
+  direct mode from SRAM, polling the status register until done. Reads use
+  the uncached XIP alias, so no cache maintenance is needed. Everything
+  stalls during an erase or program: the firmware and the kernel text run
+  from flash, and guest RAM is PSRAM on the same QMI.
+- **Statistics.** The device's last page reads back as text: counters,
+  erase/program/request times. `flashswap-stats` in the guest prints it.
+
+Measured on the board (W25Q128, 348 MHz):
+
+| | |
+|---|---|
+| 256-byte page program | 0.44 ms (max 0.46) |
+| 4 KB sector erase | 43-46 ms |
+| 4 KiB swap write, pre-erased sector | 7.1 ms average, 9.1 ms max: about 550 KB/s |
+| 4 KiB swap write with its erase | about 52 ms: about 80 KB/s |
+| Reading back | 128 pages in 0.08 s |
+
 ### Wi-Fi (`rvemu-pico/src/wifi.rs`)
 
 - **Radio.** The RM2 module's CYW43439, wired as on the Pico 2 W: GP23
@@ -197,7 +245,7 @@ Mac for the reference, and compares every board run.
 
 | Script | |
 |---|---|
-| `scripts/pico-shell.sh [-i] [-b] [-m MB]` | load the guest and `rvemu-pico-shell` over USB BOOTSEL, then print the console port |
+| `scripts/pico-shell.sh [-i] [-b] [-w] [-m MB]` | load the guest and `rvemu-pico-shell` over USB BOOTSEL, then print the console port; `-w` adds the flash swap device |
 | `scripts/pico-wifi.sh SSID \| --forget` | store or erase the Wi-Fi network |
 | `scripts/pico-linux.sh [TIMEOUT]` | boot benchmark: board against a Mac reference run, same instruction count and console hash |
 | `scripts/pico.sh` | jittest on the board against the Mac |
