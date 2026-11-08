@@ -12,6 +12,11 @@ stage=${1:-all}
 # pass it: the external tree, or empty when this checkout has none.
 EXT=; [[ -f /guest/br-external/external.desc ]] && EXT=/guest/br-external
 
+# src_sum FILES/DIRS... (relative to /guest): one checksum of their contents
+src_sum() {
+  { find "$@" -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -c1-16
+}
+
 # The /work volume is shared by every checkout. Buildroot never removes files
 # from target/, so when the configuration (defconfig, post-build script, overlay
 # or external tree under /guest) differs from the last one built in this tree,
@@ -39,17 +44,26 @@ if [[ $stage == disk* ]]; then
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
     fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
     make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
-    # External packages can compile C modules into MicroPython (their cmod/,
-    # USER_C_MODULES), which Buildroot doesn't track: rebuild MicroPython when
-    # those differ from the ones its shared build directory was built with.
-    mp_sum=$(cd /guest && { find br-external/package -path '*/cmod/*' -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -c1-16)
-    for d in /work/br-disk/build/micropython-[0-9]*; do
-      if [[ -d $d && "$(cat "$d/.cmod-sum" 2>/dev/null)" != "$mp_sum" ]]; then
-        echo "build.sh: MicroPython's C modules changed: rebuilding it"; rm -rf "$d"
-      fi
+    # Buildroot copies a local package's source once, and doesn't track the C
+    # modules external packages compile into MicroPython (cmod/,
+    # USER_C_MODULES): rebuild a package whose files changed since its shared
+    # build directory was built.
+    rebuild=()
+    for p in /guest/br-external/package/*/; do
+      [[ -d $p ]] && rebuild+=("$(basename "$p")=$(cd /guest && src_sum "br-external/package/$(basename "$p")")")
+    done
+    rebuild+=("micropython=$(cd /guest && src_sum br-external/package/*/cmod)")
+    for r in "${rebuild[@]}"; do
+      for d in /work/br-disk/build/"${r%%=*}"-[0-9]*; do
+        if [[ -d $d && "$(cat "$d/.src-sum" 2>/dev/null)" != "${r#*=}" ]]; then
+          echo "build.sh: ${r%%=*}'s sources changed: rebuilding it"; rm -rf "$d"
+        fi
+      done
     done
     make -C /work/br-disk -j"$JOBS"
-    for d in /work/br-disk/build/micropython-[0-9]*; do [[ -d $d ]] && echo "$mp_sum" > "$d/.cmod-sum"; done
+    for r in "${rebuild[@]}"; do
+      for d in /work/br-disk/build/"${r%%=*}"-[0-9]*; do [[ -d $d ]] && echo "${r#*=}" > "$d/.src-sum"; done
+    done
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
   if [[ $stage == disk || $stage == disk-kernel ]]; then

@@ -2,5 +2,6 @@ config BR2_PACKAGE_PINS_EXAMPLES
 	bool "pins-examples"
 	help
 	  Example C programs for the board's pins (GPIO blink and edge
-	  interrupts, I2C scan, SPI transfer, ADC), installed as source in
-	  /usr/share/examples/pins for compiling on the board.
+	  interrupts, I2C scan, SPI transfer, ADC) in
+	  /usr/share/examples/pins, built and as source for compiling on
+	  the board.

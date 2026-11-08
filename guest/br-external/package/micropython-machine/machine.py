@@ -58,14 +58,31 @@ def _pin_number(id):
 
 
 class _Irq:
-    def __init__(self, pin):
-        self._pin = pin
+    def __init__(self, line):
+        self._line = line
 
     def flags(self):
-        return self._pin._last_edge
+        return self._line.last_edge
 
     def trigger(self):
-        return self._pin._trigger
+        return self._line.trigger
+
+
+class _Line:
+    # One GPIO line's request and configuration, shared by every Pin object
+    # made for it (as on a microcontroller, Pin(15) twice is the same pin)
+    def __init__(self, n):
+        self.n = n
+        self.req = None
+        self.mode = Pin.IN
+        self.pull = -1
+        self.trigger = 0
+        self.handler = None
+        self.last_edge = 0
+        self.out = 0
+
+
+_lines = {}
 
 
 class Pin:
@@ -79,13 +96,11 @@ class Pin:
 
     def __init__(self, id, mode=-1, pull=-1, *, value=None):
         self._n = _pin_number(id)
-        self._req = None
-        self._mode = Pin.IN
-        self._pull = -1
-        self._trigger = 0
-        self._handler = None
-        self._last_edge = 0
-        self._out = 0
+        self._l = _lines.get(self._n)
+        if self._l is None:
+            self._l = _lines[self._n] = _Line(self._n)
+        elif mode == -1 and pull == -1 and value is None:
+            return  # Pin(n) of a pin in use: that pin as it is
         # as on the rp2 port: a mode without a pull means no pull
         if mode != -1 and pull == -1:
             pull = None
@@ -95,19 +110,20 @@ class Pin:
         return "Pin(%d)" % self._n
 
     def _flags(self):
-        f = _F_OUTPUT if self._mode in (Pin.OUT, Pin.OPEN_DRAIN) else _F_INPUT
-        if self._mode == Pin.OPEN_DRAIN:
+        l = self._l
+        f = _F_OUTPUT if l.mode in (Pin.OUT, Pin.OPEN_DRAIN) else _F_INPUT
+        if l.mode == Pin.OPEN_DRAIN:
             f |= _F_OPEN_DRAIN
         # pull -1 (never given): leave the line's bias as it is
-        if self._pull == Pin.PULL_UP:
+        if l.pull == Pin.PULL_UP:
             f |= _F_PULL_UP
-        elif self._pull == Pin.PULL_DOWN:
+        elif l.pull == Pin.PULL_DOWN:
             f |= _F_PULL_DOWN
-        elif self._pull is None:
+        elif l.pull is None:
             f |= _F_BIAS_DISABLED
-        if self._trigger & Pin.IRQ_RISING:
+        if l.trigger & Pin.IRQ_RISING:
             f |= _F_EDGE_RISING
-        if self._trigger & Pin.IRQ_FALLING:
+        if l.trigger & Pin.IRQ_FALLING:
             f |= _F_EDGE_FALLING
         return f
 
@@ -115,16 +131,17 @@ class Pin:
         # struct gpio_v2_line_config: flags, num_attrs, then the output value
         # as attribute 0 for line 0
         struct.pack_into("<QI", buf, off, self._flags(), 1)
-        struct.pack_into("<IIQQ", buf, off + 32, _ATTR_OUTPUT_VALUES, 0, self._out, 1)
+        struct.pack_into("<IIQQ", buf, off + 32, _ATTR_OUTPUT_VALUES, 0, self._l.out, 1)
 
     def init(self, mode=-1, pull=-1, *, value=None):
+        l = self._l
         if mode != -1:
-            self._mode = mode
+            l.mode = mode
         if pull != -1:
-            self._pull = pull
+            l.pull = pull
         if value is not None:
-            self._out = 1 if value else 0
-        if self._req is None:
+            l.out = 1 if value else 0
+        if l.req is None:
             r = bytearray(_LINE_REQ)
             struct.pack_into("<I", r, 0, self._n)
             r[256:256 + 13] = b"micropython\0\0"
@@ -132,22 +149,23 @@ class Pin:
             struct.pack_into("<I", r, _REQ_NLINES, 1)
             with open(_GPIOCHIP, "rb") as chip:
                 fcntl.ioctl(chip, _GET_LINE, r)
-            self._req = open(struct.unpack_from("<i", r, _REQ_FD)[0], "rb")
+            l.req = open(struct.unpack_from("<i", r, _REQ_FD)[0], "rb")
         else:
             c = bytearray(_LINE_CFG)
             self._config(c, 0)
-            fcntl.ioctl(self._req, _SET_CONFIG, c)
+            fcntl.ioctl(l.req, _SET_CONFIG, c)
         return self
 
     def value(self, v=None):
+        l = self._l
         b = bytearray(16)
         if v is None:
             struct.pack_into("<QQ", b, 0, 0, 1)
-            fcntl.ioctl(self._req, _GET_VALUES, b)
+            fcntl.ioctl(l.req, _GET_VALUES, b)
             return struct.unpack_from("<Q", b, 0)[0] & 1
-        self._out = 1 if v else 0
-        struct.pack_into("<QQ", b, 0, self._out, 1)
-        fcntl.ioctl(self._req, _SET_VALUES, b)
+        l.out = 1 if v else 0
+        struct.pack_into("<QQ", b, 0, l.out, 1)
+        fcntl.ioctl(l.req, _SET_VALUES, b)
 
     __call__ = value
 
@@ -161,29 +179,30 @@ class Pin:
     low = off
 
     def toggle(self):
-        self.value(1 - self._out)
+        self.value(1 - self._l.out)
 
     def mode(self, mode=None):
         if mode is None:
-            return self._mode
+            return self._l.mode
         self.init(mode)
 
     def pull(self, pull=-1):
         if pull == -1:
-            return None if self._pull == -1 else self._pull
+            return None if self._l.pull == -1 else self._l.pull
         self.init(pull=pull)
 
     def wait_edge(self):
         """Block until the next edge irq() asked for; Pin.IRQ_RISING or
         Pin.IRQ_FALLING."""
-        ev = self._req.read(_EVENT)
-        self._last_edge = Pin.IRQ_RISING if struct.unpack_from("<I", ev, 8)[0] == 1 else Pin.IRQ_FALLING
-        return self._last_edge
+        l = self._l
+        ev = l.req.read(_EVENT)
+        l.last_edge = Pin.IRQ_RISING if struct.unpack_from("<I", ev, 8)[0] == 1 else Pin.IRQ_FALLING
+        return l.last_edge
 
     def _irq_loop(self):
-        while self._handler is not None:
+        while self._l.handler is not None:
             self.wait_edge()
-            h = self._handler
+            h = self._l.handler
             if h is not None:
                 h(self)
 
@@ -191,21 +210,24 @@ class Pin:
         """Edge interrupts: handler(pin) runs in a thread of its own for each
         edge. No handler: edges are still detected, read them with
         wait_edge()."""
-        start = handler is not None and self._handler is None
-        self._handler = handler
-        self._trigger = trigger
+        l = self._l
+        start = handler is not None and l.handler is None
+        l.handler = handler
+        l.trigger = trigger
         self.init()
         if start:
             import _thread
 
             _thread.start_new_thread(self._irq_loop, ())
-        return _Irq(self)
+        return _Irq(l)
 
     def deinit(self):
-        self._handler = None
-        if self._req is not None:
-            self._req.close()
-            self._req = None
+        l = self._l
+        l.handler = None
+        if l.req is not None:
+            l.req.close()
+            l.req = None
+        _lines.pop(self._n, None)
 
 
 # linux/i2c-dev.h, linux/i2c.h
