@@ -197,7 +197,7 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 - **Flash writes.** Erasing or programming flash stalls XIP. `core1::park()`
   returns a guard that holds core1 in an SRAM loop until it drops.
 - **Memory.** core1's code is about 55 KB in `.core1_text`. Its service
-  slot is 7 KiB, its stack 6 KiB, the console rings 16 KiB, and the frame
+  slot is 7 KiB, its stack 5 KiB, the console rings 16 KiB, and the frame
   rings 6 KiB in SRAM8/9.
 
 ### Hazard3 constraints

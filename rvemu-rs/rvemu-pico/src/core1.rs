@@ -382,8 +382,8 @@ unsafe fn copy_core1_text() {
 
 // ------------------------------------------------------------------ launch
 
-/// core1's stack, in main SRAM.
-const STACK_WORDS: usize = 1536;
+/// core1's stack, in main SRAM (3.3 KB deep after a gate run).
+const STACK_WORDS: usize = 1280;
 pub const STACK_BYTES: usize = STACK_WORDS * 4;
 #[repr(align(16))]
 struct Stack(UnsafeCell<[u32; STACK_WORDS]>);

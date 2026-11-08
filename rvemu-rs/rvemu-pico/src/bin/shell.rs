@@ -87,10 +87,10 @@ fn flash_disk() -> Option<MemDisk> {
 
 // ------------------------------------------------------------------ translator storage (SRAM)
 
-/// The translator's code cache. 320 KiB is what dev/base has; core1's code
-/// and buffers (about 44 KB, `core1.rs`) take part of that on this branch
-/// until the block descriptors move into the code buffer.
-const CODE_KIB: usize = 260;
+/// The translator's code cache: what SRAM has left once core1's code and
+/// buffers (`core1.rs`) and core0's stack (9 KB deep after a gate run;
+/// 11.6 KB here) have theirs.
+const CODE_KIB: usize = 272;
 const CODE_WORDS: usize = CODE_KIB * 256;
 const NBLOCKS: usize = 4096;
 const NBUCKETS: usize = 1024;
@@ -232,7 +232,6 @@ impl Bus for PicoBus {
     /// 100 ms, for input or the timer deadline, then skip to the deadline.
     /// core1 bumps its event word when input or a frame arrives, which ends
     /// the wait at once.
-    #[unsafe(link_section = ".data.rvemu_hot")]
     fn wfi(&mut self, cpu: &mut Cpu) {
         self.poll();
         if cpu.sip_value(self) & cpu.sie != 0 {
