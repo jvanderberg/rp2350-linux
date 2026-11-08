@@ -149,7 +149,7 @@ QEMU tier uses the initramfs guest; it does not exercise disk-only features.
 
 ## CI
 
-`.github/workflows/check.yml` runs the host tier on Ubuntu 24.04 and macOS 14
+`.github/workflows/check.yml` runs the host tier on Ubuntu 24.04 and macOS 15
 for pushes and pull requests. A manual workflow dispatch with `guest` enabled
 builds the initramfs guest and runs the QEMU tier on Ubuntu. This keeps the
 expensive toolchain build explicit while the pipeline is established.
