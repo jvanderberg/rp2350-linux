@@ -81,9 +81,9 @@ links on the guest: `cc hello.c && ./a.out`, `cc -run hello.c`, `cc -c`,
 - **Memory:** compiling a file takes 0.9–2.8 MB, against about 3.7 MB
   available after login. With no swap, a compile that took the last of it
   would evict the page cache that holds every program's code and stall the
-  guest for minutes. So unless `RLIMIT_DATA` is set, tcc limits its own data
-  to MemAvailable less 768 kB, and a compile that is too big stops with
-  "memory full". Larger programs build one file at a time (`cc -c`).
+  guest for minutes. So after every 128 kB it allocates, tcc checks
+  MemAvailable, and below 512 kB it stops with "memory full". Larger
+  programs build one file at a time (`cc -c`).
 - **Size:** 704 KiB of squashfs.
 - **Tests:** `br-external/package/tcc/test/board-test.sh` copies the tests
   to the board over the console (`push.py`) and runs them (`run.sh`). The
