@@ -73,17 +73,21 @@ counters.
 
 ## Translator (`rvjit/`)
 
-- **Registers.** Guest `xN` lives in host `xN`. Five host registers are
-  reserved: x3 (state pointer), x4/x7/x23 (scratch) and x24 (helper link).
-  These are the five least-used guest registers in a boot (about 1.5% of
-  operand uses); their guest values live in `cpu.x[]`.
-- **Exact timing.** Every block starts with `budget -= N; if < 0 exit`. The
-  budget is the number of instructions until the next timer deadline, so
-  `instret` and interrupt timing are identical to the interpreter's.
+- **Registers.** Guest `xN` lives in host `xN`. Six host registers are
+  reserved: x3 (state pointer), x4/x7/x23 (scratch), x22 (instruction
+  budget) and x24 (helper link). These are the six least-used guest
+  registers in a boot (about 2% of operand uses); their guest values live in
+  `cpu.x[]`.
+- **Exact timing.** A block is its guest pc, `jal budget_exit`, then the
+  entry: `addi x22, x22, -N; blt x22, zero, <the jal>`. The budget is the
+  number of instructions until the next timer deadline, so `instret` and
+  interrupt timing are identical to the interpreter's.
 - **Memory.** Loads and stores call a shared soft-TLB helper
-  (`addi; jal helper; .word meta; ld/st`) that skips the metadata word on a
-  hit. A miss, MMIO, a fault, a page-crossing access or a misaligned access
-  exits, and `Cpu::step()` executes that one instruction. AMOs use the host
+  (`addi; jal helper; ld/st`). A miss, MMIO, a fault, a page-crossing
+  access or a misaligned access exits with the call site, and `Cpu::step()`
+  executes that one instruction. The dispatcher finds the block by scanning
+  back to its `jal budget_exit`, and the instruction by counting helper
+  calls, so no per-access metadata is stored. AMOs use the host
   AMO on the translated address, or load/op/store when `Jit::native_amo` is
   off. LR/SC, CSRs, ecall, sret and wfi go to the interpreter.
 - **Linking.** Blocks are keyed by (virtual pc, physical pc) and never cross a

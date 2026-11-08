@@ -1,24 +1,29 @@
 //! Block translator: RV32IMA guest code -> RV32 host code (Hazard3).
 //!
-//! Guest register xN lives in host register xN, except five host registers
+//! Guest register xN lives in host register xN, except six host registers
 //! the translator reserves; the guest values of those live in `cpu.x[]`:
 //!   x3  S   pointer to the `Cpu`
 //!   x4  K0  scratch: guest address / host address / exit pc
 //!   x7  K1  scratch / exit info
+//!   x22 KB  instruction budget (`cpu.jit.budget` while in translated code)
 //!   x23 K2  scratch
 //!   x24 K3  link register for the TLB helpers
-//! (the five least-used guest registers in a boot, ~1.5% of operand uses).
+//! (the six least-used guest registers in a boot, ~2% of operand uses).
 //!
-//! Every block starts with `budget -= N; if budget < 0 exit`. The dispatcher
-//! sets the budget to the instructions left before the next timer deadline,
-//! which keeps `instret` exact and makes interrupt timing identical to the
+//! A block is `pc0; jal K1, budget_exit; addi KB, KB, -N; blt KB, zero, -8`
+//! and then its body; it is entered at the `addi`. The dispatcher sets the
+//! budget to the instructions left before the next timer deadline, which
+//! keeps `instret` exact and makes interrupt timing identical to the
 //! interpreter's. Anything other than ALU / M / loads / stores / branches /
 //! jumps ends the block and is run by the interpreter (`Cpu::step`).
 //!
 //! Loads and stores call a shared soft-TLB helper (`jal K3`) that returns
-//! the host address in K0 and skips the following `j miss_stub` on a hit. A
-//! miss, MMIO, a fault or a misaligned access exits, and the interpreter
-//! executes that one instruction.
+//! the host address in K0. A miss, MMIO, a fault or a misaligned access
+//! exits with the call site, and the interpreter executes that one
+//! instruction: the dispatcher finds the block from the call site (the
+//! `jal K1, budget_exit` before its entry; data words in a block are guest
+//! pcs, 4-aligned, so they never look like an instruction) and which
+//! instruction it was (counting `jal K3` sites).
 //!
 //! Blocks are keyed by (virtual pc, physical pc) and never cross a page.
 //! Exits to the same page are chained by patching a `jal`. Other jumps go
@@ -56,15 +61,16 @@ pub const K0: Reg = 4;
 pub const K1: Reg = 7;
 pub const K2: Reg = 23;
 pub const K3: Reg = 24;
+pub const KB: Reg = 22;
 
 #[inline(always)]
 pub const fn spilled(r: u32) -> bool {
-    r == S || r == K0 || r == K1 || r == K2 || r == K3
+    r == S || r == K0 || r == K1 || r == K2 || r == K3 || r == KB
 }
 
 /// Guest registers held in host registers while in translated code.
-const GUEST_REGS: [Reg; 26] = [
-    1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 30, 31,
+const GUEST_REGS: [Reg; 25] = [
+    1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 25, 26, 27, 28, 29, 30, 31,
 ];
 /// Host registers the entry trampoline must preserve for the Rust caller
 /// (ra, callee-saved s0-s11, and gp/tp which we repurpose).
@@ -74,6 +80,11 @@ const FRAME: i32 = 64;
 pub const EXIT_JUMP: u32 = 0; // info = chain slot address, or 0
 pub const EXIT_INTERP: u32 = 1; // interpret the instruction at exit_pc
 pub const EXIT_BUDGET: u32 = 2; // budget exhausted before the block ran
+pub const EXIT_MEM: u32 = 3; // info = 3 + the return address of a `jal K3` site
+
+/// Words from a block's header (its guest pc) to its entry point: the header,
+/// then the `jal K1, budget_exit` the budget check branches back to.
+const ENTRY_OFF: usize = 2;
 
 pub const MAX_BLOCK: usize = 32;
 /// Most code-buffer regions (`JitMem::regions`).
@@ -458,18 +469,12 @@ struct Routines {
     ijmp_imm: usize,
     /// `jal K1, interp_exit; .word pc`
     interp_exit: usize,
-    /// from the block prologue: `jal K1, budget_exit` (K1 = entry + 16)
+    /// from the block prologue: `jal K1, budget_exit` (K1 = entry)
     budget_exit: usize,
-    /// `jal K3, ...; .word meta` - interpret the instruction meta names
+    /// `jal K3, mem_miss` - interpret the instruction of that call site
     mem_miss: usize,
     /// TLB helpers, [store][log2 size]
     helper: [[usize; 3]; 2],
-}
-
-/// Metadata word after a helper call: distance back to the block header,
-/// index of the instruction, and block length.
-const fn meta(dist: usize, k: usize, n: usize) -> u32 {
-    (dist as u32) | ((k as u32) << 10) | ((n as u32) << 16)
 }
 
 #[inline(always)]
@@ -569,6 +574,7 @@ impl<'m> Jit<'m> {
         for &reg in &GUEST_REGS {
             a.lw(reg, S, xoff(reg));
         }
+        a.lw(KB, S, OFF_BUDGET);
         a.jalr(ZERO, K0, 0);
 
         // exit: K0 = guest pc, K1 = info
@@ -576,6 +582,7 @@ impl<'m> Jit<'m> {
         for &reg in &GUEST_REGS {
             a.sw(reg, S, xoff(reg));
         }
+        a.sw(KB, S, OFF_BUDGET);
         a.sw(K0, S, OFF_EXIT_PC);
         a.sw(K1, S, OFF_EXIT_INFO);
         a.lw(SP, S, OFF_HOST_SP);
@@ -597,30 +604,20 @@ impl<'m> Jit<'m> {
         a.addi(K1, ZERO, EXIT_INTERP as i32);
         jump!(r.exit);
 
-        // budget exhausted: K1 = entry + 16, block header (pc0) at entry - 4
+        // budget exhausted: K1 = entry, which is `addi KB, KB, -n`; undo it.
+        // The block header (pc0) is at entry - 8.
         r.budget_exit = a.pos();
-        a.lw(K0, K1, -20);
+        a.lw(K2, K1, 0);
+        a.srai(K2, K2, 20);
+        a.sub(KB, KB, K2);
+        a.lw(K0, K1, -8);
         a.addi(K1, ZERO, EXIT_BUDGET as i32);
         jump!(r.exit);
 
-        // K3 = address of a meta word: interpret instruction k of the block,
-        // refunding the n - k instructions that did not run
+        // K3 = return address of a `jal K3` site: the dispatcher works out
+        // the instruction and the refund (`mem_exit`)
         r.mem_miss = a.pos();
-        a.lw(K1, K3, 0); // meta
-        a.andi(K2, K1, 0x3FF);
-        a.slli(K2, K2, 2);
-        a.sub(K2, K3, K2);
-        a.lw(K0, K2, 0); // pc0 from the header
-        a.srli(K2, K1, 10);
-        a.andi(K2, K2, 63); // k
-        a.slli(K3, K2, 2);
-        a.add(K0, K0, K3); // pc = pc0 + 4k
-        a.srli(K1, K1, 16); // n
-        a.sub(K1, K1, K2);
-        a.lw(K2, S, OFF_BUDGET);
-        a.add(K2, K2, K1);
-        a.sw(K2, S, OFF_BUDGET);
-        a.addi(K1, ZERO, EXIT_INTERP as i32);
+        a.addi(K1, K3, EXIT_MEM as i32);
         jump!(r.exit);
 
         // indirect jump with the target in the word at K1
@@ -656,8 +653,8 @@ impl<'m> Jit<'m> {
         a.addi(K1, ZERO, EXIT_JUMP as i32);
         jump!(r.exit);
 
-        // TLB helpers: K0 = guest va -> host address, K3 = meta word.
-        // Hit returns to K3 + 4; miss goes to mem_miss.
+        // TLB helpers: K0 = guest va -> host address, K3 = return address.
+        // A miss goes to mem_miss.
         //
         // Misaligned accesses also take the miss path, so the interpreter
         // does them in software: Hazard3 has no misaligned loads/stores (on
@@ -683,7 +680,7 @@ impl<'m> Jit<'m> {
                 let m = a.branch_fwd(1, K2, ZERO);
                 a.lw(K1, K1, OFF_ADDEND);
                 a.add(K0, K0, K1);
-                a.jalr(ZERO, K3, 4);
+                a.jalr(ZERO, K3, 0);
                 let here = a.pos();
                 a.fix(m, here);
                 if let Some(mis) = misaligned {
@@ -890,7 +887,7 @@ impl<'m> Jit<'m> {
         } else {
             let r = self.translate_inner(cpu, pc0, pa0);
             if r != NO_CODE {
-                self.store_append(cpu, pc0, pa0, r as usize - 1);
+                self.store_append(cpu, pc0, pa0, r as usize - ENTRY_OFF);
             }
             r
         };
@@ -997,7 +994,7 @@ impl<'m> Jit<'m> {
         let at = self.pos;
         self.code[at..at + words].copy_from_slice(&self.store.mem[e + STORE_HDR..e + STORE_HDR + words]);
         // re-point the jals into the shared routines, stepping over the
-        // data word after a chain / jump / interp request or a helper call
+        // data word after a chain / jump / interp request
         let r = self.r;
         let mut i = 1;
         while i < words {
@@ -1013,7 +1010,7 @@ impl<'m> Jit<'m> {
             let rd = (w >> 7) & 31;
             self.code[at + i - 1] = j_type(rd, ((tgt - (at + i - 1) as isize) * 4) as i32);
             let t = tgt as usize;
-            if rd == K3 || (rd == K1 && (t == r.chain_req || t == r.ijmp_imm || t == r.interp_exit)) {
+            if rd == K1 && (t == r.chain_req || t == r.ijmp_imm || t == r.interp_exit) {
                 i += 1;
             }
         }
@@ -1021,8 +1018,8 @@ impl<'m> Jit<'m> {
         fence_i();
         self.stats.restores += 1;
         self.stats.restore_words += words as u64;
-        self.insert(va, pa, (at + 1) as u32);
-        (at + 1) as u32
+        self.insert(va, pa, (at + ENTRY_OFF) as u32);
+        (at + ENTRY_OFF) as u32
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
@@ -1046,17 +1043,21 @@ impl<'m> Jit<'m> {
         let r = self.r;
         let mut a = Asm::at(self.code, self.code_base, self.pos);
 
-        // header word (guest pc), then the entry point
-        let header = a.emit(pc0);
-        let start = a.pos();
-        let same_page = |t: u32| t & !0xFFF == pc0 & !0xFFF;
-
         macro_rules! call {
             ($link:expr, $to:expr) => {{
                 let c = a.emit(j_type($link, 0));
                 a.fix(c, $to);
             }};
         }
+
+        // header word (guest pc), the budget exit, then the entry point:
+        // `addi KB, KB, -n; blt KB, zero, <the budget exit>`
+        let header = a.emit(pc0);
+        call!(K1, r.budget_exit);
+        let start = a.pos();
+        a.addi(KB, KB, -(n as i32));
+        a.emit(b_type(4, KB, ZERO, -8));
+        let same_page = |t: u32| t & !0xFFF == pc0 & !0xFFF;
         // jump to a known guest pc: chainable slot if same page, else jump cache
         macro_rules! goto_pc {
             ($target:expr) => {{
@@ -1065,21 +1066,6 @@ impl<'m> Jit<'m> {
                 a.emit(t);
             }};
         }
-        // `jal K3, to; .word meta` for instruction k
-        macro_rules! call_meta {
-            ($to:expr, $k:expr) => {{
-                call!(K3, $to);
-                let here = a.pos();
-                a.emit(meta(here - header, $k, n));
-            }};
-        }
-
-        // prologue: budget check
-        a.lw(K0, S, OFF_BUDGET);
-        a.addi(K0, K0, -(n as i32));
-        a.emit(b_type(5, K0, ZERO, 8)); // bge K0, zero, +8
-        call!(K1, r.budget_exit);
-        a.sw(K0, S, OFF_BUDGET);
 
         for k in 0..n {
             let insn = insns[k];
@@ -1128,7 +1114,7 @@ impl<'m> Jit<'m> {
                     } else {
                         a.addi(K0, rs1, imm);
                     }
-                    call_meta!(r.helper[store as usize][(f3 & 3) as usize], k);
+                    call!(K3, r.helper[store as usize][(f3 & 3) as usize]);
                     if store {
                         if spilled(rs2) {
                             a.lw(K1, S, xoff(rs2));
@@ -1182,8 +1168,8 @@ impl<'m> Jit<'m> {
                     a.andi(K0, K0, -2);
                     // misaligned target: let the interpreter raise it
                     a.andi(K1, K0, 2);
-                    a.emit(b_type(0, K1, ZERO, 12)); // beq K1, zero, +12
-                    call_meta!(r.mem_miss, k);
+                    a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+                    call!(K3, r.mem_miss);
                     if rd != 0 {
                         let link = pc.wrapping_add(4);
                         if spilled(rd) {
@@ -1205,9 +1191,9 @@ impl<'m> Jit<'m> {
                         a.addi(K0, rs1, 0);
                     }
                     a.andi(K1, K0, 3);
-                    a.emit(b_type(0, K1, ZERO, 12)); // beq K1, zero, +12
-                    call_meta!(r.mem_miss, k);
-                    call_meta!(r.helper[1][2], k);
+                    a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+                    call!(K3, r.mem_miss);
+                    call!(K3, r.helper[1][2]);
                     let src = if spilled(rs2) {
                         a.lw(K1, S, xoff(rs2));
                         K1
@@ -1282,7 +1268,6 @@ impl<'m> Jit<'m> {
 
         let end = a.pos();
         assert!(!a.overflowed(), "code buffer overflow");
-        assert!(end - header < 1024, "block too long for meta words");
         self.pos = end;
         fence_i();
 
@@ -1360,6 +1345,49 @@ impl<'m> Jit<'m> {
         }
     }
 
+    /// A `jal K3` site returning to host address `ret` left translated code
+    /// (TLB miss, MMIO, fault, misaligned access or jump target): set
+    /// `exit_pc` to its instruction and refund the budget for the
+    /// instructions from that one to the end of the block, which did not run.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn mem_exit(&mut self, cpu: &mut Cpu, ret: usize) {
+        let site = (ret - self.code_base) / 4 - 1;
+        // back to the block's `jal K1, budget_exit`: no other word is a jal
+        // there (guest pcs in data words are 4-aligned; instructions are not)
+        let mut p = site - 1;
+        while !(self.code[p] & 0xFFF == (K1 << 7) | 0x6F
+            && p as isize + (jal_off(self.code[p]) / 4) as isize == self.r.budget_exit as isize)
+        {
+            p -= 1;
+        }
+        let entry = p + 1;
+        let pc0 = self.code[p - 1];
+        let n = -((self.code[entry] as i32) >> 20) as u32;
+        let before = self.code[entry..site].iter().filter(|&&w| w & 0xFFF == (K3 << 7) | 0x6F).count();
+        // the guest instruction with that many sites before it
+        let pa0 = match cpu.tlb_probe(pc0, ACC_X) {
+            Some(pa) => pa,
+            None => cpu.translate_pc(pc0).map(|(pa, _)| pa).expect("mem exit: block page unmapped"),
+        };
+        let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
+        let (mut k, mut seen) = (0u32, 0usize);
+        loop {
+            // SAFETY: instruction k of the block, in the same guest RAM page.
+            let insn = unsafe { ((host0 + 4 * k as usize) as *const u32).read() };
+            seen += match classify(insn, pc0.wrapping_add(4 * k)) {
+                Kind::Load | Kind::Store | Kind::Jalr => 1,
+                Kind::Amo => 2,
+                _ => 0,
+            };
+            if seen > before {
+                break;
+            }
+            k += 1;
+        }
+        cpu.jit.exit_pc = pc0.wrapping_add(4 * k);
+        cpu.jit.budget += (n - k) as i32;
+    }
+
     /// One dispatcher step: take an interrupt, interpret one instruction, or
     /// run translated code until it exits.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
@@ -1413,12 +1441,15 @@ impl<'m> Jit<'m> {
             enter(cpu, self.code_addr(code));
         }
         self.stats.h_code += host_instret() - t0;
+        let info = cpu.jit.exit_info;
+        if info & 3 == EXIT_MEM {
+            self.mem_exit(cpu, (info & !3) as usize);
+        }
         let executed = (budget - cpu.jit.budget) as u64;
         cpu.instret += executed;
         self.stats.jit_insns += executed;
         self.stats.entries += 1;
         cpu.pc = cpu.jit.exit_pc;
-        let info = cpu.jit.exit_info;
         match info & 3 {
             EXIT_JUMP => {
                 self.stats.exit_jump += 1;
@@ -1427,6 +1458,10 @@ impl<'m> Jit<'m> {
                 }
             }
             EXIT_INTERP => {
+                self.stats.exit_interp += 1;
+                self.force_interp = true;
+            }
+            EXIT_MEM => {
                 self.stats.exit_interp += 1;
                 self.force_interp = true;
             }
