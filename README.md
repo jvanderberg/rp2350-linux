@@ -176,20 +176,28 @@ in a 1 MB heap; then a Lua loop. On the board:
 | zram, lz4, 4 MB | no: hung, over 300 s | | 26 ms / 98 ms / 28 s |
 | zswap in front of flash | no: hung, over 300 s | | 27 ms / 99 ms / 29 s |
 
-- **More memory.** With tmux and htop running, the largest Lua table that
-  builds goes from 1.2 MB to 2.3 MB (20,000 to 40,000 strings, on the Mac).
-- **Flash traffic.** That run wrote 597 pages in 149 s, about 0.9 MB a
-  minute while thrashing, and stalled the guest for 25 s of it in erases
+- **More memory.** With tmux and htop running, a Lua table of 40,000
+  strings (2.3 MB) builds in 17 guest seconds with flash swap. Without
+  swap, 20,000 (1.2 MB) is the most that builds: 40,000 doesn't finish in
+  200 s, and the console stops answering.
+- **Latency.** Typed-key echo while swapping: p50 21-26 ms, p95 150-177 ms,
+  max about 0.8 s. While idle erases run: 15-39 ms (15 ms baseline). One
+  request stalls the guest for at most one erase and its writes: the
+  slowest of about 1,750 erases took 50 ms (datasheet maximum 400 ms).
+- **Flash traffic.** The mixed run wrote 597 pages in 149 s, about 0.9 MB
+  a minute while thrashing, and stalled the guest for 25 s of it in erases
   and programs.
 - **Wear.** One erase per page written, plus 1 in 8 for wear levelling.
   At that rate (4.5 erases/s) the region's 51 M erases (511 sectors x 100K
   cycles) last 131 days of continuous thrashing, or about 9 years at an
   hour of it a day.
-- **Memory cost.** The swap device costs the guest about 32 KiB (its slab
-  and virtqueue, Mac deterministic boot), so it's opt-in. zram would cost
-  16 KiB of kernel and zram plus zswap 20 KiB, before any pages are stored.
-  Holding 2.5 MB of swapped pages at 2:1 compression took zram 2.06 MB of
-  RAM.
+- **Cost of `-w`.** About 32 KiB of guest RAM (the device's slab and
+  virtqueue, plus the 4 KiB page for the map), and 1.8 s more boot for
+  mkswap and swapon. That's why it's opt-in. Without `-w`: no guest RAM,
+  no SRAM beyond the erase/program routine.
+- **zram's cost.** 16 KiB of kernel (zram and zswap: 20 KiB) before any
+  pages are stored, and in the mixed run zram needed 2.06 MB of RAM to hold
+  2.5 MB of swapped pages (2:1 compression, then zsmalloc's overhead; Mac).
 
 ## Results (on the board, 348 MHz)
 
