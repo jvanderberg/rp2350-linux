@@ -4,7 +4,7 @@
 usage: boot-wait.py START_EPOCH [--port PORT] [--timeout S] [--log FILE]
 
 START_EPOCH is when the firmware was started (pico-shell.sh writes it to
-$RP2350_LOCK_HOME/last-launch). Prints the boot time in seconds on stdout,
+rvemu-rs/target/pico-last-launch). Prints the boot time in seconds on stdout,
 or exits 1 on timeout. --log writes the whole boot console, each line
 prefixed with its seconds since START_EPOCH, whatever the outcome.
 Plain termios, never 1200 baud.

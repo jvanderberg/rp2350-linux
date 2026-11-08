@@ -3,7 +3,6 @@
 # console (push.py) and run them there with run.sh, for at most
 # TCC_TEST_MAX_S seconds (600). (run.sh selfhost, tcc building itself, is a
 # stress case for the emulator, not the board.)
-# Needs the board lock: rp2350/tools/board-lock run NAME -- ./board-test.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 CMD=../../../../../rp2350/tools/board-cmd.py

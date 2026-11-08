@@ -539,13 +539,12 @@ Mac for the reference, and compares every board run.
 | `scripts/compare.sh` | C reference against Rust |
 | `scripts/sim.py` | board time for cache policies simulated by `rvemu -S` |
 | `scripts/check-core1.py [ELF]` | references from core1's SRAM code into XIP flash (fails on any outside cold paths); run it after any change to what core1 calls |
-| `scripts/perf-gate.sh [-n LABEL] [-B] [-s]` | the board's performance and stability gate: boots the board, times a fixed workload, checks the memory left and checksums every file in the root filesystem, and fails on anything slower, smaller or wrong against `~/.cache/rp2350-board/perf-baseline.json`. Run it as `../rp2350/tools/board-lock run NAME -- scripts/perf-gate.sh -n LABEL`; it needs `guest/out` and `guest/out-disk`. `-B` skips the benchmark boot, `-s` sets the baseline. |
+| `scripts/perf-gate.sh [-n LABEL] [-B] [-s]` | the board's performance and stability gate: boots the board, times a fixed workload, checks the memory left and checksums every file in the root filesystem, and fails on anything slower, smaller or wrong against the baseline in `target/perf-gate/`. It needs `guest/out` and `guest/out-disk`. `-B` skips the benchmark boot, `-s` sets the baseline. |
 | `scripts/pico-common.sh` | shared by the `pico-*` scripts: BOOTSEL, `load_at` with change stamps, `pack_guest`, the flash addresses |
 
 `../rp2350/tools/board-cmd.py COMMAND` runs a command in the board's shell
 over the USB console and prints its output, and `../rp2350/tools/boot-wait.py`
-waits for `login:`. Every board script needs the board lock
-(`../rp2350/tools/board-lock`, top-level README).
+waits for `login:`.
 
 Notes:
 - picotool needs `-t bin` for files with unknown extensions, and `-t elf`

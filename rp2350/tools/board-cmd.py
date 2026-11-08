@@ -101,9 +101,6 @@ def main():
     ap.add_argument("command", nargs="+")
     a = ap.parse_args()
 
-    lock = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board-lock")
-    if subprocess.run([lock, "check", os.environ.get("BOARD_LOCK_OWNER", "nobody")], check=False).returncode:
-        sys.exit(1)
     port = a.port or default_port()
     if not port:
         sys.exit("board-cmd: no /dev/cu.usbmodemrvemu* (is rvemu-pico-shell running? scripts/pico-shell.sh)")

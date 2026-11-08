@@ -53,8 +53,7 @@ The flash map is in the [top-level README](../README.md#flash-map-16-mb).
 
 | Tool | |
 |---|---|
-| `board-lock run\|acquire\|renew\|release\|check\|status OWNER ...` | a FIFO lock on the board (picotool, the console port, SWD) and on the guest-build Docker volume (`-r guest-build`), shared by every checkout; state in `~/.cache/rp2350-board`. `run OWNER -- CMD` waits, runs CMD holding the lock and releases it. A lease (20 min by default, `-l MIN`) that isn't renewed expires. The `pico-*.sh` scripts, `perf-gate.sh`, `run-riscv.sh` and `board-cmd.py` refuse to run unless `BOARD_LOCK_OWNER` holds the board; `guest/run-build.sh` takes the guest-build lock itself. |
-| `boot-wait.py START [--log FILE]` | wait for `login:` on the console and print the seconds since START (`pico-shell.sh` writes it to `~/.cache/rp2350-board/last-launch`) |
+| `boot-wait.py START [--log FILE]` | wait for `login:` on the console and print the seconds since START (`pico-shell.sh` writes it to `rvemu-rs/target/pico-last-launch`) |
 | `pack-guest.py IMAGE INITRD DTB RAM_MB TEXT_LEN BLOB TEXT` | split an Image into the flash text and the guest blob |
 | `board-cmd.py [--port P] [--timeout S] COMMAND...` | run a command in the board's shell over the USB console (logs in as root if needed), print its output, exit with its status |
 | `serial-chat.py PORT EXPECT [SEND EXPECT]...` | script a serial console: wait for a pattern, send a line, repeat |

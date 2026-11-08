@@ -8,7 +8,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-../rp2350/tools/board-lock check "${BOARD_LOCK_OWNER:-nobody}" || exit 1
 
 (cd jittest-guest && cargo build -q --release)
 "$BIN/llvm-objcopy" -O binary jittest-guest/target/riscv32im-unknown-none-elf/release/jittest-guest jittest-guest/jittest.bin

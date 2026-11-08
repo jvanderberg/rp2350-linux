@@ -50,13 +50,10 @@ lines starting with `$` on the Mac the board is plugged into.
 ## Quickstart
 
 ```sh
-export BOARD_LOCK_OWNER=$USER
-
 # 1. Build the guest into guest/out-disk (Docker).
 cd guest && ./run-build.sh disk && cd ../rvemu-rs
 
 # 2. Store the Wi-Fi network in the board's flash (asks for the passphrase).
-../rp2350/tools/board-lock acquire $USER -l 120
 scripts/pico-wifi.sh "My Network"
 
 # 3. Load the guest and the firmware over USB, and boot.

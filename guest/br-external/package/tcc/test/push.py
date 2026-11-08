@@ -7,7 +7,7 @@ Runs `base64 -d > REMOTE` in the guest's shell with echo off and streams
 LOCAL to it as base64 lines, then EOF. While base64 reads the terminal,
 the shell's line editor (which takes at most 1 KiB per line) is not in the
 way, and nothing comes back but the result. Uses board-cmd.py's console
-handling (lock check, login) and needs the board lock the same way.
+handling (login).
 """
 import base64
 import importlib.util
@@ -28,9 +28,6 @@ def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__.strip().split("\n")[2])
     local, remote = sys.argv[1:]
-    lock = os.path.join(TOOLS, "board-lock")
-    if subprocess.run([lock, "check", os.environ.get("BOARD_LOCK_OWNER", "nobody")], check=False).returncode:
-        sys.exit(1)
     port = bc.default_port()
     if not port:
         sys.exit("push: no /dev/cu.usbmodemrvemu* (is rvemu-pico-shell running?)")

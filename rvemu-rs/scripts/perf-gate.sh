@@ -2,23 +2,21 @@
 # The on-device performance and stability gate. Every change is measured on
 # the board with this before it lands; nothing may make it appreciably worse.
 #   scripts/perf-gate.sh [-n LABEL] [-s] [-B]
-# Needs the board lock (run it as rp2350/tools/board-lock run NAME --
-# scripts/perf-gate.sh) and the guests already built in this checkout's
-# guest/out and guest/out-disk.
+# Needs the guests already built in guest/out and guest/out-disk.
 #   1. rvemu-pico-linux benchmark: initramfs guest to login: (deterministic
 #      instruction count, board ms; checked against the Mac reference).
 #   2. rvemu-pico-shell with the disk guest: wall time from firmware start to
 #      login:, then a fixed workload over the console, timed on the Mac:
 #      first runs of five programs, MicroPython and Lua loops, 200
 #      fork+exec, checksums of a fixed file list (the baseline image's files,
-#      $RP2350_LOCK_HOME/md5-files.list; timed cold and warm, so added files
+#      md5-files.list; timed cold and warm, so added files
 #      don't read as slower I/O), and then of every file under /usr /lib
 #      /bin /sbin, all against the squashfs image's own: the stability
 #      check, where one flipped bit fails the gate. The boot console of every
-#      run is kept in $RP2350_LOCK_HOME/boot-logs/.
-# Results go to $RP2350_LOCK_HOME/perf.log (one JSON line per run) and are
-# compared with perf-baseline.json there. -s makes this run the baseline
-# (the integrator does that, nobody else). -B skips step 1.
+#      run is kept in boot-logs/.
+# State lives in target/perf-gate/: results go to perf.log (one JSON line per
+# run) and are compared with perf-baseline.json. -s makes this run the
+# baseline (and its files the fixed list). -B skips step 1.
 # Fails (exit 1) on: any boot or workload time more than 3% (boot) / 5%
 # (workload) slower than the baseline, MemAvailable 128 KiB or more below it,
 # a checksum mismatch, a Mac/board mismatch, or no login:.
@@ -27,7 +25,7 @@ cd "$(dirname "$0")/.."
 . scripts/pico-common.sh
 LABEL=""; SET=0; SKIP_BENCH=0
 while getopts "n:sB" o; do case $o in n) LABEL=$OPTARG;; s) SET=1;; B) SKIP_BENCH=1;; *) exit 2;; esac; done
-need_board
+G=target/perf-gate; mkdir -p "$G/boot-logs"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 CMD=../rp2350/tools/board-cmd.py
 now() { python3 -c 'import time; print(f"{time.time():.3f}")'; }
@@ -58,10 +56,9 @@ docker run --rm -v "$(cd ../guest/out-disk && pwd):/d:ro" -v rvemu-guest-work:/w
 
 scripts/pico-shell.sh
 # the boot console of every run, kept so a slow or odd boot can be read later
-mkdir -p "$LOCK_HOME/boot-logs"
-BOOTLOG="$LOCK_HOME/boot-logs/$(date +%Y%m%d-%H%M%S)-${BOARD_LOCK_OWNER:-anon}.log"
+BOOTLOG="$G/boot-logs/$(date +%Y%m%d-%H%M%S).log"
 echo "perf-gate: boot console -> $BOOTLOG"
-put boot_s "$(python3 ../rp2350/tools/boot-wait.py "$(cat "$LOCK_HOME/last-launch")" --timeout 180 --log "$BOOTLOG")"
+put boot_s "$(python3 ../rp2350/tools/boot-wait.py "$(cat "$LAUNCH")" --timeout 180 --log "$BOOTLOG")"
 python3 "$CMD" --timeout 60 -- true > /dev/null          # log in
 python3 "$CMD" -- "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo" > "$T/mem"
 put mem_total_kb "$(awk '/MemTotal/{print $2}' "$T/mem")"
@@ -76,13 +73,13 @@ timed mpy_s 300 "micropython -c 'print(sum(i*i for i in range(30000)))'"
 timed lua_s 300 "lua -e 'local s=0 for i=1,300000 do s=s+i end print(s)'"
 timed fork_exec_s 300 'i=0; while [ $i -lt 200 ]; do /bin/true; i=$((i+1)); done'
 ok=1
-# Timed passes read a fixed file list ($LOCK_HOME/md5-files.list: the
+# Timed passes read a fixed file list ($G/md5-files.list: the
 # baseline image's files, as many of them as this image still has), so a
 # branch that adds files doesn't look like slower I/O. The last pass checks
 # every file of this image against its squashfs: the stability check.
 FIXED="$T/fixed.list"
-if [ -s "$LOCK_HOME/md5-files.list" ]; then
-  awk '{print $2}' "$T/manifest" | grep -Fxf "$LOCK_HOME/md5-files.list" > "$FIXED" || true
+if [ $SET = 0 ] && [ -s "$G/md5-files.list" ]; then
+  awk '{print $2}' "$T/manifest" | grep -Fxf "$G/md5-files.list" > "$FIXED" || true
 else
   awk '{print $2}' "$T/manifest" > "$FIXED"
 fi
@@ -107,16 +104,17 @@ if ! diff <(tr -d '\r' < "$T/md5_all_s.out") "$T/manifest" > "$T/md5.diff"; then
   echo "perf-gate: CHECKSUM MISMATCH (all files) -- possible memory corruption:"; head -20 "$T/md5.diff"; ok=0
 fi
 put checksums_ok $ok
+[ $SET = 0 ] || cp "$FIXED" "$G/md5-files.list"
 
-python3 - "$R" "$LOCK_HOME" "$LABEL" "${BOARD_LOCK_OWNER:-}" "$SET" <<'P'
+python3 - "$R" "$G" "$LABEL" "$SET" <<'P'
 import json, subprocess, sys, time, os
-res_path, home, label, owner, set_base = sys.argv[1:]
+res_path, home, label, set_base = sys.argv[1:]
 r = {}
 for l in open(res_path):
     k, v = l.strip().split("=", 1)
     r[k] = float(v) if "." in v else int(v)
 git = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True).stdout.strip()
-r.update(label=label, owner=owner, branch=git("rev-parse", "--abbrev-ref", "HEAD"),
+r.update(label=label, branch=git("rev-parse", "--abbrev-ref", "HEAD"),
          commit=git("rev-parse", "--short", "HEAD"), dirty=bool(git("status", "--porcelain")),
          date=time.strftime("%F %T"))
 with open(os.path.join(home, "perf.log"), "a") as f:

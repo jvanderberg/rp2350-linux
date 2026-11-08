@@ -9,15 +9,15 @@ export BR2_DL_DIR=/work/dl
 
 stage=${1:-all}
 
-# Buildroot saves BR2_EXTERNAL in the (shared) output directory, so always
-# pass it: the external tree, or empty when this checkout has none.
+# Buildroot saves BR2_EXTERNAL in the output directory, so always pass it:
+# the external tree, or empty when there is none.
 EXT=; [[ -f /guest/br-external/external.desc ]] && EXT=/guest/br-external
 
-# The /work volume is shared by every checkout. Buildroot never removes files
-# from target/, so when the configuration (defconfig, post-build script, overlay
-# or external tree under /guest) differs from the last one built in this tree,
-# reinstall every package into a fresh target/ (no recompiling) so the image
-# holds only this checkout's packages.
+# Buildroot never removes files from target/, so when the configuration
+# (defconfig, post-build script, overlay or external tree under /guest)
+# differs from the last one built in this tree, reinstall every package into
+# a fresh target/ (no recompiling) so the image holds only the configured
+# packages.
 fresh_target() {   # BR_OUT FILES...
   local o=$1; shift
   local sum; sum=$(cd /guest && { find "$@" -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
@@ -58,8 +58,7 @@ if [[ $stage == disk* ]]; then
     fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
     make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
     # Buildroot doesn't rebuild BusyBox when its config fragment changes or
-    # goes away, so a tree last built for another checkout could keep the
-    # wrong (static or dynamic) BusyBox: rebuild it when the fragment differs
+    # goes away: rebuild it when the fragment differs from the last build's
     bb=$(cat /guest/busybox-disk.fragment 2>/dev/null | sha256sum | cut -d' ' -f1)
     if [[ "$(cat /work/br-disk/.busybox-sum 2>/dev/null)" != "$bb" ]]; then
       make -C /work/br-disk busybox-dirclean
@@ -68,7 +67,7 @@ if [[ $stage == disk* ]]; then
     ext_rebuild /work/br-disk
     # MicroPython is built with the external packages' C modules (cmod/,
     # USER_C_MODULES), which Buildroot doesn't track: rebuild it unless its
-    # build directory (shared with other checkouts) has these ones
+    # build directory has these ones
     mp=$(cd /guest && { find br-external/package/*/cmod -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
     for d in /work/br-disk/build/micropython-[0-9]*/; do
       [[ -d $d && "$(cat "$d/.cmod-sum" 2>/dev/null)" != "$mp" ]] && make -C /work/br-disk micropython-dirclean

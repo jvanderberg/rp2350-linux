@@ -2,23 +2,20 @@
 
 The Linux guests for the board, built in Docker:
 
-    BOARD_LOCK_OWNER=NAME ./run-build.sh [all|rootfs|kernel|disk|disk-rootfs|disk-kernel]
+    ./run-build.sh [all|rootfs|kernel|disk|disk-rootfs|disk-kernel]
 
 The first run clones Buildroot 2026.08.1 into `src/buildroot`. Build trees
 live in the Docker volume `rvemu-guest-work`, so later builds are
-incremental. That volume is shared by every checkout, so `run-build.sh`
-waits for the `guest-build` lock (`../rp2350/tools/board-lock`) and needs
-`BOARD_LOCK_OWNER`. It refuses to run while you hold the board lock. Logs
-and outputs are not tracked.
+incremental. Logs and outputs are not tracked.
 
 Packages that Buildroot doesn't have live in `br-external`, a BR2_EXTERNAL
 tree named `RVEMU`: one directory per package under `package/`, and one
 `source` line per package in `Config.in`. `build.sh` always passes
-`BR2_EXTERNAL` (Buildroot remembers it in the shared output directory).
+`BR2_EXTERNAL` (Buildroot remembers it in the output directory).
 
 What `build.sh` rebuilds by itself, because Buildroot wouldn't:
 - a fresh `target/` when the configuration files differ from the last
-  build in that tree, so an image never holds another checkout's packages;
+  build, so an image holds only the configured packages;
 - BusyBox, when `busybox-disk.fragment` differs from the last build's;
 - an external package whose files changed (a new patch or `.mk`);
 - MicroPython, when the C modules it was built with differ from the
