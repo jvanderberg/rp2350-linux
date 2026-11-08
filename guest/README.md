@@ -90,10 +90,13 @@ links on the guest: `cc hello.c && ./a.out`, `cc -run hello.c`, `cc -c`,
   tests cover long long, float and double, structs by value, varargs,
   function pointers, a static library, kernel headers and an arithmetic
   hash that must match a native build. On the board, each compiles in
-  0.2–3.1 s. `run.sh selfhost` adds a stress case for the emulator only
-  (QEMU and the translator, `-m 11`). tcc builds itself from its sources
-  one file at a time, then builds itself again with the result, and the
-  two binaries must be identical.
+  0.2–3.1 s. `test/emu-selfhost.sh` runs them on the Mac (QEMU and the
+  translator, `-m 11`) together with a stress case. In it, tcc builds
+  itself from its sources one file at a time, then builds itself again
+  with the result, and the two binaries must be identical. With the
+  sources and objects in `/tmp` taking about 2 MB of RAM, the first build
+  stops at "memory full" after about 80 s, and the guest stays responsive
+  while it runs.
 
 Kernel options of note in `linux-disk.fragment`:
 
