@@ -125,17 +125,21 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 
 ### rvemu-pico-shell
 
+- **Two cores.** core0 runs only the guest. core1 does all the I/O: the
+  USB console and the Wi-Fi radio (below).
 - **Memory.** Guest RAM is the 8 MB PSRAM, preceded by the kernel text in
   flash (`guest_blob.rs`; flash map in the top-level README). The translator
-  has a 320 KiB code cache in SRAM: 4,096 blocks in a ring of 8 regions. It
+  has a `CODE_KIB` code cache in SRAM: 4,096 blocks in a ring of 8 regions. It
   has no PSRAM backing store, because that traffic would share the 16 KB XIP
   cache with guest RAM.
-- **Console.** Output waits in a 16 KB ring (a static) while no terminal is
-  open, so a late `screen` shows the end of the boot log. Input goes into a
-  256-byte ring.
-- **Idle.** While the guest idles in WFI, the firmware polls USB and the
-  radio in real time until the next timer deadline (at most 100 ms per
-  wait), then skips guest time ahead.
+- **Console** (`usbcon.rs`). Output waits in a 16 KB ring while no terminal
+  is open, keeping the newest bytes, so a late `screen` shows the end of the
+  boot log. With a terminal open nothing is lost: when the ring is full the
+  guest waits for the terminal. Input goes into a 256-byte ring, and USB is
+  read only while it has room.
+- **Idle.** While the guest idles in WFI, core0 waits in real time until the
+  next timer deadline (at most 100 ms per wait), then skips guest time ahead.
+  Console input or a received frame ends the wait at once.
 - **BOOTSEL.** Opening the port at 1200 baud and closing it reboots into
   BOOTSEL. So does the SWD request in `rp2350-board::bootsel_if_requested`.
 - **Disk.** The squashfs is read through flash's uncached, non-allocating
@@ -146,18 +150,55 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 - **Radio.** The RM2 module's CYW43439, wired as on the Pico 2 W: GP23
   WL_ON, GP24 data/IRQ, GP25 CS, GP29 CLK. Firmware blobs and their licence
   are in `rvemu-pico/firmware/`.
-- **Driver.** The `cyw43` 0.7 crate, without an executor: the emulator's
-  device poll polls its futures with a no-op waker, and `embassy-time` reads
-  the core's cycle counter.
+- **Driver.** The `cyw43` 0.7 crate, without an executor: core1's service
+  loop polls its futures with a no-op waker, and `embassy-time` reads the
+  SIO RISC-V timer. The radio comes up on core1 while the guest boots. The
+  guest waits for its MAC (at most 5 s) when it probes the NIC.
 - **Bus.** A port of `cyw43-pio`'s PIO gSPI program to rp235x-hal. The CPU
   feeds the FIFOs where the original uses DMA. The divider keeps the PIO clock
   at or below 50 MHz (a 25 MHz gSPI clock) at any system clock. A transfer that takes more
-  than 20 ms is abandoned, so a missing radio can't hang the emulator.
-- **Network.** Ethernet frames are bridged to the guest's virtio-net. The
+  than 20 ms is abandoned, so a missing radio can't hang core1. The
+  firmware blobs are read through flash's uncached alias, so uploading them
+  doesn't sweep the guest's data out of the XIP cache.
+- **Network.** Ethernet frames are bridged to the guest's virtio-net through
+  two frame rings (2 slots each way; the driver buffers 4 more received
+  frames). A frame the guest sends while core1 is two behind is dropped. The
   guest gets the radio's MAC, and its link state follows the join.
 - **Credentials.** `scripts/pico-wifi.sh SSID` asks for the passphrase and
   writes it to the 4 KB at 0x103FF000. The firmware joins in the background
   and retries every 3 s. `--forget` erases the network.
+
+### core1 (`rvemu-pico/src/core1.rs`)
+
+- **Service loop.** core1 runs one `core1::Service` (`fn poll(&mut self)`),
+  built by `core1::launch` in a static slot (`SERVICE_BYTES`, checked at
+  compile time) so it never moves and may hold pinned futures. In
+  `rvemu-pico-shell` it is `Io` in `shell.rs`: the console, the radio and an
+  RTT status line (stack depths, every 10 s). To add a service, add a field
+  to `Io` and call it from `Io::poll`. A pass must not block for long, since
+  the other services wait.
+- **Sharing.** The cores share only lock-free single-producer
+  single-consumer rings (`ByteRing`, `FrameRing`) and single-writer words, in
+  main SRAM or SRAM8/9 (`#[unsafe(link_section = ".sram89.NAME")]`, zeroed
+  at startup). core1 bumps an event word (`notify_core0`) when it hands the
+  guest something; core0's device poll is one load and a compare until then.
+  core0 rings a doorbell (`notify_core1`) when it queues work.
+- **Sleep.** Between passes core1 sleeps in `wfi` until a USB or radio
+  (PIO) interrupt, a doorbell, or a 1 ms timer. Interrupts are never taken:
+  they only end the `wfi`. core1 keeps time with the SIO RISC-V timer
+  (`core1::now()`, at the system clock).
+- **SRAM only.** Everything core1 runs is in SRAM, because the cores share
+  one QMI and one 16 KB XIP cache with the guest's RAM. `core1.x` links the
+  crates and modules it uses into `.core1_text` (copied from flash in
+  riscv-rt's `pre_init`), as well as any function marked
+  `#[unsafe(link_section = ".data.core1")]`. `scripts/check-core1.py` lists
+  every call or address from there into flash, and fails on any that isn't
+  a cold path (panics, RTT formatting, BOOTSEL, the radio firmware upload).
+- **Flash writes.** Erasing or programming flash stalls XIP. `core1::park()`
+  returns a guard that holds core1 in an SRAM loop until it drops.
+- **Memory.** core1's code is about 55 KB in `.core1_text`. Its service
+  slot is 7 KiB, its stack 6 KiB, the console rings 16 KiB, and the frame
+  rings 6 KiB in SRAM8/9.
 
 ### Hazard3 constraints
 
@@ -204,6 +245,7 @@ Mac for the reference, and compares every board run.
 | `scripts/virt.sh` | the bare-metal build under QEMU |
 | `scripts/compare.sh` | C reference against Rust |
 | `scripts/sim.py` | board time for cache policies simulated by `rvemu -S` |
+| `scripts/check-core1.py [ELF]` | references from core1's SRAM code into XIP flash (fails on any outside cold paths) |
 | `scripts/pico-common.sh` | shared by the `pico-*` scripts: BOOTSEL, `load_at` with change stamps, `pack_guest`, the flash addresses |
 
 `../rp2350/tools/board-cmd.py COMMAND` runs a command in the board's shell

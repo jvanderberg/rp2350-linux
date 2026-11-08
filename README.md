@@ -1,8 +1,8 @@
 # rp2350-linux
 
 Linux 6.12 (rv32ima, Sv32 MMU) on an RP2350B board. The kernel runs in an
-emulated hart, and the emulator runs on the chip's own Hazard3 RISC-V core.
-The guest gets the board's 8 MB PSRAM as RAM, plus its kernel text read in
+emulated hart, and the emulator runs on one of the chip's own Hazard3 RISC-V
+cores; the other does the console and network I/O. The guest gets the board's 8 MB PSRAM as RAM, plus its kernel text read in
 place from flash. Its root filesystem is a squashfs in flash. Its console is
 the board's USB serial port, and its Ethernet is the RM2 (CYW43439) Wi-Fi
 module. Hot guest code goes through a block translator into SRAM, so most of
@@ -22,7 +22,7 @@ Linux rp2350 6.12.116 #3 Sun Nov  8 04:03:07 UTC 2026 riscv32 GNU/Linux
 | `rvemu-rs/rvjit` | `no_std` block translator, RV32IMA guest to RV32 host code |
 | `rvemu-rs/rvemu` | Mac host: interactive or batch boots, device tree generation, statistics, timing model, cache-policy simulator |
 | `rvemu-rs/rvemu-virt` | the same core bare-metal under `qemu-system-riscv32 -M virt` (interpreter, translator, lockstep) |
-| `rvemu-rs/rvemu-pico` | board firmwares: `rvemu-pico-shell` (interactive, USB console, Wi-Fi), `rvemu-pico-linux` (boot benchmark over RTT), `rvemu-pico` (jittest) |
+| `rvemu-rs/rvemu-pico` | board firmwares: `rvemu-pico-shell` (interactive, USB console, Wi-Fi; the I/O on the second core), `rvemu-pico-linux` (boot benchmark over RTT), `rvemu-pico` (jittest) |
 | `rvemu-rs/jittest-guest` | bare-metal test guest for the translator |
 | `rvemu-rs/scripts` | build, load and compare scripts (`pico-shell.sh`, `pico-wifi.sh`, `pico-linux.sh`, `virt.sh`, ...) |
 | `rp2350/` | board crate (clocks, PSRAM, BOOTSEL), PSRAM bring-up tests, host tools (`pack-guest.py`, `board-cmd.py`, RTT, profiler) |
