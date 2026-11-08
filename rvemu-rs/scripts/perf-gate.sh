@@ -35,7 +35,7 @@ put() { echo "$1=$2" >> "$R"; echo "perf-gate: $1 = $2"; }
 timed() {
   local name=$1 to=$2 s e; shift 2
   s=$(now)
-  python3 "$CMD" --timeout "$to" "$@" > "$T/$name.out"
+  python3 "$CMD" --timeout "$to" -- "$@" > "$T/$name.out"
   e=$(now)
   put "$name" "$(python3 -c "print(f'{$e-$s:.2f}')")"
 }
@@ -55,8 +55,8 @@ docker run --rm -v "$(cd ../guest/out-disk && pwd):/d:ro" -v rvemu-guest-work:/w
 
 scripts/pico-shell.sh
 put boot_s "$(python3 ../rp2350/tools/boot-wait.py "$(cat "$LOCK_HOME/last-launch")" --timeout 180)"
-python3 "$CMD" --timeout 60 true > /dev/null          # log in
-python3 "$CMD" grep -E "'^(MemTotal|MemAvailable):'" /proc/meminfo > "$T/mem"
+python3 "$CMD" --timeout 60 -- true > /dev/null          # log in
+python3 "$CMD" -- "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo" > "$T/mem"
 put mem_total_kb "$(awk '/MemTotal/{print $2}' "$T/mem")"
 put mem_avail_kb "$(awk '/MemAvailable/{print $2}' "$T/mem")"
 timed first_runs_s 300 "htop --version >/dev/null; tmux -V >/dev/null; micropython -c 'print(1)' >/dev/null; lua -v >/dev/null; nano --version >/dev/null"
