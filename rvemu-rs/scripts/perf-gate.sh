@@ -59,6 +59,11 @@ python3 "$CMD" --timeout 60 -- true > /dev/null          # log in
 python3 "$CMD" -- "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo" > "$T/mem"
 put mem_total_kb "$(awk '/MemTotal/{print $2}' "$T/mem")"
 put mem_avail_kb "$(awk '/MemAvailable/{print $2}' "$T/mem")"
+# Pages parked on the per-CPU free lists are missing from MemAvailable and swing
+# it by hundreds of KiB between boots; mem_adj_kb adds them back (4 KiB pages).
+python3 "$CMD" -- "awk '/^ +count:/{s+=\$2} END{print s+0}' /proc/zoneinfo" > "$T/pcp"
+put pcp_pages "$(tr -dc 0-9 < "$T/pcp")"
+put mem_adj_kb "$(( $(awk '/MemAvailable/{print $2}' "$T/mem") + 4 * $(tr -dc 0-9 < "$T/pcp") ))"
 timed first_runs_s 300 "htop --version >/dev/null; tmux -V >/dev/null; micropython -c 'print(1)' >/dev/null; lua -v >/dev/null; nano --version >/dev/null"
 timed mpy_s 300 "micropython -c 'print(sum(i*i for i in range(30000)))'"
 timed lua_s 300 "lua -e 'local s=0 for i=1,300000 do s=s+i end print(s)'"
@@ -104,11 +109,13 @@ for k, lim in [("initramfs_ms", 3), ("boot_s", 3), ("first_runs_s", 5), ("mpy_s"
     if flag:
         fail.append(f"{k} +{d:.1f}% (limit {lim}%)")
     print(f"{k:<18}{b[k]:>12}{r[k]:>12}{d:>8.1f}%{flag}")
-if "mem_avail_kb" in b:
-    d = r["mem_avail_kb"] - b["mem_avail_kb"]
-    print(f"{'mem_avail_kb':<18}{b['mem_avail_kb']:>12}{r['mem_avail_kb']:>12}{d:>+8} KiB")
+# memory: MemAvailable plus the per-CPU free lists when both runs have it
+mk = "mem_adj_kb" if "mem_adj_kb" in b and "mem_adj_kb" in r else "mem_avail_kb"
+if mk in b:
+    d = r[mk] - b[mk]
+    print(f"{mk:<18}{b[mk]:>12}{r[mk]:>12}{d:>+8} KiB")
     if d <= -128:
-        fail.append(f"MemAvailable {d} KiB")
+        fail.append(f"{mk} {d} KiB")
 if not r.get("checksums_ok"):
     fail.append("checksum mismatch (stability)")
 print("\nperf-gate: " + ("FAIL: " + "; ".join(fail) if fail else "PASS"))

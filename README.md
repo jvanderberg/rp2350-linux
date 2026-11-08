@@ -133,7 +133,9 @@ rp2350/tools/board-lock renew NAME; rp2350/tools/board-lock release NAME
 
 It compares the results with `~/.cache/rp2350-board/perf-baseline.json` and
 fails on any slowdown over 3% (boot) or 5% (workload), on 128 KiB less
-MemAvailable, or on a checksum mismatch.
+memory (MemAvailable plus the pages parked on the per-CPU free lists, which
+otherwise swing it by hundreds of KiB between boots), or on a checksum
+mismatch.
 
 ## Flash map (16 MB)
 
