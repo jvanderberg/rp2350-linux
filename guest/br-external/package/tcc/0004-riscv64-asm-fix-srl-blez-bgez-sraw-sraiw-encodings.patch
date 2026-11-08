@@ -1,7 +1,7 @@
 From e2e9b82e62999e7e35bbfbc5652e5295601365df Mon Sep 17 00:00:00 2001
 From: Josh Vanderberg <jvanderberg@gmail.com>
 Date: Sun, 8 Nov 2026 01:03:46 -0600
-Subject: [PATCH 4/6] riscv64-asm: fix srl, blez/bgez, sraw/sraiw encodings
+Subject: [PATCH 4/7] riscv64-asm: fix srl, blez/bgez, sraw/sraiw encodings
 
 srl was assembled as xor, blez and bgez had their operands swapped, and
 sraw/sraiw lacked bit 30 (they were srlw/srliw). Checked against llvm-mc

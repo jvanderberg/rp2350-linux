@@ -78,13 +78,22 @@ links on the guest: `cc hello.c && ./a.out`, `cc -run hello.c`, `cc -c`,
   image in a `ROOTFS_PRE_CMD_HOOK`.
 - **Linking:** dynamic, against `/lib/ld-musl-riscv32-sf.so.1`. There is
   no `libc.a`, so no `-static`.
+- **Memory:** compiling a file takes 0.9–2.8 MB, against about 3.7 MB
+  available after login. With no swap, a compile that took the last of it
+  would evict the page cache that holds every program's code and stall the
+  guest for minutes. So unless `RLIMIT_DATA` is set, tcc limits its own data
+  to MemAvailable less 768 kB, and a compile that is too big stops with
+  "memory full". Larger programs build one file at a time (`cc -c`).
 - **Size:** 704 KiB of squashfs.
-- **Tests:** `br-external/package/tcc/test/board-test.sh [selfhost]` copies
-  the tests to the board over the console and runs them (`run.sh`). The
+- **Tests:** `br-external/package/tcc/test/board-test.sh` copies the tests
+  to the board over the console (`push.py`) and runs them (`run.sh`). The
   tests cover long long, float and double, structs by value, varargs,
   function pointers, a static library, kernel headers and an arithmetic
-  hash that must match a native build. `selfhost` has tcc build itself
-  twice, and the two builds must be identical.
+  hash that must match a native build. On the board, each compiles in
+  0.2–3.1 s. `run.sh selfhost` adds a stress case for the emulator only
+  (QEMU and the translator, `-m 11`). tcc builds itself from its sources
+  one file at a time, then builds itself again with the result, and the
+  two binaries must be identical.
 
 Kernel options of note in `linux-disk.fragment`:
 

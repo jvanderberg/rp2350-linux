@@ -1,0 +1,79 @@
+From ab20d9fdc25c48af221cd22339c6216cc7b54e91 Mon Sep 17 00:00:00 2001
+From: Josh Vanderberg <jvanderberg@gmail.com>
+Date: Sun, 8 Nov 2026 04:49:40 -0600
+Subject: [PATCH 7/7] tcc (native riscv32 Linux): limit its data to
+ MemAvailable less a page-cache reserve
+
+Without swap, a compile that takes the last of the RAM evicts the page
+cache that every program's code lives in, and the guest thrashes for
+minutes instead of failing. With RLIMIT_DATA unset, tcc now caps its own
+data so it stops with 'memory full' while 768 kB of cache remain.
+---
+ tcc.c | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/tcc.c b/tcc.c
+index 5a904014..69c5a450 100644
+--- a/tcc.c
++++ b/tcc.c
+@@ -288,6 +288,49 @@ static unsigned getclock_ms(void)
+ #endif
+ }
+ 
++#if defined TCC_TARGET_RISCV32 && defined TCC_IS_NATIVE && defined __linux__
++#include <sys/resource.h>
++
++/* kB of a "Name:  N kB" line in a /proc file, or -1 */
++static long proc_kb(const char *file, const char *name)
++{
++    char line[128];
++    long kb = -1;
++    size_t n = strlen(name);
++    FILE *f = fopen(file, "r");
++    if (!f)
++        return -1;
++    while (fgets(line, sizeof line, f))
++        if (!strncmp(line, name, n) && line[n] == ':') {
++            kb = atol(line + n + 1);
++            break;
++        }
++    fclose(f);
++    return kb;
++}
++
++/* On a machine with a few MB of RAM and no swap, a compile that takes the
++   last of it does not fail: it evicts the page cache that every program's
++   code is in, and the whole system thrashes for minutes. Unless a limit is
++   set already, keep tcc's data (heap and anonymous mappings) to what is
++   available with some page cache left, so it stops with "memory full". */
++#define TCC_PAGE_CACHE_RESERVE_KB 768
++static void limit_data(void)
++{
++    struct rlimit rl;
++    long avail = proc_kb("/proc/meminfo", "MemAvailable");
++    long data = proc_kb("/proc/self/status", "VmData");
++    if (avail < 0 || data < 0 || getrlimit(RLIMIT_DATA, &rl)
++        || rl.rlim_cur != RLIM_INFINITY)
++        return;
++    avail -= TCC_PAGE_CACHE_RESERVE_KB;
++    rl.rlim_cur = (rlim_t)(data + (avail > 1024 ? avail : 1024)) * 1024;
++    setrlimit(RLIMIT_DATA, &rl);
++}
++#else
++static void limit_data(void) {}
++#endif
++
+ int main(int argc, char **argv)
+ {
+     TCCState *s, *s1;
+@@ -298,6 +341,7 @@ int main(int argc, char **argv)
+     char **argv0 = argv;
+     FILE *ppfp = NULL;
+ 
++    limit_data();
+ redo:
+     argc = argc0, argv = argv0;
+     s = s1 = tcc_new();
+-- 
+2.38.1
+

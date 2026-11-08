@@ -1,9 +1,10 @@
 #!/bin/sh
 # run.sh [selfhost]: run in the guest, from a copy of this directory.
 # Compiles and runs each test with the guest's cc and compares the output
-# with NAME.expect (made by a native compiler). With "selfhost", tcc's
-# source in ./tcc-src is built by cc, and then by that tcc, and the two
-# binaries must be identical. Prints wall times and peak memory (VmHWM).
+# with NAME.expect (made by a native compiler). With "selfhost" (a stress
+# case for the emulator, emu-selfhost.sh), tcc's source in ./tcc-src.tgz is
+# built by cc, and then by that tcc, and the two binaries must be identical.
+# Prints wall times and peak memory (VmHWM).
 cd "$(dirname "$0")" || exit 1
 pass=0 fail=0
 

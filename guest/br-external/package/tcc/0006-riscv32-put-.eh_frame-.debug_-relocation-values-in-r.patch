@@ -1,7 +1,7 @@
 From 4f0d228b68940170da15b836b7309047d17e0165 Mon Sep 17 00:00:00 2001
 From: Josh Vanderberg <jvanderberg@gmail.com>
 Date: Sun, 8 Nov 2026 01:19:56 -0600
-Subject: [PATCH 6/6] riscv32: put .eh_frame/.debug_* relocation values in
+Subject: [PATCH 6/7] riscv32: put .eh_frame/.debug_* relocation values in
  r_addend in objects
 
 tccdbg leaves them in the data, which tcc's linker adds; GNU ld uses

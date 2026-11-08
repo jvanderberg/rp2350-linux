@@ -1,7 +1,7 @@
 From cbd9aa0f4dfa595a1eb6f46f31ddaf88b6e028a3 Mon Sep 17 00:00:00 2001
 From: Josh Vanderberg <jvanderberg@gmail.com>
 Date: Sun, 8 Nov 2026 00:35:22 -0600
-Subject: [PATCH 1/6] Add a riscv32 target (rv32ima, ilp32, soft float)
+Subject: [PATCH 1/7] Add a riscv32 target (rv32ima, ilp32, soft float)
 
 riscv32-gen.c is a code generator for rv32ima with the ilp32 ABI: long
 long in register pairs, float and double in integer registers with the
