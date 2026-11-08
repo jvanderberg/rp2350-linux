@@ -11,6 +11,7 @@ pub mod cpu;
 pub mod dev;
 pub mod instrument;
 mod mmu;
+pub mod nor;
 mod sbi;
 pub mod virtio;
 
