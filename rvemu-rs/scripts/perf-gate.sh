@@ -26,6 +26,15 @@ cd "$(dirname "$0")/.."
 LABEL=""; SET=0; SKIP_BENCH=0
 while getopts "n:sB" o; do case $o in n) LABEL=$OPTARG;; s) SET=1;; B) SKIP_BENCH=1;; *) exit 2;; esac; done
 G=target/perf-gate; mkdir -p "$G/boot-logs"
+if [ "$SET" = 0 ]; then
+  python3 - "$G" <<'P'
+import sys
+from pathlib import Path
+sys.path.insert(0, '../scripts')
+from provenance import validate_baseline
+validate_baseline(Path(sys.argv[1]))
+P
+fi
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 CMD=../rp2350/tools/board-cmd.py
 now() { python3 -c 'import time; print(f"{time.time():.3f}")'; }
@@ -104,7 +113,11 @@ if ! diff <(tr -d '\r' < "$T/md5_all_s.out") "$T/manifest" > "$T/md5.diff"; then
   echo "perf-gate: CHECKSUM MISMATCH (all files) -- possible memory corruption:"; head -20 "$T/md5.diff"; ok=0
 fi
 put checksums_ok $ok
-[ $SET = 0 ] || cp "$FIXED" "$G/md5-files.list"
+if [ "$SET" = 1 ]; then
+  [ "$ok" = 1 ] || { echo 'perf-gate: refusing a baseline with checksum failures' >&2; exit 1; }
+  rm -f "$G/baseline-provenance.json"
+  cp "$FIXED" "$G/md5-files.list"
+fi
 
 python3 - "$R" "$G" "$LABEL" "$SET" <<'P'
 import json, subprocess, sys, time, os
@@ -154,3 +167,7 @@ if not r.get("checksums_ok"):
 print("\nperf-gate: " + ("FAIL: " + "; ".join(fail) if fail else "PASS"))
 sys.exit(1 if fail else 0)
 P
+# Keep the environment and guest hashes with an explicitly established baseline.
+if [ "$SET" = 1 ]; then
+  python3 ../scripts/provenance.py --stage board-baseline --output "$G/baseline-provenance.json"
+fi

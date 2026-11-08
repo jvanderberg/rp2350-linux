@@ -17,3 +17,7 @@ build/
 *.swp
 *~
 __pycache__/
+
+/rvemu/rvemu
+
+/.cache/

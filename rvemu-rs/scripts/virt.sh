@@ -14,12 +14,20 @@ while getopts "k:i:d:Dm:u:n:a:Ic" o; do case $o in
   c) ICOUNT=(-icount "shift=0,align=off,sleep=off");; *) exit 2;; esac; done
 case $MODE in interp) MN=0;; jit) MN=1;; lockstep) MN=2;; *) echo "bad mode"; exit 2;; esac
 
+. ../scripts/preflight.sh
+for tool in cargo python3 dtc qemu-system-riscv32; do need_tool "$tool" 'See docs/development.md.'; done
+need_target riscv32imac-unknown-none-elf
+need_file "$K" 'Run: (cd ../guest && ./run-build.sh all), or disk for -D.'
+[ "$I" = none ] || need_file "$I" 'Run: (cd ../guest && ./run-build.sh all)'
+[ -z "$D" ] || need_file "$D" 'Run: (cd ../guest && ./run-build.sh disk)'
+file_size() { python3 -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "$1"; }
+
 # The frontend feature also reserves native workspace memory.
 RVEMU_FEATURES=${RVEMU_FEATURES:-}
 RVEMU_FEATURES=${RVEMU_FEATURES//rvcore\/pv-buffers/pv-buffers}
 FEATURES=(); [ -n "${RVEMU_FEATURES:-}" ] && FEATURES=(--features "$RVEMU_FEATURES")
-cargo build -q --release -p rvemu "${FEATURES[@]}"
-cargo build -q --release -p rvemu-virt --target riscv32imac-unknown-none-elf "${FEATURES[@]}"
+cargo build --locked -q --release -p rvemu "${FEATURES[@]}"
+cargo build --locked -q --release -p rvemu-virt --target riscv32imac-unknown-none-elf "${FEATURES[@]}"
 ELF=target/riscv32imac-unknown-none-elf/release/rvemu-virt
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
@@ -28,7 +36,7 @@ INITRD_ARGS=(); [ "$I" != none ] && INITRD_ARGS=(-i "$I")
 [ -n "$D" ] && INITRD_ARGS+=(-d "$D")
 [ -n "$A" ] && INITRD_ARGS+=(-a "$A")
 ./target/release/rvemu -D -m "$M" "${INITRD_ARGS[@]}" > "$T/guest.dts"
-DLEN=0; [ -n "$D" ] && DLEN=$(stat -f%z "$D")
+DLEN=0; [ -n "$D" ] && DLEN=$(file_size "$D")
 dtc -q -I dts -O dtb -o "$T/guest.dtb" "$T/guest.dts"
 python3 - "$T/info.bin" "$MN" "$M" "$N" "$BATCH" "$U" "$DLEN" <<'P'
 import struct, sys
@@ -39,14 +47,14 @@ RAM=$((M << 20)); BASE=$((0x81000000))
 DTB_ADDR=$((RAM - 0x10000))
 LOADERS=()
 if [ "$I" != none ]; then
-  ISZ=$(stat -f%z "$I")
+  ISZ=$(file_size "$I")
   INITRD_ADDR=$(( (DTB_ADDR - ISZ) & ~0xFFF ))
 fi
 hex() { printf "0x%x" "$1"; }
 [ "$I" != none ] && LOADERS=(-device "loader,file=$I,addr=$(hex $((BASE + INITRD_ADDR))),force-raw=on")
 [ -n "$D" ] && LOADERS+=(-device "loader,file=$D,addr=0x8a000000,force-raw=on")
 
-exec qemu-system-riscv32 -machine virt -bios none -m 256M -nographic -monitor none -serial stdio \
+qemu-system-riscv32 -machine virt -bios none -m 256M -nographic -monitor none -serial stdio \
   "${ICOUNT[@]}" \
   -kernel "$ELF" \
   -device "loader,file=$K,addr=$(hex $BASE),force-raw=on" \
