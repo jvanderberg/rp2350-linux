@@ -93,11 +93,15 @@ counters.
 - **Linking.** Blocks are keyed by (virtual pc, physical pc) and never cross a
   page. Same-page exits are chained by patching a `jal`. Other jumps use an
   inline jump cache, validated against the fetch TLB.
-- **Code cache.** When the code buffer is full it is either flushed
-  (`regions = 1`) or used as a ring of equal regions. Moving on to the next
-  region evicts the blocks in it, which are the oldest. Chains from a newer
-  region into an older one are logged, and reset when that older region is
-  evicted.
+- **Code cache.** Each block's descriptor (hash-chain link, physical and
+  virtual pc) is a header in front of its code, so the code buffer is the
+  only limit on how many blocks are live. When the buffer is full it is
+  either flushed (`regions = 1`) or used as a ring of equal regions. Moving
+  on to the next region evicts the blocks in it, which are the oldest: they
+  are the tail of every hash chain, so each chain is cut at the first one.
+  Chains from a newer region into an older one are logged, and reset when
+  that older region is evicted. Blocks whose first instruction needs the
+  interpreter are not kept.
 - **Self-modifying code.** Pages with translations never get write-TLB
   entries. A store to one reaches the interpreter, and that page's blocks
   are dropped.
@@ -131,7 +135,8 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
 
 - **Memory.** Guest RAM is the 8 MB PSRAM, preceded by the kernel text in
   flash (`guest_blob.rs`; flash map in the top-level README). The translator
-  has a 320 KiB code cache in SRAM: 4,096 blocks in a ring of 8 regions. It
+  has a 384 KiB code cache in SRAM (`CODE_KIB` in `shell.rs`), in a ring of
+  8 regions. It
   has no PSRAM backing store, because that traffic would share the 16 KB XIP
   cache with guest RAM.
 - **Console.** Output waits in a 16 KB ring (a static) while no terminal is

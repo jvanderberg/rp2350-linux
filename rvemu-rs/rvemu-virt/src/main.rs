@@ -14,7 +14,7 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use rvcore::dev::{Console, Platform};
 use rvcore::virtio::{GuestMem, MemDisk};
 use rvcore::{Bus, Cpu, Halt};
-use rvjit::{Block, Event, JcEntry, Jit, JitMem};
+use rvjit::{Event, JcEntry, Jit, JitMem};
 
 core::arch::global_asm!(
     r#"
@@ -260,7 +260,6 @@ const CODE_KB: usize = match option_env!("RVEMU_CODE_KB") {
     None => 1024,
 };
 const CODE_WORDS: usize = CODE_KB * 256;
-const NBLOCKS: usize = 128 * 1024;
 const NBUCKETS: usize = 16 * 1024;
 
 const fn parse_usize(s: &str) -> usize {
@@ -276,7 +275,6 @@ const fn parse_usize(s: &str) -> usize {
 }
 
 static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
-static mut BLOCKS: [Block; NBLOCKS] = [Block::EMPTY; NBLOCKS];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
 static mut CODE_PAGES: [u8; 2048] = [0; 2048];
 /// Jump-cache entries: 4096, or RVEMU_NJC at build time (rvemu-pico uses 1024).
@@ -387,7 +385,6 @@ extern "C" fn main() -> ! {
                     JitMem {
                         code: &mut *addr_of_mut!(CODE),
                         buckets: &mut *addr_of_mut!(BUCKETS),
-                        blocks: &mut *addr_of_mut!(BLOCKS),
                         code_pages: &mut *addr_of_mut!(CODE_PAGES),
                         jump_cache: &mut *addr_of_mut!(JUMP_CACHE),
                         regions: REGIONS,

@@ -35,7 +35,9 @@
 //! When the code buffer is full it is either flushed (`regions` = 1) or used
 //! as a ring of `regions` equal parts: blocks fill one region after another,
 //! and moving on to the next region evicts the blocks it holds, the oldest.
-//! Block descriptors are a ring in the same order. A chain from a block into
+//! Each block's descriptor (hash-chain link, physical and virtual pc) is a
+//! header in the code buffer in front of its code, so the buffer has no
+//! separate block limit. A chain from a block into
 //! an older region is logged in that region's `chain_log` and reset to a
 //! chain request when the region is evicted; chains into the same or a newer
 //! region need nothing, because the source is evicted first.
@@ -82,9 +84,14 @@ pub const EXIT_INTERP: u32 = 1; // interpret the instruction at exit_pc
 pub const EXIT_BUDGET: u32 = 2; // budget exhausted before the block ran
 pub const EXIT_MEM: u32 = 3; // info = 3 + the return address of a `jal K3` site
 
-/// Words from a block's header (its guest pc) to its entry point: the header,
-/// then the `jal K1, budget_exit` the budget check branches back to.
-const ENTRY_OFF: usize = 2;
+/// A block in the code buffer: a header of `HDR_NEXT` (the next block in its
+/// hash chain, as the word index of its header, or EMPTY), `HDR_PA` (its
+/// physical pc) and `HDR_VA` (its virtual pc), then `jal K1, budget_exit`,
+/// then the entry point (`ENTRY_OFF`).
+const HDR_NEXT: usize = 0;
+const HDR_PA: usize = 1;
+const HDR_VA: usize = 2;
+const ENTRY_OFF: usize = 4;
 
 pub const MAX_BLOCK: usize = 32;
 /// Most code-buffer regions (`JitMem::regions`).
@@ -118,19 +125,6 @@ const fn off_tlb_cur(acc: usize) -> i32 {
     (offset_of!(Cpu, jit) + offset_of!(JitRegs, tlb_cur) + acc * core::mem::size_of::<usize>()) as i32
 }
 const OFF_ADDEND: i32 = offset_of!(TlbEntry, addend) as i32;
-
-#[derive(Clone, Copy)]
-pub struct Block {
-    pub va: u32,
-    pub pa: u32,
-    /// Word index of the code, or NO_CODE for "always interpret".
-    pub code: u32,
-    pub next: u32,
-}
-
-impl Block {
-    pub const EMPTY: Block = Block { va: 0, pa: 0, code: NO_CODE, next: EMPTY };
-}
 
 #[derive(Clone, Copy)]
 pub struct JitStats {
@@ -377,10 +371,10 @@ pub enum Event {
 
 /// Memory the translator works in, supplied by the platform.
 pub struct JitMem<'m> {
+    /// Translated code, block headers included.
     pub code: &'m mut [u32],
-    /// Power of two.
+    /// Hash chains of blocks. Power of two.
     pub buckets: &'m mut [u32],
-    pub blocks: &'m mut [Block],
     /// One bit per RAM page.
     pub code_pages: &'m mut [u8],
     /// Power of two.
@@ -408,10 +402,6 @@ pub struct Jit<'m> {
     enter: usize,
     buckets: &'m mut [u32],
     bucket_shift: u32,
-    blocks: &'m mut [Block],
-    /// descriptor ring: oldest live descriptor, live count
-    bhead: usize,
-    nblocks: usize,
     code_pages: &'m mut [u8],
     ring: Ring<'m>,
     store: Store<'m>,
@@ -456,8 +446,6 @@ struct Ring<'m> {
     /// allocation sequence of each region (0 = empty)
     seq: [u32; MAX_REGIONS],
     seq_next: u32,
-    /// descriptors per region (they are contiguous in the descriptor ring)
-    nblk: [u32; MAX_REGIONS],
     log: &'m mut [u32],
     log_per: usize,
     nlog: [u32; MAX_REGIONS],
@@ -521,9 +509,6 @@ impl<'m> Jit<'m> {
             enter: 0,
             buckets: mem.buckets,
             bucket_shift,
-            blocks: mem.blocks,
-            bhead: 0,
-            nblocks: 0,
             code_pages: mem.code_pages,
             ring: Ring {
                 regions: mem.regions,
@@ -531,7 +516,6 @@ impl<'m> Jit<'m> {
                 cur: 0,
                 seq: [0; MAX_REGIONS],
                 seq_next: 1,
-                nblk: [0; MAX_REGIONS],
                 log: mem.chain_log,
                 log_per,
                 nlog: [0; MAX_REGIONS],
@@ -706,8 +690,6 @@ impl<'m> Jit<'m> {
 
     fn reset_tables(&mut self) {
         self.buckets.fill(EMPTY);
-        self.bhead = 0;
-        self.nblocks = 0;
         // with a backing store, pages keep their write protection: stored
         // blocks from them must still see stores to them
         if self.store.nidx == 0 {
@@ -721,7 +703,6 @@ impl<'m> Jit<'m> {
         g.seq = [0; MAX_REGIONS];
         g.seq[0] = g.seq_next;
         g.seq_next += 1;
-        g.nblk = [0; MAX_REGIONS];
         g.nlog = [0; MAX_REGIONS];
     }
 
@@ -735,13 +716,13 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn make_room(&mut self, need: usize) {
         if self.ring.regions == 1 {
-            if self.pos + need > self.code.len() || self.nblocks == self.blocks.len() {
+            if self.pos + need > self.code.len() {
                 self.flush();
             }
             return;
         }
         let end = self.code_start + (self.ring.cur + 1) * self.ring.region_words;
-        if self.pos + need <= end && self.nblocks < self.blocks.len() {
+        if self.pos + need <= end {
             return;
         }
         let next = (self.ring.cur + 1) % self.ring.regions;
@@ -753,40 +734,39 @@ impl<'m> Jit<'m> {
         self.pos = self.code_start + next * self.ring.region_words;
         self.generation = self.generation.wrapping_add(1);
         self.stats.evictions += 1;
-        if self.nblocks == self.blocks.len() {
-            // one region holds every descriptor (no-code blocks)
-            self.flush();
-        }
     }
 
-    /// Drop region `r`'s blocks: descriptors out of the hash table, logged
-    /// chains into it back to chain requests, jump-cache entries into it.
+    /// Drop region `r`'s blocks: out of the hash chains, logged chains into
+    /// it back to chain requests, jump-cache entries into it.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn evict_region(&mut self, r: usize) {
-        let nb = self.ring.nblk[r] as usize;
-        for k in 0..nb {
-            let d = (self.bhead + k) % self.blocks.len();
-            let (va, pa) = (self.blocks[d].va, self.blocks[d].pa);
-            let h = self.hash(va, pa);
-            let mut prev = EMPTY;
+        // Chains are newest first, and `r` is the oldest region still
+        // holding blocks, so its blocks are the tail of every chain: cut
+        // each chain at the first one.
+        let lo = (self.code_start + r * self.ring.region_words) as u32;
+        let hi = lo + self.ring.region_words as u32;
+        let inr = |i: u32| i.wrapping_sub(lo) < hi - lo;
+        for h in 0..self.buckets.len() {
             let mut i = self.buckets[h];
-            while i != EMPTY {
-                let next = self.blocks[i as usize].next;
-                if i as usize == d {
-                    if prev == EMPTY {
-                        self.buckets[h] = next;
-                    } else {
-                        self.blocks[prev as usize].next = next;
-                    }
+            if i == EMPTY {
+                continue;
+            }
+            if inr(i) {
+                self.buckets[h] = EMPTY;
+                continue;
+            }
+            loop {
+                let next = self.code[i as usize + HDR_NEXT];
+                if next == EMPTY {
                     break;
                 }
-                prev = i;
+                if inr(next) {
+                    self.code[i as usize + HDR_NEXT] = EMPTY;
+                    break;
+                }
                 i = next;
             }
         }
-        self.bhead = (self.bhead + nb) % self.blocks.len();
-        self.nblocks -= nb;
-        self.ring.nblk[r] = 0;
         let base = r * self.ring.log_per;
         for k in 0..self.ring.nlog[r] as usize {
             let slot = self.ring.log[base + k] as usize;
@@ -794,8 +774,7 @@ impl<'m> Jit<'m> {
         }
         self.ring.nlog[r] = 0;
         self.ring.seq[r] = 0;
-        let lo = self.code_addr((self.code_start + r * self.ring.region_words) as u32) as u32;
-        let hi = lo + (self.ring.region_words * 4) as u32;
+        let (lo, hi) = (self.code_addr(lo) as u32, self.code_addr(hi) as u32);
         for e in self.jc.iter_mut() {
             if e.code >= lo && e.code < hi {
                 *e = JcEntry::EMPTY;
@@ -815,41 +794,42 @@ impl<'m> Jit<'m> {
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    /// Entry point (code word index) of block (va, pa).
     fn lookup(&self, va: u32, pa: u32) -> Option<u32> {
         let mut i = self.buckets[self.hash(va, pa)];
         while i != EMPTY {
-            let b = &self.blocks[i as usize];
-            if b.va == va && b.pa == pa {
-                return Some(b.code);
+            let h = i as usize;
+            if self.code[h + HDR_VA] == va && self.code[h + HDR_PA] == pa {
+                return Some((h + ENTRY_OFF) as u32);
             }
-            i = b.next;
+            i = self.code[h + HDR_NEXT];
         }
         None
     }
 
+    /// Fill in the header at word `h` and put the block in its hash chain.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    fn insert(&mut self, va: u32, pa: u32, code: u32) {
-        let h = self.hash(va, pa);
-        let i = (self.bhead + self.nblocks) % self.blocks.len();
-        self.blocks[i] = Block { va, pa, code, next: self.buckets[h] };
-        self.buckets[h] = i as u32;
-        self.nblocks += 1;
-        self.ring.nblk[self.ring.cur] += 1;
+    fn insert(&mut self, va: u32, pa: u32, h: usize) {
+        let b = self.hash(va, pa);
+        self.code[h + HDR_NEXT] = self.buckets[b];
+        self.code[h + HDR_PA] = pa;
+        self.code[h + HDR_VA] = va;
+        self.buckets[b] = h as u32;
     }
 
     /// Drop every block translated from physical page `ppage`.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn invalidate_page(&mut self, cpu: &Cpu, ppage: u32) {
-        for h in 0..self.buckets.len() {
+        for b in 0..self.buckets.len() {
             let mut prev = EMPTY;
-            let mut i = self.buckets[h];
+            let mut i = self.buckets[b];
             while i != EMPTY {
-                let next = self.blocks[i as usize].next;
-                if self.blocks[i as usize].pa & !0xFFF == ppage {
+                let next = self.code[i as usize + HDR_NEXT];
+                if self.code[i as usize + HDR_PA] & !0xFFF == ppage {
                     if prev == EMPTY {
-                        self.buckets[h] = next;
+                        self.buckets[b] = next;
                     } else {
-                        self.blocks[prev as usize].next = next;
+                        self.code[prev as usize + HDR_NEXT] = next;
                     }
                 } else {
                     prev = i;
@@ -1002,7 +982,7 @@ impl<'m> Jit<'m> {
         // re-point the jals into the shared routines, stepping over the
         // data word after a chain / jump / interp request
         let r = self.r;
-        let mut i = 1;
+        let mut i = HDR_VA + 1;
         while i < words {
             let w = self.code[at + i];
             i += 1;
@@ -1024,7 +1004,7 @@ impl<'m> Jit<'m> {
         fence_i();
         self.stats.restores += 1;
         self.stats.restore_words += words as u64;
-        self.insert(va, pa, (at + ENTRY_OFF) as u32);
+        self.insert(va, pa, at);
         (at + ENTRY_OFF) as u32
     }
 
@@ -1034,13 +1014,14 @@ impl<'m> Jit<'m> {
         let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0);
         let pc = pc0.wrapping_add(4 * n as u32);
 
+        // (no-code blocks are not kept: scanning one instruction again is
+        // about as cheap as looking it up)
+        if n == 0 {
+            return NO_CODE;
+        }
         // room for the worst case (measuring never keeps the block)
         if !self.measure_only {
-            self.make_room(n * 12 + 16);
-        }
-        if n == 0 {
-            self.insert(pc0, pa0, NO_CODE);
-            return NO_CODE;
+            self.make_room(n * 12 + 16 + ENTRY_OFF);
         }
         if !self.measure_only {
             self.mark_code_page(cpu, pa0);
@@ -1059,7 +1040,10 @@ impl<'m> Jit<'m> {
 
         // header word (guest pc), the budget exit, then the entry point:
         // `addi KB, KB, -n; blt KB, zero, <the budget exit>`
-        let header = a.emit(pc0);
+        let header = a.pos();
+        a.emit(EMPTY); // HDR_NEXT, HDR_PA: filled in by `insert`
+        a.emit(pa0);
+        a.emit(pc0);
         call!(K1, r.budget_exit);
         let start = a.pos();
         a.addi(KB, KB, -(n as i32));
@@ -1281,7 +1265,7 @@ impl<'m> Jit<'m> {
         self.stats.blocks += 1;
         self.stats.guest_insns_translated += n as u64;
         self.stats.code_words += (end - header) as u64;
-        self.insert(pc0, pa0, start as u32);
+        self.insert(pc0, pa0, header);
         start as u32
     }
 
@@ -1512,7 +1496,7 @@ impl<'m> Jit<'m> {
         if sc.n == 0 {
             return (BlockInfo { n: 0, words: 0, end }, &[], self.pos);
         }
-        let (pos, nblocks, nblk) = (self.pos, self.nblocks, self.ring.nblk);
+        let pos = self.pos;
         let h = self.hash(va, pa);
         let head = self.buckets[h];
         let stats = self.stats;
@@ -1521,8 +1505,6 @@ impl<'m> Jit<'m> {
         self.measure_only = false;
         let words = (self.pos - pos) as u32;
         self.pos = pos;
-        self.nblocks = nblocks;
-        self.ring.nblk = nblk;
         self.buckets[h] = head;
         self.stats = stats;
         (BlockInfo { n: sc.n as u32, words, end }, &self.code[pos..pos + words as usize], pos)
@@ -1541,8 +1523,5 @@ impl<'m> Jit<'m> {
 
     pub fn code_words_used(&self) -> usize {
         self.pos - self.code_start
-    }
-    pub fn blocks_live(&self) -> usize {
-        self.nblocks
     }
 }

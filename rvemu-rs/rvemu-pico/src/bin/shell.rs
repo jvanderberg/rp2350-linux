@@ -32,7 +32,7 @@ use rtt_target::{ChannelMode, rprintln, rtt_init_print};
 use rvcore::dev::{Console, Platform};
 use rvcore::virtio::{Disk as _, GuestMem, MemDisk};
 use rvcore::{Bus, Cpu, Halt, TIMEBASE_HZ};
-use rvjit::{Block, JcEntry, Jit, JitMem};
+use rvjit::{JcEntry, Jit, JitMem};
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
@@ -82,10 +82,10 @@ fn flash_disk() -> Option<MemDisk> {
 
 // ------------------------------------------------------------------ translator storage (SRAM)
 
-/// 320 KiB: what the SRAM holds without the lockstep reference CPU and with
-/// a small stack (the cache-policy simulator's `flush320`).
-const CODE_WORDS: usize = 80 * 1024;
-const NBLOCKS: usize = 4096;
+/// Translated code and its block headers: 384 KiB, what the SRAM holds with
+/// a 32 KiB stack. Whatever else needs SRAM comes out of this.
+const CODE_KIB: usize = 384;
+const CODE_WORDS: usize = CODE_KIB * 256;
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
 /// Ring of 8 regions (simulator: 7.9 s to login: against 8.8 s flush-all);
@@ -93,7 +93,6 @@ const NJC: usize = 1024;
 const REGIONS: usize = 8;
 
 static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
-static mut BLOCKS: [Block; NBLOCKS] = [Block::EMPTY; NBLOCKS];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
 /// Guest RAM as Linux sees it, at most: flash-backed kernel text + PSRAM.
 const GUEST_MAX: u32 = RAM_MAX + guest_blob::TEXT_MAX;
@@ -386,7 +385,6 @@ fn main() -> ! {
             JitMem {
                 code: &mut *addr_of_mut!(CODE),
                 buckets: &mut *addr_of_mut!(BUCKETS),
-                blocks: &mut *addr_of_mut!(BLOCKS),
                 code_pages: &mut *addr_of_mut!(CODE_PAGES),
                 jump_cache: &mut *addr_of_mut!(JUMP_CACHE),
                 regions: REGIONS,
