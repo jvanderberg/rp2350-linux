@@ -24,6 +24,7 @@
 #define RS_GO		0x18
 #define MODE_BITS	(SPI_CPHA | SPI_CPOL | SPI_LSB_FIRST)
 #define MAX_HZ		50000000
+#define MIN_HZ		100000	/* SPI_MIN_HZ: the emulator waits out each transfer */
 
 struct rvemu_spi {
 	void __iomem *base;
@@ -91,6 +92,7 @@ static int rvemu_spi_probe(struct platform_device *pdev)
 	host->mode_bits = MODE_BITS;
 	host->bits_per_word_mask = SPI_BPW_MASK(8);
 	host->max_speed_hz = MAX_HZ;
+	host->min_speed_hz = MIN_HZ;
 	host->transfer = rs_transfer;
 	return devm_spi_register_controller(&pdev->dev, host);
 }

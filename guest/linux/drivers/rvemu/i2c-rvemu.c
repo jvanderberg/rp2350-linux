@@ -4,8 +4,9 @@
  * of the RP2350's I2C blocks. The emulator runs a whole transfer while the
  * driver writes NMSGS: it reads the message table at MSGS (guest physical),
  * moves the data to and from the buffers it names, and leaves the number of
- * messages done in RESULT (bit 31: the address was not acknowledged). No
- * interrupts, no queues.
+ * messages done in RESULT (bit 31: the address was not acknowledged; bit 30:
+ * the bus stayed busy, and the emulator gave up on it). No interrupts, no
+ * queues.
  */
 #include <linux/i2c.h>
 #include <linux/io.h>
@@ -18,6 +19,7 @@
 #define RI_NMSGS	0x04
 #define RI_RESULT	0x08
 #define  RESULT_NACK	BIT(31)
+#define  RESULT_TIMEOUT	BIT(30)
 #define  RESULT_DONE	0xff
 #define MAX_MSGS	16
 
@@ -63,7 +65,14 @@ static int ri_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 	writel(virt_to_phys(tab), ri->base + RI_MSGS);
 	writel(num, ri->base + RI_NMSGS);
 	r = readl(ri->base + RI_RESULT);
-	ret = (r & RESULT_DONE) == num ? num : r & RESULT_NACK ? -ENXIO : -EIO;
+	if ((r & RESULT_DONE) == num)
+		ret = num;
+	else if (r & RESULT_NACK)
+		ret = -ENXIO;
+	else if (r & RESULT_TIMEOUT)
+		ret = -ETIMEDOUT;
+	else
+		ret = -EIO;
 out:
 	for (i = 0; i < num; i++)
 		i2c_put_dma_safe_msg_buf(bufs[i], &msgs[i], ret == num);

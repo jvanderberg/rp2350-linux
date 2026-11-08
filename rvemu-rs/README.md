@@ -179,13 +179,18 @@ map is in the top-level README.
   latch in IO_BANK0's raw interrupt registers. The device poll reads them
   only when the IO_IRQ_BANK0 line is pending (one Xh3irq CSR read); that
   interrupt is never taken.
-- **I2C.** `hal::I2C` at 100 kHz with the pads' pull-ups. The controller
-  can't send an address without data, so a zero-length write (i2cdetect's
-  probe) becomes a one-byte read. rp235x-hal 0.4 reports no NACK for a
-  write short enough to fit the FIFO, so the firmware reads the abort
-  status after each transaction.
-- **SPI.** `hal::spi::Spi`, 8-bit frames; the clock rate and mode change
-  per transfer. Chip select GP17 is a GPIO, held for the whole message.
+- **I2C.** 100 kHz with the pads' pull-ups. `hal::I2C` sets the
+  controllers up; the transfers run on their registers (one byte in flight,
+  as the pico-sdk does), because the HAL's waits have no time limit. Each
+  byte and the STOP get 5 ms. Past that the transfer is aborted, a device
+  still holding SDA low gets up to 9 SCL pulses and a STOP, and the guest's
+  transfer fails with `-ETIMEDOUT`: a stuck bus can't stop the emulator.
+  The controller can't send an address without data, so a zero-length
+  write (i2cdetect's probe) becomes a one-byte read.
+- **SPI.** `hal::spi::Spi`, 8-bit frames; the clock rate (100 kHz to
+  50 MHz) and mode change per transfer. The controller makes the clock, so
+  no device can hold a transfer up; the 100 kHz floor bounds the longest
+  one (4 KiB, spidev's buffer) to about 0.3 s. Chip select GP17 is a GPIO, held for the whole message.
 - **PWM.** The slice and channel that reach the pin, with the divider and
   TOP worked out from the period. A slice's period can't change while
   another of its pins is running.

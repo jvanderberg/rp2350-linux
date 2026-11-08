@@ -4,7 +4,10 @@
 //!   Edges latch in IO_BANK0's raw interrupt registers; the device poll
 //!   looks at them only when the IO_IRQ_BANK0 line is pending (one CSR
 //!   read), and the interrupt itself is never taken.
-//! - I2C0 on GP4/GP5 and I2C1 on GP6/GP7, 100 kHz, internal pull-ups.
+//! - I2C0 on GP4/GP5 and I2C1 on GP6/GP7, 100 kHz, internal pull-ups. The
+//!   HAL sets the controllers up; transfers run in `i2c_run`, on their
+//!   registers, because the HAL's own waits have no time limit and a device
+//!   holding SCL or SDA low would stop the emulator for good.
 //! - SPI0: GP16 RX (MISO), GP17 chip select (driven as a GPIO), GP18 SCK,
 //!   GP19 TX (MOSI).
 //! - PWM: the slice and channel that can reach the pin (`periph::pwm_slice`).
@@ -17,7 +20,6 @@
 //! HAL's own conversion does).
 
 use embedded_hal::digital::{InputPin as _, OutputPin as _};
-use embedded_hal::i2c::Operation;
 use embedded_hal::spi::{MODE_0, Mode, Phase, Polarity, SpiBus as _};
 use hal::fugit::RateExtU32;
 use hal::gpio::bank0::{Gpio4, Gpio5, Gpio6, Gpio7, Gpio16, Gpio17, Gpio18, Gpio19};
@@ -29,7 +31,8 @@ use hal::pac;
 use hal::pwm::{Slices, ValidSliceMode};
 use hal::spi::{Enabled, FrameFormat, Spi};
 use rp235x_hal as hal;
-use rvcore::periph::{FREE_PINS, I2C_MSGS, I2cError, I2cOp, Line, NGPIO, Pins, Pwm, pwm_slice, pwm_timing};
+use rp2350_board as board;
+use rvcore::periph::{FREE_PINS, I2cError, I2cOp, Line, NGPIO, Pins, Pwm, pwm_slice, pwm_timing};
 
 type DPin<F> = Pin<DynPinId, F, DynPullType>;
 
@@ -117,8 +120,9 @@ pub struct BoardPins {
     gp: [Option<Gp>; NGPIO as usize],
     /// Lines with an edge interrupt enabled.
     edge_lines: u64,
-    i2c0: I2c0,
-    i2c1: I2c1,
+    /// Ours, set up by the HAL; `i2c_run` drives their registers.
+    _i2c0: I2c0,
+    _i2c1: I2c1,
     spi: Spi0,
     spi_cs: SpiCs,
     spi_hz: u32,
@@ -148,8 +152,8 @@ impl BoardPins {
         BoardPins {
             gp: set.gp,
             edge_lines: 0,
-            i2c0: set.i2c0,
-            i2c1: set.i2c1,
+            _i2c0: set.i2c0,
+            _i2c1: set.i2c1,
             spi: set.spi,
             spi_cs,
             spi_hz: 0,
@@ -229,46 +233,172 @@ impl BoardPins {
     }
 }
 
-/// One I2C transaction on `bus` (its controller's registers: `regs`), as
-/// `Pins::i2c` describes.
-fn i2c_run<B: embedded_hal::i2c::I2c>(
-    bus: &mut B,
-    regs: &pac::i2c0::RegisterBlock,
-    addr: u8,
-    ops: &mut [I2cOp<'_>],
-) -> Result<(), I2cError> {
-    use embedded_hal::i2c::{Error as _, ErrorKind, NoAcknowledgeSource};
-    let map = |e: B::Error| match e.kind() {
-        ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address | NoAcknowledgeSource::Unknown) => I2cError::Nack,
-        _ => I2cError::Bus,
-    };
+/// How long one I2C byte, or the STOP, may take: 9 bit times at 100 kHz
+/// are 90 us, and a device may stretch the clock, but not past this.
+const I2C_BYTE_US: u64 = 5_000;
+
+/// Spin until `ready()` or `us` microseconds have passed (`cyc_us`: core
+/// cycles per microsecond); false on the timeout.
+fn spin(cyc_us: u64, us: u64, mut ready: impl FnMut() -> bool) -> bool {
+    let end = board::mcycle64() + cyc_us * us;
+    while !ready() {
+        if board::mcycle64() > end {
+            return ready();
+        }
+    }
+    true
+}
+
+/// One I2C controller: its registers and its SDA/SCL pins.
+struct I2cBus {
+    regs: &'static pac::i2c0::RegisterBlock,
+    sda: usize,
+    scl: usize,
+}
+
+impl I2cBus {
+    fn new(bus: usize) -> Self {
+        // SAFETY: the controllers are ours (`BoardPins::_i2c0`/`_i2c1`); only
+        // `i2c_run` uses their registers once the HAL has set them up.
+        let regs: &'static pac::i2c0::RegisterBlock =
+            unsafe { if bus == 0 { &*pac::I2C0::ptr() } else { &*pac::I2C1::ptr() } };
+        if bus == 0 { I2cBus { regs, sda: 4, scl: 5 } } else { I2cBus { regs, sda: 6, scl: 7 } }
+    }
+
+    /// After an abort (the controller ends it with a STOP once it can).
+    fn aborted(&self, cyc_us: u64) -> I2cError {
+        let r = self.regs;
+        let src = r.ic_tx_abrt_source().read();
+        r.ic_clr_tx_abrt().read();
+        if spin(cyc_us, I2C_BYTE_US, || r.ic_raw_intr_stat().read().stop_det().is_active()) {
+            r.ic_clr_stop_det().read();
+        }
+        if src.abrt_7b_addr_noack().bit_is_set() { I2cError::Nack } else { I2cError::Bus }
+    }
+
+    /// The bus stayed busy past the deadline: abort, and if a device still
+    /// holds SDA low, clock it free (up to 9 SCL pulses, then a STOP) with
+    /// the pins on SIO for the moment.
+    fn timed_out(&self, cyc_us: u64) -> I2cError {
+        let r = self.regs;
+        r.ic_enable().modify(|_, w| w.abort().set_bit());
+        spin(cyc_us, I2C_BYTE_US, || r.ic_enable().read().abort().bit_is_clear());
+        r.ic_clr_tx_abrt().read();
+        r.ic_enable().write(|w| w.enable().disabled());
+        spin(cyc_us, I2C_BYTE_US, || r.ic_enable_status().read().ic_en().bit_is_clear());
+        // SAFETY: our own two pins; their function goes back to I2C below.
+        let (io, sio) = unsafe { (&*pac::IO_BANK0::ptr(), &*pac::SIO::ptr()) };
+        let (sda, scl) = (1u32 << self.sda, 1u32 << self.scl);
+        let level = |m: u32| sio.gpio_in().read().bits() & m != 0;
+        if !level(sda) {
+            // open drain: output enable drives the line low, off lets the
+            // pull-up take it high
+            let low = |m: u32| sio.gpio_oe_set().write(|w| unsafe { w.bits(m) });
+            let release = |m: u32| sio.gpio_oe_clr().write(|w| unsafe { w.bits(m) });
+            let half = || spin(cyc_us, 5, || false);
+            release(sda | scl);
+            sio.gpio_out_clr().write(|w| unsafe { w.bits(sda | scl) });
+            for n in [self.sda, self.scl] {
+                io.gpio(n).gpio_ctrl().modify(|_, w| w.funcsel().sio());
+            }
+            for _ in 0..9 {
+                if level(sda) {
+                    break;
+                }
+                low(scl);
+                half();
+                release(scl);
+                half();
+            }
+            low(sda);
+            half();
+            release(scl);
+            half();
+            release(sda);
+            half();
+            for n in [self.sda, self.scl] {
+                io.gpio(n).gpio_ctrl().modify(|_, w| w.funcsel().i2c());
+            }
+        }
+        I2cError::Timeout
+    }
+}
+
+/// One I2C transaction (`Pins::i2c`) on the controller's registers, as the
+/// pico-sdk's blocking transfers do it, one byte in flight at a time, but
+/// with every wait bounded: a device that holds the bus makes it fail with
+/// `Timeout` after at most a few `I2C_BYTE_US`, never hang the emulator.
+fn i2c_run(bus: &I2cBus, cyc_us: u64, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
     // The controller can't send an address alone (SMBus quick, i2cdetect's
     // probe): a one-byte read asks the same question.
     if let [I2cOp::Write([])] = ops {
-        return bus.read(addr, &mut [0]).map_err(map);
+        return i2c_xfer(bus, cyc_us, addr, &mut [I2cOp::Read(&mut [0])]);
     }
+    if ops.iter().any(|op| matches!(op, I2cOp::Read([]) | I2cOp::Write([]))) {
+        return Err(I2cError::Bus);
+    }
+    i2c_xfer(bus, cyc_us, addr, ops)
+}
+
+fn i2c_xfer(bus: &I2cBus, cyc_us: u64, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
+    let r = bus.regs;
+    r.ic_enable().write(|w| w.enable().disabled());
+    if !spin(cyc_us, I2C_BYTE_US, || r.ic_enable_status().read().ic_en().bit_is_clear()) {
+        return Err(bus.timed_out(cyc_us));
+    }
+    r.ic_tar().write(|w| unsafe { w.ic_tar().bits(u16::from(addr)) });
+    r.ic_clr_tx_abrt().read();
+    r.ic_clr_stop_det().read();
+    r.ic_enable().write(|w| w.enable().enabled());
     let n = ops.len();
-    let mut eops: [Operation<'_>; I2C_MSGS] = core::array::from_fn(|_| Operation::Write(&[]));
-    for (e, op) in eops.iter_mut().zip(ops.iter_mut()) {
-        *e = match op {
-            I2cOp::Read([]) | I2cOp::Write([]) => return Err(I2cError::Bus),
-            I2cOp::Read(b) => Operation::Read(b),
-            I2cOp::Write(b) => Operation::Write(b),
+    let mut prev_read = None;
+    for (k, op) in ops.iter_mut().enumerate() {
+        let read = matches!(op, I2cOp::Read(_));
+        // a repeated start where the direction changes
+        let restart = prev_read.is_some_and(|p| p != read);
+        prev_read = Some(read);
+        let len = match op {
+            I2cOp::Read(b) => b.len(),
+            I2cOp::Write(b) => b.len(),
         };
-    }
-    let r = bus.transaction(addr, &mut eops[..n]).map_err(map);
-    // rp235x-hal 0.4 checks for an abort only while a write waits for FIFO
-    // room: a write that fits returns Ok after the STOP even when the address
-    // was not acknowledged, and leaves the abort set for the next transfer.
-    // Read (and clear) it here, as the pico-sdk does after its STOP.
-    let abrt = regs.ic_tx_abrt_source().read();
-    if abrt.bits() != 0 {
-        regs.ic_clr_tx_abrt().read();
-        if r.is_ok() {
-            return Err(if abrt.abrt_7b_addr_noack().bit_is_set() { I2cError::Nack } else { I2cError::Bus });
+        for i in 0..len {
+            let stop = k + 1 == n && i + 1 == len;
+            let first = restart && i == 0;
+            match op {
+                I2cOp::Write(b) => {
+                    r.ic_data_cmd().write(|w| unsafe { w.restart().bit(first).stop().bit(stop).dat().bits(b[i]) });
+                    // TX_EMPTY_CTRL (the HAL sets it): empty once the byte
+                    // has left the shift register
+                    if !spin(cyc_us, I2C_BYTE_US, || r.ic_raw_intr_stat().read().tx_empty().is_active()) {
+                        return Err(bus.timed_out(cyc_us));
+                    }
+                    if r.ic_tx_abrt_source().read().bits() != 0 {
+                        return Err(bus.aborted(cyc_us));
+                    }
+                }
+                I2cOp::Read(b) => {
+                    r.ic_data_cmd().write(|w| w.restart().bit(first).stop().bit(stop).cmd().read());
+                    let ok = spin(cyc_us, I2C_BYTE_US, || {
+                        r.ic_rxflr().read().rxflr().bits() != 0 || r.ic_tx_abrt_source().read().bits() != 0
+                    });
+                    if r.ic_tx_abrt_source().read().bits() != 0 {
+                        return Err(bus.aborted(cyc_us));
+                    }
+                    if !ok {
+                        return Err(bus.timed_out(cyc_us));
+                    }
+                    b[i] = r.ic_data_cmd().read().dat().bits();
+                }
+            }
+            if stop {
+                if !spin(cyc_us, I2C_BYTE_US, || r.ic_raw_intr_stat().read().stop_det().is_active()) {
+                    return Err(bus.timed_out(cyc_us));
+                }
+                r.ic_clr_stop_det().read();
+            }
         }
     }
-    r
+    Ok(())
 }
 
 impl Pins for BoardPins {
@@ -338,13 +468,7 @@ impl Pins for BoardPins {
     }
 
     fn i2c(&mut self, bus: usize, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
-        // SAFETY: shared reads of the registers of controllers that are ours
-        // (`i2c0`, `i2c1`); i2c_run uses them only between HAL calls
-        if bus == 0 {
-            i2c_run(&mut self.i2c0, unsafe { &*pac::I2C0::ptr() }, addr, ops)
-        } else {
-            i2c_run(&mut self.i2c1, unsafe { &*pac::I2C1::ptr() }, addr, ops)
-        }
+        i2c_run(&I2cBus::new(bus), u64::from(self.sys_hz / 1_000_000), addr, ops)
     }
 
     fn spi_transfer(&mut self, hz: u32, mode: u8, buf: &mut [u8]) {

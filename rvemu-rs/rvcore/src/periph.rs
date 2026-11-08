@@ -39,6 +39,9 @@ pub const NGPIO: u32 = 48;
 pub const NPWM: u32 = 40;
 /// The fastest SPI clock the guest may ask for.
 pub const SPI_MAX_HZ: u32 = 50_000_000;
+/// The slowest SPI clock: the device runs a transfer while the guest waits,
+/// so 4 KiB (spidev's buffer) takes at most about 0.3 s.
+pub const SPI_MIN_HZ: u32 = 100_000;
 /// ADC channels: 0-7 are GP40-GP47, 8 the temperature sensor.
 pub const ADC_CHANNELS: u32 = 9;
 
@@ -155,6 +158,9 @@ pub enum I2cError {
     /// Anything else (a data NACK, arbitration, a message the controller
     /// can't do).
     Bus,
+    /// The bus stayed busy past the backend's deadline (a device holding SCL
+    /// or SDA low); the backend has aborted and tried to free the bus.
+    Timeout,
 }
 
 /// One PWM channel: period and duty in ns.
@@ -321,12 +327,13 @@ impl Dirty {
 /// Messages in one transfer, at most (Linux's i2c-dev allows 42).
 pub const I2C_MSGS: usize = 16;
 const I2C_RESULT_NACK: u32 = 1 << 31;
+const I2C_RESULT_TIMEOUT: u32 = 1 << 30;
 
 /// `rvemu,i2c`: MSGS (0x00) is the guest physical address of a table of
 /// 16-byte messages { u16 addr, u16 flags (bit 0 read), u32 len, u32 buf,
 /// u32 0 }; writing their number to NMSGS (0x04) runs them as one transfer
 /// and RESULT (0x08) is then the number done, plus bit 31 when the address
-/// wasn't acknowledged. Consecutive messages to one address are one
+/// wasn't acknowledged or bit 30 when the bus stayed busy (timeout). Consecutive messages to one address are one
 /// transaction, with repeated starts.
 #[derive(Default)]
 struct I2c {
@@ -395,6 +402,7 @@ impl I2c {
                 Ok(()) => done = end,
                 Err(I2cError::Nack) => return done as u32 | I2C_RESULT_NACK,
                 Err(I2cError::Bus) => return done as u32,
+                Err(I2cError::Timeout) => return done as u32 | I2C_RESULT_TIMEOUT,
             }
         }
         n as u32
@@ -439,7 +447,7 @@ impl Spi {
             0x00 => self.tx = v,
             0x04 => self.rx = v,
             0x08 => self.len = v,
-            0x0c => self.hz = v.clamp(1, SPI_MAX_HZ),
+            0x0c => self.hz = v.clamp(SPI_MIN_HZ, SPI_MAX_HZ),
             0x10 => self.mode = v & 0xB,
             0x14 => {
                 self.cs = v & 1;
