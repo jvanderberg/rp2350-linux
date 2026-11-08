@@ -125,6 +125,8 @@ const OFF_HOST_SP: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, host_sp)) a
 const OFF_JC: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, jc_base)) as i32;
 const OFF_IRQ_PENDING: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, irq_pending)) as i32;
 const OFF_SIE_BIT: i32 = offset_of!(Cpu, sie_bit) as i32;
+const OFF_RES_VALID: i32 = offset_of!(Cpu, res_valid) as i32;
+const OFF_RES_ADDR: i32 = offset_of!(Cpu, res_addr) as i32;
 /// sstatus as csr_read composes it: (field, bit)
 const SSTATUS_BITS: [(i32, u32); 5] = [
     (offset_of!(Cpu, sie_bit) as i32, 1),
@@ -235,6 +237,8 @@ enum Kind {
     /// S-mode access to sscratch, sepc, scause, stval or sstatus
     /// (`emit_csr`).
     Csr,
+    /// LR.W / SC.W on the interpreter's reservation (`emit_lrsc`).
+    LrSc,
     Interp,
 }
 
@@ -320,6 +324,7 @@ fn classify(insn: u32, pc: u32, sup: bool) -> Kind {
         0x2F if f3 == 2 && matches!(insn >> 27, 0x00 | 0x01 | 0x04 | 0x08 | 0x0C | 0x10 | 0x14 | 0x18 | 0x1C) => {
             Kind::Amo
         }
+        0x2F if f3 == 2 && (insn >> 27 == 3 || (insn >> 27 == 2 && (insn >> 20) & 31 == 0)) => Kind::LrSc,
         // (a page executable in S-mode never is in U-mode, so a block's
         // privilege is the one it was translated in)
         0x73 if sup && f3 & 3 != 0 => {
@@ -356,6 +361,74 @@ fn insn_at(host0: usize, k: usize) -> u32 {
 /// Kinds of a block's instructions; scan() writes the first `n` (left
 /// uninitialized otherwise: zero-filling it cost more than the scan).
 type Kinds = [MaybeUninit<Kind>; MAX_BLOCK];
+
+/// A translated LR.W / SC.W (out of line like `emit_csr`).
+#[inline(never)]
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn emit_lrsc<'a>(mut a: Asm<'a>, r: &Routines, insn: u32) -> Asm<'a> {
+    let rd = (insn >> 7) & 31;
+    let rs1 = (insn >> 15) & 31;
+    let rs2 = (insn >> 20) & 31;
+    macro_rules! call {
+        ($link:expr, $to:expr) => {{
+            let off = ($to as isize - a.pos() as isize) * 4;
+            a.emit(j_type($link, off as i32));
+        }};
+    }
+    if spilled(rs1) {
+        a.lw(K0, S, xoff(rs1));
+    } else {
+        a.addi(K0, rs1, 0);
+    }
+    // A slow case (miss, MMIO, fault, misaligned) leaves at the helper call
+    // with the reservation as it was, and the interpreter does it all.
+    if insn >> 27 == 2 {
+        // LR.W
+        a.sw(K0, S, OFF_RES_ADDR);
+        call!(K3, r.helper[0][2]);
+        if spilled(rd) {
+            a.lw(K1, K0, 0);
+            a.sw(K1, S, xoff(rd));
+        } else {
+            a.lw(rd, K0, 0); // (rd = x0 still loads)
+        }
+        a.addi(K1, ZERO, 1);
+        a.store(0, K1, S, OFF_RES_VALID); // sb
+        return a;
+    }
+    // SC.W: a misaligned address goes to the helper, which leaves for the
+    // interpreter to raise the fault before looking at the reservation
+    a.andi(K1, K0, 3);
+    let misaligned = a.branch_fwd(1, K1, ZERO);
+    a.load(4, K1, S, OFF_RES_VALID); // lbu
+    let fail1 = a.branch_fwd(0, K1, ZERO);
+    a.lw(K1, S, OFF_RES_ADDR);
+    let fail2 = a.branch_fwd(1, K1, K0);
+    let here = a.pos();
+    a.fix(misaligned, here);
+    call!(K3, r.helper[1][2]);
+    if spilled(rs2) {
+        a.lw(K1, S, xoff(rs2));
+        a.sw(K1, K0, 0);
+    } else {
+        a.sw(rs2, K0, 0);
+    }
+    a.addi(K2, ZERO, 0);
+    let done = a.jump_fwd();
+    let here = a.pos();
+    a.fix(fail1, here);
+    a.fix(fail2, here);
+    a.addi(K2, ZERO, 1);
+    let here = a.pos();
+    a.fix(done, here);
+    a.store(0, ZERO, S, OFF_RES_VALID);
+    if spilled(rd) {
+        a.sw(K2, S, xoff(rd));
+    } else if rd != 0 {
+        a.addi(rd, K2, 0);
+    }
+    a
+}
 
 /// A translated S-mode CSR access (classify() picked which); `left` is the
 /// number of instructions after it in the block. Out of line, and `a` by
@@ -1496,6 +1569,7 @@ impl<'m> Jit<'m> {
                 }
                 Kind::Nop => {}
                 Kind::Csr => a = emit_csr(a, r, insn, pc, n - 1 - k),
+                Kind::LrSc => a = emit_lrsc(a, r, insn),
                 Kind::Amo => {
                     // misaligned AMOs and every slow case go to the interpreter
                     if spilled(rs1) {
@@ -1690,6 +1764,7 @@ impl<'m> Jit<'m> {
                 Kind::Load | Kind::Store | Kind::Jalr => 1,
                 Kind::Amo => 2,
                 Kind::Csr => csr_sites(insn),
+                Kind::LrSc => 1,
                 _ => 0,
             };
             if seen > before {

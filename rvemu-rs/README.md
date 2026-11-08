@@ -97,7 +97,8 @@ counters.
   back to its `jal budget_exit`, and the instruction by counting helper
   calls, so no per-access metadata is stored. AMOs use the host
   AMO on the translated address, or load/op/store when `Jit::native_amo` is
-  off. LR/SC, ecall, sret and wfi go to the interpreter.
+  off. LR.W and SC.W keep the interpreter's reservation in `Cpu`
+  (`res_valid`, `res_addr`). Ecall, sret and wfi go to the interpreter.
 - **CSRs.** In S mode, every access to `sscratch`, `sepc`, `scause` and
   `stval` is a load and store on `Cpu`. So are reads of `sstatus` and SIE
   set or clear. Other `sstatus` writes call `Cpu::sstatus_op()` the same way

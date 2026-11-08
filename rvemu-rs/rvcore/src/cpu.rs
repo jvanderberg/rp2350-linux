@@ -139,8 +139,9 @@ pub struct Cpu {
     pub stimecmp: u64,
     pub instret: u64,
     pub time_skip: u64,
-    pub(crate) res_valid: bool,
-    pub(crate) res_addr: u32,
+    /// LR/SC reservation (a translator does LR/SC itself)
+    pub res_valid: bool,
+    pub res_addr: u32,
 
     pub(crate) ram: *mut u8,
     pub(crate) ram_base: u32,
