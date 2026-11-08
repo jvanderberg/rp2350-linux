@@ -54,6 +54,10 @@ if [[ $stage == disk* ]]; then
       sed -i '$i config MTD_RVEMU_FLASH\n\ttristate "rvemu NOR flash device"\n\tdepends on HAS_IOMEM \&\& OF\n' drivers/mtd/devices/Kconfig
     grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Makefile ||
       echo 'obj-$(CONFIG_MTD_RVEMU_FLASH) += rvemu-flash.o' >> drivers/mtd/devices/Makefile
+    # jffs2's GC thread CRC-checks every node after a mount: idle time only
+    # (SCHED_IDLE, not nice 10), so a full /home doesn't hold up the boot. A
+    # writer that runs out of space collects garbage itself.
+    sed -i 's|^\tset_user_nice(current, 10);$|\tsched_setscheduler_nocheck(current, SCHED_IDLE, \&(struct sched_param){ 0 });|' fs/jffs2/background.c
     make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
     scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment
     make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig

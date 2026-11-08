@@ -6,7 +6,7 @@ PSRAM and translated code is in SRAM.
 
 | Crate | |
 |---|---|
-| `rvcore/` | `no_std` core: hart state, interpreter, soft TLB and Sv32 walk, built-in SBI, 16550 UART, PLIC and the virtio-mmio devices (`virtio.rs`). The `instrument` feature adds host-only statistics (unique-code bitmaps, an XIP cache model) and needs `alloc`. `ram-code` puts the hot paths in SRAM on the board. |
+| `rvcore/` | `no_std` core: hart state, interpreter, soft TLB and Sv32 walk, built-in SBI, 16550 UART, PLIC, the virtio-mmio devices (`virtio.rs`) and the NOR flash device (`nor.rs`). The `instrument` feature adds host-only statistics (unique-code bitmaps, an XIP cache model) and needs `alloc`. `ram-code` puts the hot paths in SRAM on the board. |
 | `rvjit/` | `no_std` block translator, RV32IMA guest code to RV32 host code |
 | `rvemu/` | Mac host: loads the guest, generates the device tree (needs `dtc`), terminal console, statistics, RP2350 timing model (`-M`), cache-policy simulator (`-S`) |
 | `rvemu-virt/` | bare-metal build for `qemu-system-riscv32 -M virt`: interpreter, translator or lockstep |
@@ -28,6 +28,7 @@ is what lockstep testing and the board-against-Mac comparisons rely on.
 | `-k FILE` | kernel Image, loaded at the start of RAM |
 | `-i FILE` | initramfs (cpio) |
 | `-d FILE` | disk image for the read-only virtio-blk device. Without `-i`, the default command line roots on it: `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`. |
+| `-F FILE` | the NOR flash device (the board's 1 MB `/home` region), backed by FILE, which is created blank (0xFF) if missing and written through, so `/home` persists across runs. `RVEMU_NOR_CUT=N` simulates a power cut: the N-th program or erase is applied halfway and the emulator exits. |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
 | `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board |
 | `-m MB` | guest RAM (default 64) |
@@ -51,6 +52,7 @@ counters.
 | UART (16550) | 0xF4000000 | 1 |
 | virtio-blk | 0xF8000000 | 2 |
 | virtio-net | 0xF8000200 | 3 |
+| NOR flash (`rvemu,flash`) | 0xF8000400 | |
 
 - **No M-mode.** The kernel runs in S-mode, and SBI is implemented in the
   emulator.
@@ -66,6 +68,14 @@ counters.
 - **DMA and the translator:** each guest RAM range a device writes is
   reported separately (`take_dma_write`). The translator then drops only the
   code pages that were actually written.
+- **NOR flash** (`rvcore/src/nor.rs`): the guest's `/home`. A command
+  (read, program or erase, with an offset, a guest buffer and a length) is
+  one register store, and it completes before the store returns, so there
+  is no interrupt. Programs AND into the flash, as on NOR. The guest sees
+  16 KB erase blocks (four 4 KB flash sectors): with 4 KB blocks jffs2 needs
+  about 80 KiB more RAM for its per-block tables. Backends implement
+  `NorFlash`: a file on the Mac, `flash::STORAGE` on the board. The guest's
+  driver is `guest/linux/rvemu-flash.c`.
 - **Read-only prefix:** `Cpu::set_readonly_prefix(n)` makes stores to the
   first `n` bytes of guest RAM fault. `GuestMem::ro` makes devices refuse DMA
   writes there. That is how the board maps the kernel's text straight from
@@ -140,6 +150,30 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
   BOOTSEL. So does the SWD request in `rp2350-board::bootsel_if_requested`.
 - **Disk.** The squashfs is read through flash's uncached, non-allocating
   XIP alias, so disk reads don't evict guest RAM from the XIP cache.
+
+### Flash writes (`rvemu-pico/src/flash.rs`)
+
+The one module that erases or programs flash at run time: the `/home`
+device uses it, and so does swap.
+- **Regions.** Only `STORAGE` (0x10100000-0x101FFFFF) and `SWAP`
+  (0x10200000-0x103FEFFF) are writable. Anything else is refused: the
+  firmware, the Wi-Fi sector, the blob, the squashfs and the kernel text.
+- **API.** `erase_sector` (4 KB; a sector that is already blank is not
+  erased), `program_page` (256 bytes from SRAM), `program` (any range in one
+  region, from anywhere, PSRAM included; copied a page at a time into SRAM),
+  `read` and `is_erased` through the uncached alias, and `stats`.
+- **Stopping XIP.** Each sector erase or page program is one critical
+  section: interrupts masked, core 1 parked (`park_core1`), then an SRAM
+  function saves the QMI window settings (the 348 MHz flash timing and the
+  PSRAM's QPI setup), the QSPI pads and XIP_CTRL, calls the bootrom's
+  `connect_internal_flash`, `flash_exit_xip` and erase or program, and
+  restores them all.
+- **XIP cache.** Only the changed flash lines are invalidated, by address.
+  The bootrom's `flash_flush_cache` would also discard guest RAM's dirty
+  PSRAM lines, which share the 16 KB cache.
+- **Stalls.** The guest is paused while the flash is busy: about 0.7 ms per
+  page and 45 ms per sector (400 ms at most). Guest time doesn't advance
+  meanwhile, and USB is polled again as soon as the store returns.
 
 ### Wi-Fi (`rvemu-pico/src/wifi.rs`)
 
