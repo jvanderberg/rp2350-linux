@@ -58,6 +58,10 @@ mod swap_flash;
 use swap_flash::SwapFlash;
 use wifi::{Creds, RadioPins};
 
+#[path = "../pins.rs"]
+mod pins;
+use pins::{BoardPins, Gp, PinSet};
+
 #[unsafe(link_section = ".start_block")]
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
@@ -294,7 +298,7 @@ impl NetLink for RingLink {
 }
 
 struct PicoBus {
-    plat: Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>>,
+    plat: Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>, BoardPins>,
     sys_hz: u32,
     /// The last `core1::events()` acted on.
     seen: u32,
@@ -311,6 +315,8 @@ impl PicoBus {
             self.seen = e;
             self.plat.update_irqs();
         }
+        // GPIO edges (only lines the guest armed; one register read otherwise)
+        self.plat.poll_pins();
     }
 }
 
@@ -366,6 +372,11 @@ impl Bus for PicoBus {
                 if cpu.sip_value(self) & cpu.sie != 0 {
                     return;
                 }
+            }
+            // a GPIO edge the guest armed ends the wait too
+            self.plat.poll_pins();
+            if self.plat.plic.irq && cpu.sip_value(self) & cpu.sie != 0 {
+                return;
             }
         }
         if cpu.stimecmp == u64::MAX {
@@ -507,6 +518,51 @@ fn main() -> ! {
         rprintln!("[wifi] joining {:?} in the background", c.ssid());
     }
 
+    // The guest's GPIO, I2C, SPI, PWM and ADC (rvcore::periph, pins.rs).
+    let peri_hz = clocks.peripheral_clock.freq().to_Hz();
+    let mut gp: [Option<Gp>; rvcore::periph::NGPIO as usize] = [const { None }; rvcore::periph::NGPIO as usize];
+    macro_rules! free {
+        ($($n:literal $f:ident),*) => { $( gp[$n] = Some(Gp::new(pins.$f)); )* };
+    }
+    free!(1 gpio1, 2 gpio2, 3 gpio3, 8 gpio8, 9 gpio9, 10 gpio10, 11 gpio11, 12 gpio12, 13 gpio13, 14 gpio14,
+        15 gpio15, 20 gpio20, 21 gpio21, 22 gpio22, 26 gpio26, 27 gpio27, 28 gpio28, 30 gpio30, 31 gpio31,
+        32 gpio32, 33 gpio33, 34 gpio34, 35 gpio35, 36 gpio36, 37 gpio37, 38 gpio38, 39 gpio39);
+    debug_assert!((0..rvcore::periph::NGPIO as usize).all(|n| gp[n].is_some() == (rvcore::periph::FREE_PINS >> n & 1 != 0)));
+    use hal::fugit::RateExtU32;
+    let i2c0 = hal::I2C::i2c0(
+        pac.I2C0,
+        pins.gpio4.reconfigure(),
+        pins.gpio5.reconfigure(),
+        pins::i2c_hz(),
+        &mut pac.RESETS,
+        sys_hz.Hz(),
+    );
+    let i2c1 = hal::I2C::i2c1(
+        pac.I2C1,
+        pins.gpio6.reconfigure(),
+        pins.gpio7.reconfigure(),
+        pins::i2c_hz(),
+        &mut pac.RESETS,
+        sys_hz.Hz(),
+    );
+    let spi = hal::spi::Spi::<_, _, _, 8>::new(
+        pac.SPI0,
+        (pins.gpio19.reconfigure(), pins.gpio16.reconfigure(), pins.gpio18.reconfigure()),
+    )
+    .init(&mut pac.RESETS, peri_hz.Hz(), 1.MHz(), pins::SPI_MODE);
+    let adc_pins = [
+        pins.gpio40.into_floating_disabled().into_dyn_pin(),
+        pins.gpio41.into_floating_disabled().into_dyn_pin(),
+        pins.gpio42.into_floating_disabled().into_dyn_pin(),
+        pins.gpio43.into_floating_disabled().into_dyn_pin(),
+        pins.gpio44.into_floating_disabled().into_dyn_pin(),
+        pins.gpio45.into_floating_disabled().into_dyn_pin(),
+        pins.gpio46.into_floating_disabled().into_dyn_pin(),
+        pins.gpio47.into_floating_disabled().into_dyn_pin(),
+    ];
+    let set = PinSet { gp, i2c0, i2c1, spi, spi_cs: pins.gpio17.reconfigure(), adc_pins };
+    let board_pins = BoardPins::new(set, pac.PWM, pac.ADC, &mut pac.RESETS, sys_hz, peri_hz);
+
     // SAFETY: initialised once, here, before anything borrows it.
     let usb_bus: &'static UsbBusAllocator<hal::usb::UsbBus> = unsafe {
         (*addr_of_mut!(USB_BUS)).write(UsbBusAllocator::new(hal::usb::UsbBus::new(
@@ -552,7 +608,10 @@ fn main() -> ! {
         fail("no root filesystem: no initramfs in the blob and no squashfs at 0x10600000");
     }
     let gmem = GuestMem { ptr: h.ram_host() as *mut u8, base: 0, size: h.ram_size, ro: h.text_len };
-    let mut plat = Platform::new(con).with_net(RingLink { wait_cycles: ms(RADIO_BRING_UP_MS) }, gmem).with_nor(BoardNor, gmem);
+    let mut plat = Platform::new(con)
+        .with_net(RingLink { wait_cycles: ms(RADIO_BRING_UP_MS) }, gmem)
+        .with_nor(BoardNor, gmem)
+        .with_io(board_pins, gmem);
     if let Some(d) = disk {
         plat = plat.with_disk(d, gmem);
     }

@@ -16,10 +16,12 @@ use rvcore::virtio::{
 };
 use stubnet::StubNet;
 use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, Priv, TIMEBASE_HZ};
+use stubpins::StubPins;
 
 mod norfile;
 mod sim;
 mod stubnet;
+mod stubpins;
 
 const DTB_RESERVE: u32 = 0x10000; // top 64 KiB of RAM holds the DTB
 
@@ -192,7 +194,7 @@ impl Flash for ModelFlash {
 // ------------------------------------------------------------------ bus
 
 struct HostBus {
-    plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>>,
+    plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>, StubPins>,
     interactive: bool,
 }
 
@@ -200,6 +202,7 @@ impl HostBus {
     fn poll(&mut self) {
         self.plat.con.read_input();
         self.plat.update_irqs();
+        self.plat.poll_pins();
     }
 }
 
@@ -291,10 +294,12 @@ struct DtsOpts<'a> {
     nor: bool,
     /// swap virtio-blk at VIRTIO_SWAP_BASE, and the top RAM page reserved
     swap: bool,
+    /// the pin devices at IO_BASE (gpio)
+    gpio: bool,
 }
 
 fn make_dts(o: &DtsOpts) -> String {
-    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap } = *o;
+    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap, gpio } = *o;
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -346,6 +351,7 @@ fn make_dts(o: &DtsOpts) -> String {
 "#
         );
     }
+    let (io_root, io_soc) = if gpio { io_nodes() } else { (String::new(), String::new()) };
     format!(
         r#"/dts-v1/;
 / {{
@@ -353,7 +359,7 @@ fn make_dts(o: &DtsOpts) -> String {
   #size-cells = <1>;
   model = "rvemu";
   compatible = "rvemu";
-  chosen {{
+{io_root}  chosen {{
     bootargs = "{bootargs}";
     stdout-path = "/soc/serial@f4000000";
     rng-seed = [{seed}];
@@ -403,10 +409,93 @@ fn make_dts(o: &DtsOpts) -> String {
       clock-frequency = <5000000>;
       no-loopback-test;
     }};
-{virtio}  }};
+{virtio}{io_soc}  }};
 }};
 "#
     )
+}
+
+/// The board's pins (`-G`, rvcore::periph): root-level nodes (aliases fixing
+/// the bus numbers) and the devices on the soc.
+fn io_nodes() -> (String, String) {
+    use rvcore::periph::*;
+    // RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc: only these (for measuring)
+    let only = std::env::var("RVEMU_IO").ok();
+    let want = |d: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == d));
+    let names = LINE_NAMES.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+    let (mut root, mut soc, mut aliases) = (String::new(), String::new(), String::new());
+    if want("gpio") {
+        soc += &format!(
+            r#"    gpio@{GPIO_BASE:x} {{
+      compatible = "rvemu,gpio";
+      reg = <0x{GPIO_BASE:x} 0x{GPIO_SIZE:x}>;
+      interrupts = <{GPIO_IRQ}>;
+      interrupt-parent = <&plic0>;
+      gpio-controller;
+      #gpio-cells = <2>;
+      interrupt-controller;
+      #interrupt-cells = <2>;
+      gpio-line-names = {names};
+    }};
+"#
+        );
+    }
+    for (k, base) in I2C_BASE.into_iter().enumerate() {
+        if !want(&format!("i2c{k}")) {
+            continue;
+        }
+        aliases += &format!("    i2c{k} = &i2c{k};\n");
+        soc += &format!(
+            r#"    i2c{k}: i2c@{base:x} {{
+      compatible = "rvemu,i2c";
+      reg = <0x{base:x} 0x{I2C_SIZE:x}>;
+      #address-cells = <1>;
+      #size-cells = <0>;
+    }};
+"#
+        );
+    }
+    if want("spi") {
+        aliases += "    spi0 = &spi0;\n";
+        soc += &format!(
+            r#"    spi0: spi@{SPI_BASE:x} {{
+      compatible = "rvemu,spi";
+      reg = <0x{SPI_BASE:x} 0x{SPI_SIZE:x}>;
+      #address-cells = <1>;
+      #size-cells = <0>;
+      spidev@0 {{
+        compatible = "rohm,dh2228fv";
+        reg = <0>;
+        spi-max-frequency = <{SPI_MAX_HZ}>;
+      }};
+    }};
+"#
+        );
+    }
+    if want("pwm") {
+        soc += &format!(
+            r#"    pwm@{PWM_BASE:x} {{
+      compatible = "rvemu,pwm";
+      reg = <0x{PWM_BASE:x} 0x{PWM_SIZE:x}>;
+      #pwm-cells = <3>;
+    }};
+"#
+        );
+    }
+    if want("adc") {
+        soc += &format!(
+            r#"    adc@{ADC_BASE:x} {{
+      compatible = "rvemu,adc";
+      reg = <0x{ADC_BASE:x} 0x{ADC_SIZE:x}>;
+      #io-channel-cells = <1>;
+    }};
+"#
+        );
+    }
+    if !aliases.is_empty() {
+        root = format!("  aliases {{\n{aliases}  }};\n{root}");
+    }
+    (root, soc)
 }
 
 fn compile_dts(dts: &str) -> Result<Vec<u8>, String> {
@@ -532,6 +621,8 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  FILE, created blank if missing; with -D, any FILE adds the node
   -W             swap device (/dev/vdb in the disk guest): the board's flash
                  swap on a modelled 2 MB flash, statistics in its last page
+  -G             the board's pins: GPIO, I2C, SPI, PWM, ADC on a simulated
+                 board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins)
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size (default 64)
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only
@@ -568,6 +659,7 @@ struct Opts {
     bootargs_set: bool,
     net: bool,
     swap: bool,
+    io: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -591,6 +683,7 @@ fn parse_args() -> Result<Opts, String> {
         bootargs_set: false,
         net: false,
         swap: false,
+        io: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -619,6 +712,7 @@ fn parse_args() -> Result<Opts, String> {
             "-N" => o.net = true,
             "-F" => o.nor = Some(val()?),
             "-W" => o.swap = true,
+            "-G" => o.io = true,
             "-u" => o.until = Some(val()?),
             "-n" => o.max_insns = val()?.parse().map_err(|_| "bad -n")?,
             "-M" => o.model = true,
@@ -675,6 +769,7 @@ fn run() -> Result<(), String> {
         net: o.net,
         nor: o.nor.is_some(),
         swap: o.swap,
+        gpio: o.io,
     });
     if o.dump_dts {
         print!("{dts}");
@@ -729,6 +824,9 @@ fn run() -> Result<(), String> {
     }
     if o.swap {
         plat = plat.with_swap(FlashSwap::new(ModelFlash::new(), SWAP_SPARE), gmem);
+    }
+    if o.io {
+        plat = plat.with_io(StubPins::new(), gmem);
     }
     let mut bus = HostBus { plat, interactive: !o.batch };
 

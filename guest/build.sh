@@ -48,12 +48,19 @@ ext_rebuild() {   # BR_OUT
 }
 
 # disk / disk-rootfs / disk-kernel: the squashfs-root variant, into /out-disk
-# (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment)
+# (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment). PINS=1
+# adds the board's pins: buildroot-pins.fragment and linux-pins.fragment.
+PINS=${PINS:-0}
 if [[ $stage == disk* ]]; then
   if [[ $stage == disk || $stage == disk-rootfs ]]; then
     mkdir -p /work/br-disk
     cp /guest/buildroot-disk.defconfig /work/br-disk/defconfig
-    fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external
+    pins_br=()
+    if [[ $PINS == 1 ]]; then
+      cat /guest/buildroot-pins.fragment >> /work/br-disk/defconfig
+      pins_br=(buildroot-pins.fragment)
+    fi
+    fresh_target /work/br-disk buildroot-disk.defconfig post-build-disk.sh overlay-disk br-external "${pins_br[@]}"
     make -C /src/buildroot O=/work/br-disk BR2_EXTERNAL="$EXT" BR2_DEFCONFIG=/work/br-disk/defconfig defconfig
     # Buildroot doesn't rebuild BusyBox when its config fragment changes or
     # goes away, so a tree last built for another checkout could keep the
@@ -64,7 +71,16 @@ if [[ $stage == disk* ]]; then
     fi
     echo "$bb" > /work/br-disk/.busybox-sum
     ext_rebuild /work/br-disk
+    # With PINS=1 MicroPython is built with the external packages' C modules
+    # (cmod/, USER_C_MODULES), which Buildroot doesn't track: rebuild it
+    # unless its build directory (shared with other checkouts) has these ones
+    mp=none
+    [[ $PINS == 1 ]] && mp=$(cd /guest && { find br-external/package/*/cmod -type f 2>/dev/null || true; } | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
+    for d in /work/br-disk/build/micropython-[0-9]*/; do
+      [[ -d $d && "$(cat "$d/.cmod-sum" 2>/dev/null)" != "$mp" ]] && make -C /work/br-disk micropython-dirclean
+    done
     make -C /work/br-disk -j"$JOBS"
+    for d in /work/br-disk/build/micropython-[0-9]*/; do [[ -d $d ]] && echo "$mp" > "$d/.cmod-sum"; done
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
   if [[ $stage == disk || $stage == disk-kernel ]]; then
@@ -87,8 +103,15 @@ if [[ $stage == disk* ]]; then
     # (SCHED_IDLE, not nice 10), so a full /home doesn't hold up the boot. A
     # writer that runs out of space collects garbage itself.
     sed -i 's|^\tset_user_nice(current, 10);$|\tsched_setscheduler_nocheck(current, SCHED_IDLE, \&(struct sched_param){ 0 });|' fs/jffs2/background.c
+    # the rvemu machine's own drivers (guest/linux/drivers/rvemu); each one
+    # is off unless its Kconfig symbol is set
+    rm -rf drivers/rvemu && cp -r /guest/linux/drivers/rvemu drivers/rvemu
+    grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
+    grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
     make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
-    scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment
+    pins_k=()
+    [[ $PINS == 1 ]] && pins_k=(/guest/linux-pins.fragment)
+    scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment "${pins_k[@]}"
     make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig
     make ARCH=riscv CROSS_COMPILE=$CROSS -j"$JOBS" Image vmlinux
     cp arch/riscv/boot/Image vmlinux System.map /out-disk/

@@ -1,10 +1,12 @@
 //! Platform devices: 16550-style UART, a single-context SiFive PLIC (hart 0,
-//! S-mode), optional virtio-mmio block and network devices, and an optional
-//! NOR flash device (`nor.rs`). The host supplies the console, the disk, the
-//! network link and the flash.
+//! S-mode), optional virtio-mmio block and network devices, an optional
+//! NOR flash device (`nor.rs`) and optionally the board's pins (`periph`).
+//! The host supplies the console, the disk, the network link, the flash and
+//! the pins.
 
 use crate::cpu::exc;
 use crate::nor::{NOR_BASE, NOR_SIZE, NoNor, NorDev, NorFlash};
+use crate::periph::{GPIO_IRQ, IO_BASE, IO_SIZE, Io, NoPins, Pins};
 use crate::virtio::{
     Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE,
     VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ, VirtioBlk, VirtioNet,
@@ -188,9 +190,17 @@ impl Uart {
     }
 }
 
-/// UART + PLIC (+ disk, + network, + flash, + swap) wired together, generic
-/// over the host console, disk, network link, flash and swap backend.
-pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet, F: NorFlash = NoNor, W: Disk = NoDisk> {
+/// UART + PLIC (+ disk, + network, + flash, + swap, + pins) wired together,
+/// generic over the host console, disk, network link, flash, swap backend and
+/// pins.
+pub struct Platform<
+    C: Console,
+    D: Disk = NoDisk,
+    N: NetLink = NoNet,
+    F: NorFlash = NoNor,
+    W: Disk = NoDisk,
+    P: Pins = NoPins,
+> {
     pub uart: Uart,
     pub plic: Plic,
     pub con: C,
@@ -198,12 +208,13 @@ pub struct Platform<C: Console, D: Disk = NoDisk, N: NetLink = NoNet, F: NorFlas
     pub net: Option<VirtioNet<N>>,
     pub nor: Option<NorDev<F>>,
     pub swap: Option<VirtioBlk<W>>,
+    pub io: Option<Io<P>>,
 }
 
-impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk> Platform<C, D, N, F, W> {
+impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C, D, N, F, W, P> {
     /// UART and PLIC only.
     pub fn new(con: C) -> Self {
-        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, nor: None, swap: None }
+        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, nor: None, swap: None, io: None }
     }
 
     /// Add the NOR flash device at `NOR_BASE` on `flash`, copying to and from `mem`.
@@ -215,6 +226,12 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk> Platform<C, D, N, F,
     /// Add a writable virtio block device for swap at `VIRTIO_SWAP_BASE`.
     pub fn with_swap(mut self, disk: W, mem: GuestMem) -> Self {
         self.swap = Some(VirtioBlk::new(disk, mem));
+        self
+    }
+
+    /// Add the GPIO, I2C, SPI, PWM and ADC devices at `IO_BASE` on `pins`.
+    pub fn with_io(mut self, pins: P, mem: GuestMem) -> Self {
+        self.io = Some(Io::new(pins, mem));
         self
     }
 
@@ -244,6 +261,17 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk> Platform<C, D, N, F,
         }
     }
 
+    /// Pick up the pins' edges (GPIO interrupts) and refresh their line. Not
+    /// part of `update_irqs`, which every MMIO access runs and the board
+    /// keeps inlined in its SRAM code: hosts call this from their periodic
+    /// poll, and the pin devices' own accesses do it themselves.
+    pub fn poll_pins(&mut self) {
+        if let Some(io) = &mut self.io {
+            io.poll();
+            self.plic.set_level(GPIO_IRQ, io.irq_line());
+        }
+    }
+
     pub fn take_dma_write(&mut self) -> Option<(u32, u32)> {
         if let Some(r) = self.blk.as_mut().and_then(|b| b.take_dma_write()) {
             return Some(r);
@@ -254,7 +282,10 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk> Platform<C, D, N, F,
         if let Some(r) = self.swap.as_mut().and_then(|w| w.take_dma_write()) {
             return Some(r);
         }
-        self.nor.as_mut().and_then(|f| f.take_dma_write())
+        if let Some(r) = self.nor.as_mut().and_then(|f| f.take_dma_write()) {
+            return Some(r);
+        }
+        self.io.as_mut().and_then(|io| io.take_dma_write())
     }
 
     pub fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
@@ -287,6 +318,13 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk> Platform<C, D, N, F,
             && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
         {
             return w.load(pa - VIRTIO_SWAP_BASE, size);
+        }
+        if let Some(io) = &mut self.io
+            && pa.wrapping_sub(IO_BASE) < IO_SIZE
+        {
+            let r = io.load(pa, size);
+            self.poll_pins();
+            return r;
         }
         Err(exc::LOAD_FAULT)
     }
@@ -332,6 +370,13 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk> Platform<C, D, N, F,
             let r = w.store(pa - VIRTIO_SWAP_BASE, size, v);
             self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
             self.update_irqs();
+            return r;
+        }
+        if let Some(io) = &mut self.io
+            && pa.wrapping_sub(IO_BASE) < IO_SIZE
+        {
+            let r = io.store(pa, size, v);
+            self.poll_pins();
             return r;
         }
         Err(exc::STORE_FAULT)

@@ -25,8 +25,8 @@ password.
 | Stages | `all`, `rootfs`, `kernel` | `disk`, `disk-rootfs`, `disk-kernel` |
 | Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` |
 | Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay; `/home` and `/root` on jffs2 in flash |
-| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`) |
-| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, MTD + jffs2 |
+| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`) (`PINS=1`: + libgpiod tools, i2c-tools, spidev_test) |
+| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, MTD + jffs2 (`PINS=1`: + the pin drivers) |
 | Used by | the boot benchmark (`scripts/pico-linux.sh`), `pico-shell.sh -i` | `scripts/pico-shell.sh` (default), `rvemu -d`, `virt.sh -D` |
 
 Outputs in each directory: `Image`, `vmlinux`, `System.map`, `linux.config`
@@ -154,6 +154,41 @@ Kernel options of note in `linux-disk.fragment`:
 | `CONFIG_INET_TABLE_PERTURB_ORDER=8` | 1 KiB instead of 256 KiB for RFC 6056 port perturbation |
 | `CONFIG_VIRTIO_NET`, `CONFIG_NET`, `UNIX`, `INET`, `PACKET` | Ethernet over virtio; tmux needs AF_UNIX |
 | `EPOLL`, `EVENTFD`, `TIMERFD`, `SIGNALFD`, `INOTIFY_USER`, `SYSVIPC`, `FILE_LOCKING` | what the packages expect |
+
+## Pins
+
+`PINS=1 ./run-build.sh disk` (or `disk-rootfs`, `disk-kernel`) builds the
+disk guest with the board's GPIO, I2C, SPI, PWM and ADC (pin map in the
+top-level README; the devices in `rvemu-rs/README.md`). It adds
+`linux-pins.fragment` to the kernel and `buildroot-pins.fragment` to the
+root filesystem; without it the guest has none of them, so it pays nothing
+for them (their subsystems alone take about 110 KiB of kernel text, read
+from flash on the board, and 30-70 KiB of RAM).
+
+- **Drivers:** `linux/drivers/rvemu/` holds the machine's own drivers,
+  which `build.sh` copies into the kernel tree (`drivers/rvemu`):
+  `gpio-rvemu.c` (gpiochip with an irqchip, bias, edge events),
+  `i2c-rvemu.c`, `spi-rvemu.c`, `pwm-rvemu.c` and `adc-rvemu.c` (IIO).
+  Each one is off unless its `CONFIG_RVEMU_*` symbol is set, and binds to an
+  `rvemu,*` node in the device tree `rvemu -G` generates.
+- **Kernel options** (`linux-pins.fragment`): `GPIO_CDEV` (v2 only),
+  `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO` without buffers or triggers.
+- **Packages** (`buildroot-pins.fragment`): libgpiod 2 tools (`gpiodetect`, `gpioinfo`, `gpioget`,
+  `gpioset`, `gpiomon`, ...), i2c-tools, `spidev_test`, and two of this
+  repository's (`br-external/package/`):
+  - `micropython-machine`: `machine.py` (compiled to
+    `/usr/lib/micropython/machine.mpy`), which extends MicroPython's
+    built-in `machine` with `Pin`, `I2C`, `SPI`, `PWM` and `ADC` over
+    `/dev/gpiochip0`, `/dev/i2c-N`, `/dev/spidev0.0`, PWM sysfs and IIO,
+    and a small C module (`cmod/fcntl`) that MicroPython is built with, for
+    `fcntl.ioctl`. `Pin.irq(handler)` runs the handler in a thread of its
+    own for each edge.
+  - `pins-examples`: `gpio-blink`, `gpio-edge`, `i2c-scan`, `spi-xfer` and
+    `adc-read`, built and as source in `/usr/share/examples/pins` (its
+    `Makefile` builds them on the board).
+- **Rebuilds:** `build.sh` rebuilds an external package whose files
+  changed, and MicroPython when the C modules it was built with (none
+  without `PINS=1`) differ from the build's.
 
 ## Configuration notes
 

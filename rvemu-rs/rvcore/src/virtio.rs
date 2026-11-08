@@ -212,7 +212,7 @@ impl GuestMem {
     fn u16(&self, pa: u64) -> Option<u16> {
         self.read::<2>(pa).map(u16::from_le_bytes)
     }
-    fn u32(&self, pa: u64) -> Option<u32> {
+    pub(crate) fn u32(&self, pa: u64) -> Option<u32> {
         self.read::<4>(pa).map(u32::from_le_bytes)
     }
     fn u64(&self, pa: u64) -> Option<u64> {

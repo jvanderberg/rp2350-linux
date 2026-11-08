@@ -112,6 +112,7 @@ print((e-s)//4096*4096)" "$m"
 # makes it, then the blob and the kernel text. INITRD "-" means none: root on
 # the disk (pass its image as DISK=). NET=1 adds the network device node,
 # NOR=1 the flash device node (/home in the storage region 0x10100000).
+# IO=1 the pin devices (GPIO, I2C, SPI, PWM, ADC).
 pack_guest() {
   local dts dtb initrd=$2 src tl; dts=$(mktemp); dtb=$(mktemp)
   tl=$(text_len "$1")
@@ -122,6 +123,8 @@ pack_guest() {
   [ "${NOR:-0}" = 1 ] && src+=(-F /dev/null)
   # SWAP=1: the swap device node (rvemu-pico-shell's flash swap, /dev/vdb)
   [ "${SWAP:-0}" = 1 ] && src+=(-W)
+  # IO=1: the firmware drives the board's pins (rvemu-pico/src/pins.rs)
+  [ "${IO:-0}" = 1 ] && src+=(-G)
   ./target/release/rvemu -D -m "$3" -X "$tl" "${src[@]}" > "$dts"
   dtc -q -I dts -O dtb -o "$dtb" "$dts"
   python3 ../rp2350/tools/pack-guest.py "$1" "$initrd" "$dtb" "$3" "$tl" "$4" "$5"

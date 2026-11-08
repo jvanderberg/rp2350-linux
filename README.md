@@ -47,8 +47,50 @@ Each directory has its own README with the details: [rvemu-rs](rvemu-rs/README.m
   down.
 - The target's USB to the Mac, for loading (BOOTSEL + picotool) and the
   console.
+- The free GPIOs, both I2C buses, SPI0, PWM and the ADC are the guest's
+  (see "Pins" below).
 - Optional: an SWD probe (a second RP2350 running debugprobe) for RTT and
   for recovery.
+
+## Pins
+
+`rvemu-pico-shell` can give the guest the board's pins through the standard
+Linux interfaces. They are an opt-in build of the disk guest, because their
+kernel subsystems cost RAM and kernel text even when no pin is in use:
+
+```
+cd guest && PINS=1 ./run-build.sh disk    # the default build has none of it
+```
+
+`scripts/pico-shell.sh` then adds the pin devices to the guest's device tree
+(it does so whenever the kernel has their drivers).
+
+| Linux | Board |
+|---|---|
+| `/dev/gpiochip0` ("rp2350-gpio", lines 0-47 = GP0-GP47) | free pins GP1-GP3, GP8-GP15, GP20-GP22, GP26-GP28, GP30-GP39; pull-up/pull-down/none, rising/falling edge events |
+| `/dev/i2c-0`, `/dev/i2c-1` | I2C0 on GP4 (SDA) / GP5 (SCL), I2C1 on GP6 / GP7; 100 kHz, internal pull-ups |
+| `/dev/spidev0.0` | SPI0: GP16 MISO, GP17 CS, GP18 SCK, GP19 MOSI; up to 50 MHz, modes 0-3, 8-bit |
+| `/sys/class/pwm/pwmchip0` (channel N = GPN) | any free GPIO below 40; pins on one slice share its period |
+| IIO `rp2350-adc` (`/sys/bus/iio/devices/iio:device0`) | `in_voltage0..7` = GP40-GP47 (mV = raw x `in_voltage_scale`), `in_temp` (the chip's sensor, m°C = (raw + offset) x scale) |
+
+GP0 (the PSRAM's chip select) and GP23/24/25/29 (the radio) are not offered
+to the guest; the gpiochip names every line (`gpioinfo`). The pins build has
+the tools for them, all of which also work under `rvemu -G` on the Mac:
+
+```
+gpioset -c gpiochip0 GP15=1 &          # libgpiod 2: gpiodetect, gpioinfo, gpioget, gpioset, gpiomon
+gpiomon -c gpiochip0 -e both GP14
+i2cdetect -y 0                         # i2c-tools: i2cdetect, i2cget, i2cset, i2ctransfer
+spidev_test -D /dev/spidev0.0 -v -p 'hi'
+micropython -c 'from machine import Pin; Pin(15, Pin.OUT).value(1)'
+cd /usr/share/examples/pins; ./i2c-scan 1   # C examples, built and as source
+```
+
+MicroPython's `machine` module has `Pin` (with `irq()`), `I2C`, `SPI`, `PWM`
+and `ADC` (`ADC(Pin(40))`, `ADC(ADC.CORE_TEMP).read_temp()`), over the same
+interfaces. Details: [guest](guest/README.md#pins); the devices and the
+firmware side: [rvemu-rs](rvemu-rs/README.md) (Machine, and Pins under
+rvemu-pico-shell).
 
 ## Prerequisites (macOS)
 
