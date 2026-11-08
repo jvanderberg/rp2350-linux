@@ -57,7 +57,7 @@ if [[ $stage == disk* ]]; then
     grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Kconfig ||
       sed -i '$i config MTD_RVEMU_FLASH\n\ttristate "rvemu NOR flash device"\n\tdepends on HAS_IOMEM \&\& OF\n' drivers/mtd/devices/Kconfig
     grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Makefile ||
-      echo 'obj-$(CONFIG_MTD_RVEMU_FLASH) += rvemu-flash.o' >> drivers/mtd/devices/Makefile
+      echo "obj-\$(CONFIG_MTD_RVEMU_FLASH) += rvemu-flash.o" >> drivers/mtd/devices/Makefile
     # jffs2's GC thread CRC-checks every node after a mount: idle time only
     # (SCHED_IDLE, not nice 10), so a full /home doesn't hold up the boot. A
     # writer that runs out of space collects garbage itself.
