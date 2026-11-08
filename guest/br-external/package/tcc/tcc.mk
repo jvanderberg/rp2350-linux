@@ -91,6 +91,10 @@ endef
 define TCC_INSTALL_DEVFILES
 	cp -a $(TCC_DEVROOT)/. $(TARGET_DIR)/
 endef
+# A global hook, so only when tcc is selected: the initramfs guest has no
+# tcc build directory to copy from
+ifeq ($(BR2_PACKAGE_TCC),y)
 ROOTFS_PRE_CMD_HOOKS += TCC_INSTALL_DEVFILES
+endif
 
 $(eval $(generic-package))
