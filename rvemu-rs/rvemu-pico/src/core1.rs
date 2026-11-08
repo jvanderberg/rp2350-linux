@@ -28,7 +28,7 @@
 //! timer at the system clock), since a sleeping core's `mcycle` may stop.
 
 use core::cell::UnsafeCell;
-use core::mem::ManuallyDrop;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
@@ -36,8 +36,8 @@ use rp2350_board as board;
 use rp235x_hal as hal;
 
 /// What core1 runs: `poll` is called in a loop, forever. It must not block
-/// for long (the other services wait), and must not be moved once polled,
-/// which `launch` guarantees.
+/// for long (the other services wait). `launch` builds it in a static slot
+/// where it never moves, so it may hold pinned futures.
 pub trait Service {
     fn poll(&mut self);
 }
@@ -382,9 +382,8 @@ unsafe fn copy_core1_text() {
 
 // ------------------------------------------------------------------ launch
 
-/// core1's stack, in main SRAM. `launch` moves the service (the radio's
-/// driver future is most of it, 6-8 KB) onto it.
-const STACK_WORDS: usize = 3 * 1024;
+/// core1's stack, in main SRAM.
+const STACK_WORDS: usize = 1536;
 pub const STACK_BYTES: usize = STACK_WORDS * 4;
 #[repr(align(16))]
 struct Stack(UnsafeCell<[u32; STACK_WORDS]>);
@@ -393,9 +392,17 @@ unsafe impl Sync for Stack {}
 static STACK: Stack = Stack(UnsafeCell::new([0; STACK_WORDS]));
 const STACK_PAINT: u32 = 0xC07E_57AC;
 
+/// Where the service lives (`launch`): its size is checked at compile time.
+/// The radio's driver future is most of it.
+pub const SERVICE_BYTES: usize = 7 * 1024;
+#[repr(C, align(16))]
+struct ServiceSlot(UnsafeCell<MaybeUninit<[u8; SERVICE_BYTES]>>);
+// SAFETY: written by core0 before core1 starts, then core1's alone.
+unsafe impl Sync for ServiceSlot {}
+static SERVICE: ServiceSlot = ServiceSlot(UnsafeCell::new(MaybeUninit::uninit()));
+
 static ENTRY: AtomicUsize = AtomicUsize::new(0);
 static ARG: AtomicUsize = AtomicUsize::new(0);
-const MOVED: u32 = 0xC0DE_0001;
 
 // core1's first instructions: the bootrom sets sp and mtvec, but not gp.
 core::arch::global_asm!(
@@ -422,9 +429,8 @@ unsafe extern "C" {
 
 #[unsafe(link_section = ".data.core1")]
 extern "C" fn trampoline<S: Service>(arg: *mut S) -> ! {
-    // SAFETY: `launch` keeps the value alive (and never drops it) until we
-    // say it moved.
-    let s = unsafe { arg.read() };
+    // SAFETY: `launch` built it in SERVICE, which nothing else touches now.
+    let s = unsafe { &mut *arg };
     board::enable_counters();
     // Wake sources for `wfi` (interrupts stay off: mstatus.MIE is 0, so
     // nothing is taken, wfi just returns). PIO0's IRQ 0 output follows the
@@ -437,18 +443,13 @@ extern "C" fn trampoline<S: Service>(arg: *mut S) -> ! {
         hal::arch::interrupt_unmask(hal::pac::Interrupt::SIO_IRQ_BELL);
         core::arch::asm!("csrs mie, {0}", in(reg) (1u32 << 11) | (1 << 7));
     }
-    // SAFETY: the SIO FIFO is per core; this is core1's end.
-    let mut sio = hal::Sio::new(unsafe { hal::pac::Peripherals::steal() }.SIO);
-    sio.fifo.write_blocking(MOVED);
     RUNNING.store(true, Ordering::Release);
     run(s)
 }
 
-/// `s` lives in this frame from here on, so a pinned future inside it
-/// stays put.
 #[unsafe(link_section = ".data.core1")]
 #[inline(never)]
-fn run<S: Service>(mut s: S) -> ! {
+fn run<S: Service>(s: &mut S) -> ! {
     let tick = u64::from(TICK_SYS_MHZ.load(Ordering::Relaxed)) * u64::from(TICK_US);
     loop {
         // acknowledge doorbells first: one rung during the pass wakes the
@@ -470,10 +471,12 @@ fn run<S: Service>(mut s: S) -> ! {
 /// The system clock in MHz, for `TICK_US`.
 static TICK_SYS_MHZ: AtomicU32 = AtomicU32::new(150);
 
-/// Start `s` on core1 with its stack in SRAM8/9 (8 KB). Returns once
-/// core1 has taken it.
-pub fn launch<S: Service + Send>(fifo: &mut hal::sio::SioFifo, psm: &mut hal::pac::PSM, sys_hz: u32, s: S) {
-    const { assert!(size_of::<S>() + 2048 < STACK_WORDS * 4, "core1's service is too big for its stack") };
+/// Start core1 on the service `make` builds (straight into its static slot,
+/// so it never sits in a stack frame). Returns once core1 is running it.
+pub fn launch<S: Service + Send>(fifo: &mut hal::sio::SioFifo, psm: &mut hal::pac::PSM, sys_hz: u32, make: impl FnOnce() -> S) {
+    const {
+        assert!(size_of::<S>() <= SERVICE_BYTES && align_of::<S>() <= 16, "core1's service: raise SERVICE_BYTES");
+    };
     let stack = STACK.0.get().cast::<u32>();
     for i in 0..STACK_WORDS {
         // SAFETY: core1 isn't running yet.
@@ -484,9 +487,12 @@ pub fn launch<S: Service + Send>(fifo: &mut hal::sio::SioFifo, psm: &mut hal::pa
     TICK_SYS_MHZ.store(sys_hz / 1_000_000, Ordering::Relaxed);
     // the SIO RISC-V timer at the system clock: `now()`
     wr(MTIME_CTRL, 0b11);
-    let mut s = ManuallyDrop::new(s);
+    let s = SERVICE.0.get().cast::<S>();
+    // SAFETY: the slot is big and aligned enough (checked above), and core1
+    // isn't running yet.
+    unsafe { s.write(make()) };
     ENTRY.store(trampoline::<S> as *const () as usize, Ordering::Relaxed);
-    ARG.store(&raw mut *s as usize, Ordering::Relaxed);
+    ARG.store(s as usize, Ordering::Relaxed);
 
     // Reset core1 into the bootrom, which then waits for this sequence.
     psm.frce_off().modify(|_, w| w.proc1().set_bit());
@@ -506,7 +512,9 @@ pub fn launch<S: Service + Send>(fifo: &mut hal::sio::SioFifo, psm: &mut hal::pa
         fifo.write_blocking(cmd);
         i = if fifo.read_blocking() == cmd { i + 1 } else { 0 };
     }
-    while fifo.read_blocking() != MOVED {}
+    while !RUNNING.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
 }
 
 /// core1's deepest stack use so far, in bytes (from the paint `launch` put

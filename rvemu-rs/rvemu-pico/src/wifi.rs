@@ -450,8 +450,7 @@ pub static LINK_UP: AtomicBool = AtomicBool::new(false);
 /// core1's radio service: drives the driver, moves frames between it and
 /// the rings, publishes the MAC and the link state.
 pub struct RadioService<F> {
-    /// Pinned in place: the service never moves once core1 polls it
-    /// (`core1::Service`).
+    /// Pinned in place: services never move (`core1::launch`).
     fut: F,
     /// When bring-up started, and how long it may take.
     t0: u64,
@@ -470,7 +469,7 @@ impl<F: Future<Output = ()>> RadioService<F> {
 
     fn poll_driver(&mut self) {
         let mut cx = Context::from_waker(core1::waker());
-        // SAFETY: `fut` never moves once polled (see the field).
+        // SAFETY: `fut` never moves (see the field).
         let _ = unsafe { Pin::new_unchecked(&mut self.fut) }.poll(&mut cx);
     }
 }

@@ -379,11 +379,8 @@ fn main() -> ! {
         fail("run scripts/pico-shell.sh");
     }
 
-    // The radio comes up on core1 while the guest boots; the guest waits
-    // for its MAC (at most `RADIO_BRING_UP_MS`) when it probes the NIC.
     let radio_pins = RadioPins { pwr: pins.gpio23, dio: pins.gpio24, cs: pins.gpio25, clk: pins.gpio29 };
     let creds = Creds::from_flash();
-    let driver = wifi::driver(pac.PIO0, &mut pac.RESETS, sys_hz, radio_pins, creds);
     if let Some(c) = creds {
         rprintln!("[wifi] joining {:?} in the background", c.ssid());
     }
@@ -409,16 +406,18 @@ fn main() -> ! {
         .build();
     let ms = |n: u32| u64::from(sys_hz / 1000) * u64::from(n);
     core1::paint_stack(core0_stack().0, 256);
-    core1::launch(
-        &mut sio.fifo,
-        &mut pac.PSM,
-        sys_hz,
-        Io {
-            console: usbcon::UsbConsole::new(usb, serial, sys_hz),
-            radio: wifi::RadioService::new(driver, sys_hz, RADIO_BRING_UP_MS),
-            status: Status { next: 0, period: u64::from(sys_hz) * u64::from(STATUS_S) },
-        },
-    );
+    // The radio comes up on core1 while the guest boots; the guest waits
+    // for its MAC (at most `RADIO_BRING_UP_MS`) when it probes the NIC.
+    let resets = &mut pac.RESETS;
+    core1::launch(&mut sio.fifo, &mut pac.PSM, sys_hz, move || Io {
+        console: usbcon::UsbConsole::new(usb, serial, sys_hz),
+        radio: wifi::RadioService::new(
+            wifi::driver(pac.PIO0, resets, sys_hz, radio_pins, creds),
+            sys_hz,
+            RADIO_BRING_UP_MS,
+        ),
+        status: Status { next: 0, period: u64::from(sys_hz) * u64::from(STATUS_S) },
+    });
     // Self-test of the guard that flash writes use.
     let t0 = board::mcycle64();
     drop(core1::park());
