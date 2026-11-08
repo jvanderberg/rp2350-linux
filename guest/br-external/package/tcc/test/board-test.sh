@@ -22,7 +22,7 @@ tar czf "$W/t.tgz" -C "$W" tcc-test
 start=$(date +%s)
 "$CMD" -- 'rm -rf /tmp/tcc-test /tmp/t.tgz'
 ./push.py "$W/t.tgz" /tmp/t.tgz
-"$CMD" -- 'cd /tmp && tar xzf t.tgz && rm t.tgz && ls tcc-test | wc -l'
+"$CMD" -- 'cd /tmp && gunzip -c t.tgz | tar xf - && rm t.tgz && ls tcc-test | wc -l'
 echo "board-test: copied in $(($(date +%s) - start)) s"
 start=$(date +%s)
 "$CMD" --timeout 1800 -- "sh /tmp/tcc-test/run.sh ${1:-}"

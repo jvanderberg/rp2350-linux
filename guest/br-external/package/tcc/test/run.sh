@@ -56,7 +56,9 @@ if [ "$1" = selfhost ]; then
 	# /tmp is RAM, and the compiler needs 2-2.6 MB of its own
 	rm -f hello ll fp misc arith gpio lib a.out ./*.o libvec.a
 	mkdir -p tcc-src && cd tcc-src || exit 1
-	tar xzf ../tcc-src.tgz config.h tcc.h tcctok.h libtcc.h elf.h stab.h \
+	# src FILE...: unpack FILEs from tcc-src.tgz (busybox tar has no -z)
+	src() { gunzip -c ../tcc-src.tgz | tar xf - "$@"; }
+	src config.h tcc.h tcctok.h libtcc.h elf.h stab.h \
 		stab.def dwarf.h tcclib.h riscv64-tok.h
 	# build CC OUT: tcc one file at a time, as its Makefile does (as one
 	# unit, tcc needs about 3 MB more than the guest has)
@@ -64,8 +66,8 @@ if [ "$1" = selfhost ]; then
 		b0=$(cut -d' ' -f1 /proc/uptime)
 		for u in tcc libtcc tccpp tccgen tccdbg tccelf tccasm tccrun \
 			riscv32-gen riscv64-link riscv64-asm; do
-			tar xzf ../tcc-src.tgz "$u.c" || return 1
-			if [ "$u" = tcc ]; then tar xzf ../tcc-src.tgz tcctools.c; fi
+			src "$u.c" || return 1
+			if [ "$u" = tcc ]; then src tcctools.c; fi
 			peak "$1-$u.c" "$1" -DONE_SOURCE=0 -c "$u.c" -o "$u.o" || return 1
 			rm -f "$u.c" tcctools.c
 		done
