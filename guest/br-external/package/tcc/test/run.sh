@@ -58,18 +58,22 @@ if [ "$1" = selfhost ]; then
 	mkdir -p tcc-src && cd tcc-src || exit 1
 	# src FILE...: unpack FILEs from tcc-src.tgz (busybox tar has no -z)
 	src() { gunzip -c ../tcc-src.tgz | tar xf - "$@"; }
-	src config.h tcc.h tcctok.h libtcc.h elf.h stab.h \
-		stab.def dwarf.h tcclib.h riscv64-tok.h
+	# the headers, and the target files that tcc.h includes for their defines
+	src config.h tcc.h tcctok.h libtcc.h elf.h stab.h stab.def dwarf.h \
+		tcclib.h riscv64-tok.h riscv32-gen.c riscv64-link.c riscv64-asm.c
 	# build CC OUT: tcc one file at a time, as its Makefile does (as one
 	# unit, tcc needs about 3 MB more than the guest has)
 	build() {
 		b0=$(cut -d' ' -f1 /proc/uptime)
 		for u in tcc libtcc tccpp tccgen tccdbg tccelf tccasm tccrun \
 			riscv32-gen riscv64-link riscv64-asm; do
-			src "$u.c" || return 1
-			if [ "$u" = tcc ]; then src tcctools.c; fi
+			case $u in
+			riscv*) ;;
+			tcc) src tcc.c tcctools.c || return 1 ;;
+			*) src "$u.c" || return 1 ;;
+			esac
 			peak "$1-$u.c" "$1" -DONE_SOURCE=0 -c "$u.c" -o "$u.o" || return 1
-			rm -f "$u.c" tcctools.c
+			case $u in riscv*) ;; *) rm -f "$u.c" tcctools.c ;; esac
 		done
 		peak "$1-link" "$1" -o "$2" tcc.o libtcc.o tccpp.o tccgen.o tccdbg.o \
 			tccelf.o tccasm.o tccrun.o riscv32-gen.o riscv64-link.o \
