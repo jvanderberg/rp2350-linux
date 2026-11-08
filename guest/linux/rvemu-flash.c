@@ -113,8 +113,27 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 }
 static DEVICE_ATTR_RO(stats);
 
+/*
+ * Writing 1 erases the whole device. jffs2 refuses to mount flash that holds
+ * no valid node at all (and won't erase it), so overlay-init formats with
+ * this when the mount fails.
+ */
+static ssize_t format_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct rvfl *f = dev_get_drvdata(dev);
+	int ret;
+
+	if (!sysfs_streq(buf, "1"))
+		return -EINVAL;
+	ret = rvfl_cmd(f, RVFL_CMD_ERASE, 0, NULL, f->mtd.size);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(format);
+
 static struct attribute *rvfl_attrs[] = {
 	&dev_attr_stats.attr,
+	&dev_attr_format.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(rvfl);

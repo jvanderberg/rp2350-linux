@@ -16,9 +16,22 @@ mount --move /dev /overlay/root/dev
 cd /overlay/root
 # /home: jffs2 on the board's flash region (the rvemu,flash MTD device),
 # kept across reboots; /root lives in it as /home/root. jffs2 formats blank
-# or foreign flash itself (it erases what it can't parse, in the background).
+# flash itself, and erases blocks it can't parse, but it won't mount flash
+# that holds no jffs2 node at all (garbage): format that through the driver.
 mkdir -p home
+ok=0
 if mount -t jffs2 -o noatime mtd0 home; then
+  ok=1
+else
+  mount -t sysfs sysfs /sys
+  F=/sys/bus/platform/devices/f8000400.flash/format
+  if [ -e $F ]; then
+    echo "overlay-init: no jffs2 filesystem in the /home flash; formatting it"
+    echo 1 > $F && mount -t jffs2 -o noatime mtd0 home && ok=1
+  fi
+  umount /sys
+fi
+if [ $ok = 1 ]; then
   [ -d home/root ] || { mkdir -m 700 home/root && cp -a /root/. home/root/; }
   mount --bind home/root root
 else
