@@ -138,11 +138,17 @@ pub struct Uart {
     dll: u8,
     dlh: u8,
     scr: u8,
+    /// FIFO control: bit 0 is "FIFOs enabled", which IIR reports back
+    /// (bits 6 and 7), making the guest see a 16550A and send 16 bytes
+    /// per transmit interrupt instead of one. A byte written to THR goes
+    /// out at once, so the transmit FIFO is never full.
+    fcr: u8,
     thre_pending: bool,
 }
 
 impl Uart {
-    fn iir(&self, rx: bool) -> u8 {
+    /// The interrupt identification (IIR bits 0..3).
+    fn iir_id(&self, rx: bool) -> u8 {
         if self.ier & 1 != 0 && rx {
             0x04 // received data available
         } else if self.ier & 2 != 0 && self.thre_pending {
@@ -153,7 +159,7 @@ impl Uart {
     }
 
     pub fn irq_line(&self, con: &impl Console) -> bool {
-        self.iir(con.rx_ready()) != 0x01
+        self.iir_id(con.rx_ready()) != 0x01
     }
 
     pub fn load(&mut self, off: u32, size: u32, con: &mut impl Console) -> Result<u32, u32> {
@@ -167,11 +173,12 @@ impl Uart {
             1 if dlab => self.dlh as u32,
             1 => self.ier as u32,
             2 => {
-                let iir = self.iir(con.rx_ready());
-                if iir == 0x02 {
+                let id = self.iir_id(con.rx_ready());
+                if id == 0x02 {
                     self.thre_pending = false;
                 }
-                iir as u32
+                let fifo = if self.fcr & 1 != 0 { 0xC0 } else { 0 };
+                (fifo | id) as u32
             }
             3 => self.lcr as u32,
             4 => self.mcr as u32,
@@ -202,6 +209,7 @@ impl Uart {
                 }
                 self.ier = b & 0x0F;
             }
+            2 => self.fcr = b & 0xC9, // enable, trigger level; the clears are instant
             3 => self.lcr = b,
             4 => self.mcr = b,
             7 => self.scr = b,
