@@ -32,7 +32,7 @@ CONFIG_NET_CORE=y
 CONFIG_VIRTIO_NET=y
 # CONFIG_ETHERNET is not set
 # CONFIG_WLAN is not set
-# memory: the guest has 8 MiB in all
+# memory: the guest has 8 MiB less 64 KiB (the native engine) in all
 CONFIG_BASE_SMALL=y
 # 1 KiB instead of 256 KiB (RFC 6056 port perturbation; one host)
 CONFIG_INET_TABLE_PERTURB_ORDER=8
