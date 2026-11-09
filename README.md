@@ -1,10 +1,18 @@
 # rp2350-linux
 
-Linux 6.12 on an RP2350B board. The RP2350's Hazard3 RISC-V cores have no
-MMU, so they can't run Linux themselves: one of them runs an emulated
-RISC-V CPU that has one, and the kernel runs on that. The guest has the
-board's 8 MB PSRAM as RAM, a root filesystem in flash, `/home` on flash,
-a USB serial console, Wi-Fi networking and an SSH server.
+Linux 6.12 on a Raspberry Pi RP2350 microcontroller. The chip has no MMU,
+so one of its Hazard3 RISC-V cores runs an emulated RISC-V CPU that does,
+and the kernel boots on that. The emulator and the board firmware are
+written in Rust. The board's 8 MB PSRAM is the guest's RAM and its 16 MB
+flash holds the root filesystem, `/home` and swap. You get a login prompt
+on the USB serial port, Wi-Fi, SSH, and a C compiler on the board.
+
+Two things make it a working computer rather than a stunt. The emulator
+doesn't interpret: it translates the guest's RISC-V code into the Hazard3's
+own RISC-V code a block at a time and runs that, about twenty times faster
+than interpreting. And SSH's cryptography (X25519, Ed25519, sntrup761 and
+ChaCha20-Poly1305) runs as native code in the firmware, so Dropbear's key
+exchange runs at the Hazard3's speed, not the emulated CPU's.
 
 ```
 rp2350 login: root
@@ -14,25 +22,26 @@ Linux rp2350 6.12.116 #29 Sun Nov  8 12:56:58 UTC 2026 riscv32 GNU/Linux
 
 ## What's included
 
-| | Default | How to use it |
+| Feature | Default | How to use it |
 |---|---|---|
 | [USB console and Wi-Fi](#console-and-network) | on | `screen /dev/cu.usbmodemrvemu1 115200`; `eth0` |
 | [`/home` and `/root` on flash](#home-on-flash) | on | files there are kept across reboots |
 | [SSH](#ssh) | on | `ssh root@ADDRESS` with your key in `/root/.ssh/authorized_keys` |
 | [C compiler](#c-compiler) | on | `cc`, `tcc -run`, `tcc -ar` |
 | [Swap on flash](#swap) | off | `scripts/pico-shell.sh -w` |
-| [GPIO, I2C, SPI, PWM, ADC](#pins) | on | `gpioinfo`, `i2cdetect`, MicroPython `machine` |
+| [GPIO, I2C, SPI, PWM, ADC](#gpio-i2c-spi-pwm-adc) | on | `gpioinfo`, `i2cdetect`, MicroPython `machine` |
 
-The guest also has nano, mg, BusyBox `vi`, MicroPython, Lua 5.4, htop,
-tmux, lrzsz, bc, ncdu, lsof, less, and `ssh` and `scp` to other hosts. Log in as root, no password.
+The guest also has editors (nano, mg, BusyBox `vi`), languages
+(MicroPython, Lua 5.4, and C through `cc`), and tools (htop, tmux, lrzsz,
+bc, ncdu, lsof, less, and `ssh` and `scp` to other hosts).
 
 In the examples, lines starting with `#` are in the board's shell, and
 lines starting with `$` on the Mac the board is plugged into.
 
 ## Hardware
 
-- An RP2350B board with 8 MB APS6404L PSRAM on QMI CS1 (GP0) and 16 MB of
-  flash.
+- An RP2350B board with 16 MB of flash and 8 MB of PSRAM (APS6404L on QMI
+  CS1, GP0).
 - An RM2 (CYW43439) Wi-Fi module on the Pico 2 W pins: GP23 WL_ON, GP24
   data/IRQ, GP25 CS, GP29 CLK. Optional: without it `eth0` stays down.
 - The board's USB to the Mac, for loading and the console.
@@ -183,7 +192,7 @@ Filename				Type		Size		Used		Priority
 Swap:          1788         116        1672
 ```
 
-## Pins
+## GPIO, I2C, SPI, PWM, ADC
 
 The guest has the board's pins through the standard Linux interfaces:
 
