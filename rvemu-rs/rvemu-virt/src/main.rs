@@ -28,7 +28,14 @@ _start:
     sw zero, 0(t0)
     addi t0, t0, 4
     j 1b
-2:  la t0, trap_entry
+2:  la t0, __stack_bottom
+    la t1, __stack_top
+    li t2, 0x51ac51ac
+4:  bgeu t0, t1, 5f
+    sw t2, 0(t0)
+    addi t0, t0, 4
+    j 4b
+5:  la t0, trap_entry
     csrw mtvec, t0
     call main
 3:  j 3b
@@ -185,6 +192,7 @@ impl Console for VirtConsole {
 }
 
 struct VirtBus {
+    benchmarks: rvcore::benchmark::Log,
     plat: Platform<VirtConsole, MemDisk>,
 }
 
@@ -198,7 +206,7 @@ impl VirtBus {
             let disk = unsafe { MemDisk::new(DISK as *const u8, disk_len as usize) };
             Platform::new(con).with_disk(disk, GuestMem { ptr: ram as *mut u8, base: 0, size: ram_size, ro: 0 })
         };
-        VirtBus { plat }
+        VirtBus { plat, benchmarks: Default::default() }
     }
 }
 
@@ -210,6 +218,11 @@ impl VirtBus {
 }
 
 impl Bus for VirtBus {
+    fn benchmark_supported(&self) -> bool { true }
+    fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
+        let host = host_instret();
+        self.benchmarks.record(cpu, tag, host, 0)
+    }
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
         self.plat.mmio_load(pa, size)
     }
@@ -301,6 +314,10 @@ const STORE_KB: usize = match option_env!("RVEMU_STORE_KB") {
 };
 const STORE_ADDR: usize = 0x8900_0000;
 static mut STORE_EPOCHS: [u8; 16384] = [0; 16384];
+#[cfg(feature = "pv-buffers")]
+static mut NATIVE: MaybeUninit<rvcore::NativeWorkspace> = MaybeUninit::uninit();
+#[cfg(feature = "pv-buffers")]
+static mut REF_NATIVE: MaybeUninit<rvcore::NativeWorkspace> = MaybeUninit::uninit();
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 static mut REF_CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 
@@ -350,7 +367,10 @@ extern "C" fn main() -> ! {
 
     let cpu: &mut Cpu = unsafe {
         let p = (*addr_of_mut!(CPU)).as_mut_ptr();
-        Cpu::init(p, GUEST_RAM as *mut u8, 0, ram_size, 0, dtb)
+        let c = Cpu::init(p, GUEST_RAM as *mut u8, 0, ram_size, 0, dtb);
+        #[cfg(feature = "pv-buffers")]
+        c.set_native_workspace(rvcore::NativeWorkspace::init_at((*addr_of_mut!(NATIVE)).as_mut_ptr()));
+        c
     };
     let mut bus = VirtBus::new(VirtConsole::new(info.batch != 0, false, until), info.disk_len, GUEST_RAM, ram_size);
 
@@ -403,7 +423,10 @@ extern "C" fn main() -> ! {
                 unsafe {
                     core::ptr::copy_nonoverlapping(GUEST_RAM as *const u8, REF_RAM as *mut u8, ram_size as usize);
                     let p = (*addr_of_mut!(REF_CPU)).as_mut_ptr();
-                    Some(Cpu::init(p, REF_RAM as *mut u8, 0, ram_size, 0, dtb))
+                    let c = Cpu::init(p, REF_RAM as *mut u8, 0, ram_size, 0, dtb);
+                    #[cfg(feature = "pv-buffers")]
+                    c.set_native_workspace(rvcore::NativeWorkspace::init_at((*addr_of_mut!(REF_NATIVE)).as_mut_ptr()));
+                    Some(c)
                 }
             } else {
                 None
@@ -475,8 +498,24 @@ extern "C" fn main() -> ! {
         }
     }
     let host = host_instret() - t0;
+    // High-water mark includes setup and all native operations, not just JIT
+    // frames. Read only after taking the timed host-instruction snapshot.
+    unsafe extern "C" { static __stack_bottom: u32; static __stack_top: u32; }
+    let bottom = &raw const __stack_bottom as usize;
+    let top = &raw const __stack_top as usize;
+    let untouched = (bottom..top).step_by(4)
+        .take_while(|&a| unsafe { read_volatile(a as *const u32) } == 0x51ac51ac).count()*4;
+    println!("native firmware stack high-water {} of {} bytes", top-bottom-untouched, top-bottom);
     println!("\n[rvemu-virt] stopped: {:?} at pc={:#010x}", cpu.halt, cpu.pc);
     println!("guest instructions {}", cpu.instret);
+    println!("native buffer calls {:?}", cpu.stats.native_buffer_calls);
+    println!("idle ticks {}", cpu.stats.idle_ticks);
+    #[cfg(feature = "pv-buffers")]
+    {
+        println!("native operation stack peaks {:?}", cpu.native_stack_peaks());
+        println!("native workspace bytes {}", core::mem::size_of::<rvcore::NativeWorkspace>());
+    }
+    for point in bus.benchmarks.points() { println!("{point}"); }
     if cpu.stats.until_instret != 0 {
         println!("  to --until match {}", cpu.stats.until_instret);
     }

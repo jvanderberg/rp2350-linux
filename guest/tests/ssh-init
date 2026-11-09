@@ -1,0 +1,93 @@
+#!/bin/sh
+# Disposable guest-only SSH test. Both endpoints and all keys live here.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+fail() { echo 'SSH TEST FAIL'; [ -f /tmp/server.log ] && cat /tmp/server.log; poweroff -f; while :; do sleep 60; done; }
+set -e
+trap fail EXIT
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /tmp /root/.ssh
+mount -t devpts devpts /dev/pts
+chmod 700 /root/.ssh
+ifconfig lo 127.0.0.1 up
+mode=$(sed -n 's/.*ssh_offload=\([a-z]*\).*/\1/p' /proc/cmdline)
+case $mode in
+ off) export RVEMU_SSH_OFFLOAD=0;;
+ *) export RVEMU_SSH_OFFLOAD=1;;
+esac
+echo "SSH OFFLOAD MODE ${mode:-on}"
+if [ "$mode" != off ] && [ -c /dev/rvemu-ssh ]; then ssh-ioctl-test; fi
+case "$(cat /proc/cmdline)" in
+ *ssh_test=connection*) ;;
+ *) if [ "$mode" != off ] && [ -c /dev/rvemu-crypto ]; then crypto-ioctl-test; fi;;
+esac
+printf 'SSH TEST BEGIN\n'; cat /proc/meminfo | head -3
+# Generate independent, disposable Ed25519 host and client keys inside guest.
+dropbearkey -t ed25519 -f /tmp/hostkey >/tmp/keygen.log 2>&1
+dropbearkey -t ed25519 -f /tmp/clientkey >>/tmp/keygen.log 2>&1
+dropbearkey -y -f /tmp/clientkey | sed -n '/^ssh-ed25519 /p' > /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+servermode=$RVEMU_SSH_OFFLOAD
+[ "$mode" = client ] && servermode=0
+RVEMU_SSH_OFFLOAD=$servermode dropbear -F -E -s -p 127.0.0.1:2222 -r /tmp/hostkey -P /tmp/dropbear.pid > /tmp/server.log 2>&1 &
+server=$!
+# A single guest tick delay gives the listening process a chance to run.
+sleep 1
+[ "$mode" = server ] && export RVEMU_SSH_OFFLOAD=0
+ssh() { dbclient -y -i /tmp/clientkey -p 2222 -c chacha20-poly1305@openssh.com root@127.0.0.1 "$@"; }
+finish() {
+    kill "$server"
+    trap - EXIT
+    echo 'SSH TEST PASS'
+    poweroff -f
+    while :; do sleep 60; done
+}
+case "$(cat /proc/cmdline)" in
+ *ssh_test=connection*)
+    repeats=$(sed -n 's/.*ssh_repeats=\([0-9]*\).*/\1/p' /proc/cmdline)
+    repeats=${repeats:-1}
+    export RVEMU_SSH_BENCH=1
+    i=1
+    while [ "$i" -le "$repeats" ]; do
+        # true runs AFTER the authentication endpoint marker. Its successful
+        # exit verifies the connection but is excluded from measured deltas.
+        ssh true
+        echo "SSH CONNECTION PASS $i"
+        i=$((i+1))
+    done
+    finish
+    ;;
+esac
+[ "$(ssh 'echo authenticated')" = authenticated ]
+echo 'SSH AUTH PASS'
+set +e
+ssh 'exit 7'
+rc=$?
+set -e
+[ "$rc" = 7 ]
+echo 'SSH EXIT STATUS PASS'
+# Use noncompressible data and compare the complete encrypted round trip.
+dd if=/dev/urandom of=/tmp/input bs=1024 count=64 2>/dev/null
+ssh 'cat > /tmp/remote' < /tmp/input
+ssh 'cat /tmp/remote' > /tmp/output
+cmp /tmp/input /tmp/output
+sha256sum /tmp/input /tmp/output
+echo 'SSH TRANSFER PASS 65536 bytes each direction'
+# Stream larger workloads without storing megabytes in an 8 MiB guest.
+bulk=$(sed -n 's/.*ssh_bulk_mib=\([0-9]*\).*/\1/p' /proc/cmdline)
+bulk=${bulk:-1}
+chunks=$((bulk * 16))
+stream() { i=0; while [ "$i" -lt "$chunks" ]; do cat /tmp/input; i=$((i+1)); done; }
+stream | sha256sum | cut -d ' ' -f1 > /tmp/expected.hash
+stream | ssh 'sha256sum' | cut -d ' ' -f1 > /tmp/upload.hash
+cmp /tmp/expected.hash /tmp/upload.hash
+ssh "i=0; while [ \"\$i\" -lt $chunks ]; do cat /tmp/remote; i=\$((i+1)); done" | sha256sum | cut -d ' ' -f1 > /tmp/download.hash
+cmp /tmp/expected.hash /tmp/download.hash
+echo "SSH STREAM PASS $bulk MiB each direction"
+# A different key must not authenticate; password auth is compiled out.
+dropbearkey -t ed25519 -f /tmp/wrongkey >/tmp/wrong-keygen.log 2>&1
+if dbclient -y -i /tmp/wrongkey -p 2222 -c chacha20-poly1305@openssh.com root@127.0.0.1 true; then fail; fi
+echo 'SSH WRONG KEY REJECTED'
+cat /proc/meminfo | head -3
+finish

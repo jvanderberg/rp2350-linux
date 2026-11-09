@@ -7,9 +7,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE=${1:?mode}; shift
-K=../guest/out/Image; I=../guest/out/rootfs.cpio; D=; M=8; U="login:"; N=0; BATCH=1; ICOUNT=()
-while getopts "k:i:d:Dm:u:n:Ic" o; do case $o in
-  k) K=$OPTARG;; i) I=$OPTARG;; d) D=$OPTARG;; m) M=$OPTARG;; u) U=$OPTARG;; n) N=$OPTARG;; I) BATCH=0;;
+K=../guest/out/Image; I=../guest/out/rootfs.cpio; D=; M=8; U="login:"; A=; N=0; BATCH=1; ICOUNT=()
+while getopts "k:i:d:Dm:u:n:a:Ic" o; do case $o in
+  a) A=$OPTARG;; k) K=$OPTARG;; i) I=$OPTARG;; d) D=$OPTARG;; m) M=$OPTARG;; u) U=$OPTARG;; n) N=$OPTARG;; I) BATCH=0;;
   D) K=../guest/out-disk/Image; I=none; D=../guest/out-disk/rootfs.squashfs;;
   c) ICOUNT=(-icount "shift=0,align=off,sleep=off");; *) exit 2;; esac; done
 case $MODE in interp) MN=0;; jit) MN=1;; lockstep) MN=2;; *) echo "bad mode"; exit 2;; esac
@@ -22,14 +22,19 @@ need_file "$K" 'Run: (cd ../guest && ./run-build.sh all), or disk for -D.'
 [ -z "$D" ] || need_file "$D" 'Run: (cd ../guest && ./run-build.sh disk)'
 file_size() { python3 -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "$1"; }
 
-cargo build --locked -q --release -p rvemu
-cargo build --locked -q --release -p rvemu-virt --target riscv32imac-unknown-none-elf
+# The frontend feature also reserves native workspace memory.
+RVEMU_FEATURES=${RVEMU_FEATURES:-}
+RVEMU_FEATURES=${RVEMU_FEATURES//rvcore\/pv-buffers/pv-buffers}
+FEATURES=(); [ -n "${RVEMU_FEATURES:-}" ] && FEATURES=(--features "$RVEMU_FEATURES")
+cargo build --locked -q --release -p rvemu "${FEATURES[@]}"
+cargo build --locked -q --release -p rvemu-virt --target riscv32imac-unknown-none-elf "${FEATURES[@]}"
 ELF=target/riscv32imac-unknown-none-elf/release/rvemu-virt
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 # same device tree the Mac host generates for these inputs
 INITRD_ARGS=(); [ "$I" != none ] && INITRD_ARGS=(-i "$I")
 [ -n "$D" ] && INITRD_ARGS+=(-d "$D")
+[ -n "$A" ] && INITRD_ARGS+=(-a "$A")
 ./target/release/rvemu -D -m "$M" "${INITRD_ARGS[@]}" > "$T/guest.dts"
 DLEN=0; [ -n "$D" ] && DLEN=$(file_size "$D")
 dtc -q -I dts -O dtb -o "$T/guest.dtb" "$T/guest.dts"

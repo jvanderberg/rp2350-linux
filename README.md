@@ -4,7 +4,7 @@ Linux 6.12 on an RP2350B board. The RP2350's Hazard3 RISC-V cores have no
 MMU, so they can't run Linux themselves: one of them runs an emulated
 RISC-V CPU that has one, and the kernel runs on that. The guest has the
 board's 8 MB PSRAM as RAM, a root filesystem in flash, `/home` on flash,
-a USB serial console and Wi-Fi networking.
+a USB serial console, Wi-Fi networking and an SSH server.
 
 ```
 rp2350 login: root
@@ -18,12 +18,13 @@ Linux rp2350 6.12.116 #29 Sun Nov  8 12:56:58 UTC 2026 riscv32 GNU/Linux
 |---|---|---|
 | [USB console and Wi-Fi](#console-and-network) | on | `screen /dev/cu.usbmodemrvemu1 115200`; `eth0` |
 | [`/home` and `/root` on flash](#home-on-flash) | on | files there are kept across reboots |
+| [SSH](#ssh) | on | `ssh root@ADDRESS` with your key in `/root/.ssh/authorized_keys` |
 | [C compiler](#c-compiler) | on | `cc`, `tcc -run`, `tcc -ar` |
 | [Swap on flash](#swap) | off | `scripts/pico-shell.sh -w` |
 | [GPIO, I2C, SPI, PWM, ADC](#pins) | on | `gpioinfo`, `i2cdetect`, MicroPython `machine` |
 
 The guest also has nano, mg, BusyBox `vi`, MicroPython, Lua 5.4, htop,
-tmux, lrzsz, bc, ncdu, lsof and less. Log in as root, no password.
+tmux, lrzsz, bc, ncdu, lsof, less, and `ssh` and `scp` to other hosts. Log in as root, no password.
 
 In the examples, lines starting with `#` are in the board's shell, and
 lines starting with `$` on the Mac the board is plugged into.
@@ -102,6 +103,30 @@ $ scripts/pico-shell.sh          # reboot the board
 # md5sum -c /home/docs-test.md5
 /home/docs-test.bin: OK
 ```
+
+## SSH
+
+Dropbear listens on port 22, for public-key logins only (no passwords).
+Add your public key to `/root/.ssh/authorized_keys` on the console; it is
+on flash, so it stays across reboots. The board makes its host keys at the
+first connection and keeps them in `/home/dropbear`.
+
+Key exchange, signatures and packet encryption run in the firmware's
+native crypto engine, which also takes the top 64 KiB of the PSRAM.
+Programs can use the engine through `/dev/rvemu-crypto`
+([guest/README.md](guest/README.md#native-crypto-devices)).
+
+**Example:**
+
+```
+# mkdir -p -m 700 ~/.ssh
+# echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINrXPiG6AvyN7sIIVb4wgjCT2v0j7EJXD0pu+31IgmOo mac' >> ~/.ssh/authorized_keys
+$ ssh root@192.168.4.171 uname -a
+Linux rp2350 6.12.116 #34 Sun Nov  8 22:27:55 UTC 2026 riscv32 GNU/Linux
+$ scp -O notes.txt root@192.168.4.171:
+```
+
+The board has no SFTP server, so the Mac's `scp` needs `-O`.
 
 ## C compiler
 

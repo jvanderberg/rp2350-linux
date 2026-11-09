@@ -119,6 +119,43 @@ into the receiving checkout's `rvemu-rs/target/perf-gate/`. Keep the exported
 record with them, and compare only equivalent hardware, clocks and guests.
 Never reset a baseline merely to make a regression pass.
 
+## Native crypto on the board
+
+These flash and reboot the board too, and need the disk guest. The test
+image is the disk guest with the test programs and a vector file added
+(`guest/tests/build-board-crypto.sh`), in `guest/out-crypto`:
+
+```sh
+mkdir -p guest/out-crypto
+python3 rvemu-rs/scripts/board-crypto-vectors.py guest/out-crypto/crypto-vectors.bin
+docker run --rm --user 0 -v rvemu-guest-work:/work:ro -v "$PWD:/repo:ro" \
+  -v "$PWD/guest/out-crypto:/out" rvemu-guest bash /repo/guest/tests/build-board-crypto.sh
+```
+
+`board-crypto-vectors.py` writes the RFC 7748, RFC 8032, RFC 8439, SSH
+draft and sntrup761 draft vectors, the largest legal buffers, tampered
+inputs and malformed requests, and checks every expected output against
+the host build of the engine. `rvemu-rs/scripts/pico-crypto-test.py` loads
+the image (`pico-shell.sh -d ../guest/out-crypto`), logs in on the USB
+console and runs one of:
+
+| Command | On the board |
+|---|---|
+| `vectors` | the ioctl tests, every vector three times on one descriptor, each operation's cycles |
+| `ssh` | `ssh-board-test integration` (authentication, exit status, transfers both ways, a wrong key) with both ends native, both in software, and each end alone |
+| `connection -n N` | N fresh boots each native and software, one connection each, timed from connect to authentication |
+| `responsive` | ping over Wi-Fi and console round trips while native operations run back to back, and a `kill -9` in the middle of one |
+| `remote` | the Mac's OpenSSH logging in to a second Dropbear on the board, native and software |
+
+Close any terminal on the console port first. Results (JSON) and the
+console transcripts go to `rvemu-rs/target/pico-crypto/`. `ssh-board-test`
+keeps its keys in `/run`; nothing is written to flash.
+
+Under QEMU, `rvemu-rs/scripts/ssh-eval.py` runs the same SSH tests in an
+initramfs guest (`guest/tests/build-ssh-eval.sh`; it needs `guest/run-build.sh
+all`), and `rvemu-rs/scripts/native-crypto-eval.py` runs the vectors in
+translator/interpreter lockstep.
+
 ## Results and coverage boundaries
 
 Every check invocation writes a new `target/checks/TIMESTAMP-TIER/` directory.

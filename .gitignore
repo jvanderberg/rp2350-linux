@@ -9,6 +9,7 @@ build/
 /guest/out/
 /guest/out-disk/
 /guest/out-probe/
+/guest/out-crypto/
 # build logs
 /guest/*.log
 # junk

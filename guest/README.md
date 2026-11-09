@@ -13,14 +13,16 @@ is clean at the expected tag, retains `build-STAGE.log`, and writes
 
 Packages that Buildroot doesn't have live in `br-external`, a BR2_EXTERNAL
 tree named `RVEMU`: one directory per package under `package/`, and one
-`source` line per package in `Config.in`. `build.sh` always passes
+`source` line per package in `Config.in`. `package/dropbear` holds hooks on
+Buildroot's own `dropbear` instead (no `Config.in`). `build.sh` always passes
 `BR2_EXTERNAL` (Buildroot remembers it in the output directory).
 
 What `build.sh` rebuilds by itself, because Buildroot wouldn't:
 - a fresh `target/` when the configuration files differ from the last
   build, so an image holds only the configured packages;
 - BusyBox, when `busybox-disk.fragment` differs from the last build's;
-- an external package whose files changed (a new patch or `.mk`);
+- an external package whose files changed (a new patch or `.mk`), or
+  the files under `guest/` its `extra-sources` lists;
 - MicroPython, when the C modules it was built with differ from the
   build's.
 
@@ -35,8 +37,8 @@ and BusyBox init with a getty on ttyS0. Log in as root, no password.
 | Stages | `all`, `rootfs`, `kernel` | `disk`, `disk-rootfs`, `disk-kernel` |
 | Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `busybox-disk.fragment`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` |
 | Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay; `/home` and `/root` on jffs2 in flash |
-| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`), libgpiod tools, i2c-tools, spidev_test, MicroPython `machine`, the pin examples |
-| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, swap, MTD + jffs2, the pin drivers |
+| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`), Dropbear (SSH), libgpiod tools, i2c-tools, spidev_test, MicroPython `machine`, the pin examples |
+| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, swap, MTD + jffs2, the pin drivers, the native crypto devices |
 | Used by | the boot benchmark (`scripts/pico-linux.sh`), `pico-shell.sh -i` | `scripts/pico-shell.sh` (default) |
 
 Outputs in each directory: `Image`, `vmlinux`, `System.map`, `linux.config`
@@ -57,7 +59,7 @@ and the root filesystem.
   The `/dev/fd` and `/dev/std*` links are made at build time in
   `/lib/devlinks` and copied by one inittab line.
 - **Init scripts:** only `S02sysctl`, `S02swap` (which does nothing without
-  a swap device) and `S40network`. There is no syslogd, klogd, crond,
+  a swap device), `S40network` and `S50dropbear`. There is no syslogd, klogd, crond,
   seedrng (the device tree's `rng-seed` seeds the CRNG) or modules script.
   `dmesg` has the kernel log.
 - **Network:** `eth0` is virtio-net, bridged to the board's Wi-Fi radio.
@@ -180,7 +182,8 @@ Of note in `linux-disk.fragment`:
 | `CONFIG_INET_TABLE_PERTURB_ORDER=8` | a 1 KiB RFC 6056 port perturbation table |
 | `CONFIG_VIRTIO_NET`, `CONFIG_NET`, `UNIX`, `INET`, `PACKET` | Ethernet over virtio; tmux needs AF_UNIX |
 | `EPOLL`, `EVENTFD`, `TIMERFD`, `SIGNALFD`, `INOTIFY_USER`, `SYSVIPC`, `FILE_LOCKING` | what the packages expect |
-| `GPIO_CDEV`, `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO`, `RVEMU_*` | the board's pins |
+| `GPIO_CDEV`, `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO`, `RVEMU_GPIO` & co. | the board's pins |
+| `RVEMU_CRYPTO`, `RVEMU_SSH`, `RVEMU_BENCH` | the native crypto devices |
 | no `VT`, `INPUT`, `SERIO`, `HID_SUPPORT` | the board has only the serial console |
 
 ## Configuration notes
@@ -197,3 +200,90 @@ Of note in `linux-disk.fragment`:
   matters for the translator.
 - The disk kernel builds in its own source tree (`/work/linux-disk-*`):
   kbuild refuses out-of-tree builds from a tree that was built in place.
+
+## SSH
+
+Dropbear 2026.94 (Buildroot's package, with `BR2_PACKAGE_DROPBEAR_CLIENT`):
+`dropbear`, and `ssh`/`dbclient`, `scp`, `dropbearkey` and
+`dropbearconvert` as links to it. How to log in is in the top-level README.
+
+- **Server:** `S50dropbear` starts it on port 22 at boot. Password logins
+  are compiled out (`br-external/package/dropbear/localoptions.h`), so root
+  logs in with a key in `/root/.ssh/authorized_keys`. No reverse DNS. No SFTP
+  server: OpenSSH's `scp` needs `-O`.
+- **Host keys:** `/etc/dropbear` is a link to `/home/dropbear`
+  (`post-build-disk.sh`), which `/etc/default/dropbear` creates.
+  `dropbear -R` makes each key type's host key the first time a client asks
+  for it, so they last across reboots.
+- **Native crypto:** `br-external/package/dropbear` is not a package of
+  its own: `dropbear-rvemu.mk` adds a post-patch hook to Buildroot's
+  `dropbear`, which copies in the `rvemu-*.inc` adapters and the device
+  headers and runs `patch.py` (exact edits that fail on any other Dropbear
+  version). X25519, Ed25519 (keys, signing, verification), sntrup761 and
+  `chacha20-poly1305@openssh.com` packets then go through `/dev/rvemu-crypto`
+  and `/dev/rvemu-ssh`. The algorithms and wire format are Dropbear's. Where
+  a device is missing or a process can't open it (they are root-only),
+  Dropbear uses its own code; a failed authentication never falls back.
+  `RVEMU_SSH_OFFLOAD=0` in a process's environment makes it use its own code.
+- **Benchmark points:** with `RVEMU_SSH_BENCH=1`, `dbclient` marks the
+  connect, the TCP connection, the first key exchange and authentication on
+  `/dev/rvemu-bench`.
+- `patch.py` also makes `dbclient` run its loop handler as soon as the
+  last channel closes inside `channelio()`.
+
+## Native crypto devices
+
+The firmware's native engine (rvemu-rs/README.md) runs X25519, Ed25519,
+ChaCha20-Poly1305, sntrup761 and LZ4 outside the emulated CPU. The kernel
+drivers are in `linux/drivers/rvemu` (`CONFIG_RVEMU_CRYPTO`, `RVEMU_SSH`,
+`RVEMU_BENCH` in `linux-disk.fragment`). Each device appears only when the
+firmware has the engine, and is root-only (mode 0600).
+
+**`/dev/rvemu-crypto`** (`crypto-rvemu.c`, ABI in `rvemu-crypto.h`): one
+operation per `RVEMU_CRYPTO_RUN` ioctl. The request holds the operation,
+the input pointer and length, the output pointer and capacity, the
+parameters pointer and length, `output_len` (zero; set to the output's
+length on success) and `flags` (zero). Input and output are at most 32 KiB,
+parameters 4 KiB, and the buffers may overlap. Keys and random seeds come
+from the caller; the engine keeps no state between operations.
+
+| Op | Operation | Input | Parameters | Output |
+|---:|---|---|---|---|
+| 0 / 1 | raw LZ4 block decode / encode | block | none | bytes |
+| 2 / 3 | ChaCha20-Poly1305 (RFC 8439) seal / open | plaintext / ciphertext + tag | key32, nonce12, AAD (up to 1024) | ciphertext + tag / plaintext |
+| 4 / 5 | `chacha20-poly1305@openssh.com` packet seal / open | packet / packet + tag | payload key32, header key32, sequence (64-bit big-endian) | packet + tag / packet |
+| 6 | X25519 | peer public key32 (the basepoint for a public key) | private scalar32 | shared secret32 / public key32 |
+| 7 | Ed25519 public key | none | seed32 | public key32 |
+| 8 | Ed25519 sign | message | seed32 | signature64 |
+| 9 | Ed25519 verify (strict) | message | public key32, signature64 | none |
+| 10 | sntrup761 keypair | none | random seed32 | public key1158, secret key1763 |
+| 11 | sntrup761 encapsulate | public key1158 | random seed32 | ciphertext1039, shared secret32 |
+| 12 | sntrup761 decapsulate | ciphertext1039 | secret key1763 | shared secret32 |
+
+Errors: `EOPNOTSUPP` for an unknown operation, `EBADMSG` when
+authentication or a signature fails, a low-order X25519 point or bad LZ4,
+`EINVAL` for wrong lengths, `EMSGSIZE` for oversized buffers, `EINTR` when
+a fatal signal ends the wait. On any error the output buffer is untouched,
+or partly written on `EFAULT`; discard it. sntrup761 decapsulation of a bad
+ciphertext returns the implicit-rejection secret, not an error. The device
+serializes its callers; the kernel's buffers are wiped after every
+operation.
+
+A long operation doesn't stop the guest: the firmware runs it in 2 ms
+slices, the guest takes its interrupts between them, and the driver lets
+the scheduler run another task there (`cond_resched()`).
+
+**`/dev/rvemu-ssh`** (`ssh-rvemu.c`, `rvemu-ssh.h`): `RVEMU_SSH_CRYPT`
+seals (4) or opens (5) one `chacha20-poly1305@openssh.com` packet; the
+request carries the 64-byte key and the sequence number.
+
+**`/dev/rvemu-bench`** (`bench-rvemu.c`, `rvemu-ssh.h`):
+`RVEMU_BENCH_POINT` records a point (tag 0-3) with the firmware's cycle,
+instruction and XIP cache counters; `RVEMU_BENCH_REPORT` prints the points
+on the console and clears them, with the native operation counts and stack
+peaks since boot.
+
+The test programs in `tests/` (`crypto-ioctl-test.c`, `crypto-vectors.c`,
+`ssh-ioctl-test.c`, `ssh-board-test`, `rvemu-bench-report.c`) are not in
+the image; [docs/development.md](../docs/development.md) has the test
+images that add them.

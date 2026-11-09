@@ -194,6 +194,8 @@ impl Flash for ModelFlash {
 // ------------------------------------------------------------------ bus
 
 struct HostBus {
+    benchmarks: rvcore::benchmark::Log,
+    benchmark_epoch: Instant,
     plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>, StubPins>,
     interactive: bool,
 }
@@ -207,6 +209,10 @@ impl HostBus {
 }
 
 impl Bus for HostBus {
+    fn benchmark_supported(&self) -> bool { true }
+    fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
+        self.benchmarks.record(cpu, tag, 0, self.benchmark_epoch.elapsed().as_nanos() as u64)
+    }
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
         self.plat.mmio_load(pa, size)
     }
@@ -534,6 +540,9 @@ mod model {
 
 fn report(c: &Cpu, host_s: f64) {
     let s = &c.stats;
+    if rvcore::NATIVE_BUFFERS {
+        eprintln!("native buffer calls {:?}", s.native_buffer_calls);
+    }
     let op = &s.op;
     let n = c.instret;
     let alu = op[0x13] + op[0x33] + op[0x37] + op[0x17];
@@ -626,7 +635,7 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins,
                  RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc picks the devices)
   -b FILE        use this DTB instead of generating one
-  -m MB          guest RAM size (default 64)
+  -m MB          guest RAM size in MiB, or KiB as NK (default 64)
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only
                  guest RAM, as the RP2350 maps them from flash: RAM = BYTES + MB
   -a ARGS        kernel command line (default \"earlycon console=ttyS0\")
@@ -643,9 +652,10 @@ struct Opts {
     kernel: Option<String>,
     initrd: Option<String>,
     dtb: Option<String>,
-    ram_mb: u32,
+    /// -m: guest RAM in KiB
+    ram_kb: u32,
     /// -X: kernel text bytes kept outside the -m budget (the RP2350 reads
-    /// them from flash): guest RAM is text + ram_mb, the text read-only.
+    /// them from flash): guest RAM is text + ram_kb KiB, the text read-only.
     text: u32,
     bootargs: String,
     until: Option<String>,
@@ -664,12 +674,20 @@ struct Opts {
     io: bool,
 }
 
+/// `-m`: MiB, or KiB with a K suffix (`8128K`).
+fn parse_ram(s: &str) -> Option<u32> {
+    match s.strip_suffix('K') {
+        Some(k) => k.parse().ok(),
+        None => s.parse::<u32>().ok()?.checked_mul(1 << 10),
+    }
+}
+
 fn parse_args() -> Result<Opts, String> {
     let mut o = Opts {
         kernel: None,
         initrd: None,
         dtb: None,
-        ram_mb: 64,
+        ram_kb: 64 << 10,
         text: 0,
         bootargs: "earlycon console=ttyS0".into(),
         until: None,
@@ -694,7 +712,7 @@ fn parse_args() -> Result<Opts, String> {
             "-k" => o.kernel = Some(val()?),
             "-i" => o.initrd = Some(val()?),
             "-b" => o.dtb = Some(val()?),
-            "-m" => o.ram_mb = val()?.parse().map_err(|_| "bad -m")?,
+            "-m" => o.ram_kb = parse_ram(&val()?).ok_or("bad -m")?,
             "-X" => {
                 let v = val()?;
                 let n = match v.strip_prefix("0x") {
@@ -729,8 +747,8 @@ fn parse_args() -> Result<Opts, String> {
     if o.kernel.is_none() && !o.dump_dts {
         return Err(USAGE.into());
     }
-    if !(4..=1024).contains(&o.ram_mb) {
-        return Err("RAM size must be 4..1024 MB".into());
+    if !(4 << 10..=1 << 20).contains(&o.ram_kb) || !o.ram_kb.is_multiple_of(64) {
+        return Err("RAM size must be 4..1024 MiB, in 64 KiB steps".into());
     }
     if o.disk.is_some() && o.initrd.is_none() && !o.bootargs_set {
         o.bootargs = ROOT_ON_DISK.into();
@@ -749,7 +767,7 @@ fn read(path: &str) -> Result<Vec<u8>, String> {
 fn run() -> Result<(), String> {
     let o = parse_args()?;
     let ram_base = 0u32;
-    let ram_size = (o.ram_mb << 20) + o.text;
+    let ram_size = (o.ram_kb << 10) + o.text;
     let dtb_addr = ram_size - DTB_RESERVE;
 
     let initrd = o.initrd.as_deref().map(read).transpose()?;
@@ -802,7 +820,12 @@ fn run() -> Result<(), String> {
 
     // SAFETY: `ram` outlives `cpu` and is only accessed through it from here on.
     let mut cpu = Box::new(unsafe { Cpu::new(ram.as_mut_ptr(), ram_base, ram_size, ram_base, ram_base + dtb_addr) });
+    #[cfg(feature = "pv-buffers")]
+    cpu.set_native_workspace(Box::leak(Box::new(rvcore::NativeWorkspace::new())));
     if o.model || o.sim.is_some() {
+        if rvcore::NATIVE_BUFFERS {
+            return Err("native buffer calls are not supported by -M/-S; build without pv-buffers".into());
+        }
         cpu.inst.enable_model();
     }
     let mut sim = match &o.sim {
@@ -830,11 +853,12 @@ fn run() -> Result<(), String> {
     if o.io {
         plat = plat.with_io(StubPins::new(), gmem);
     }
-    let mut bus = HostBus { plat, interactive: !o.batch };
+    let mut bus = HostBus { plat, interactive: !o.batch,
+        benchmarks: Default::default(), benchmark_epoch: Instant::now() };
 
     eprintln!(
-        "[rvemu] RAM {} MiB, kernel {} bytes, initrd {} bytes @0x{:x}, dtb @0x{:x}",
-        o.ram_mb,
+        "[rvemu] RAM {}, kernel {} bytes, initrd {} bytes @0x{:x}, dtb @0x{:x}",
+        if o.ram_kb.is_multiple_of(1 << 10) { format!("{} MiB", o.ram_kb >> 10) } else { format!("{} KiB", o.ram_kb) },
         kimg.len(),
         initrd.as_ref().map_or(0, |d| d.len()),
         ram_base + initrd_addr,
@@ -892,6 +916,7 @@ fn run() -> Result<(), String> {
         if cpu.privilege == Priv::S { 'S' } else { 'U' }
     );
     report(&cpu, host_s);
+    for point in bus.benchmarks.points() { eprintln!("{point}"); }
     if let Some(s) = &mut sim {
         s.finish(&cpu)?;
     }

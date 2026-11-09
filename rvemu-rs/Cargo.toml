@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["rvcore", "rvemu", "rvjit", "rvemu-virt", "rvemu-pico"]
+members = ["rvaccel", "rvcore", "rvemu", "rvjit", "rvemu-virt", "rvemu-pico"]
+exclude = ["vendor/sntrup761"]
 # rvemu-virt (QEMU) and rvemu-pico (RP2350) are bare-metal riscv32 only;
 # jittest-guest is a separate workspace built for the guest (rv32ima)
 default-members = ["rvcore", "rvemu", "rvjit"]
@@ -10,3 +11,14 @@ debug = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The native crypto runs from flash behind the 16 KB XIP cache it shares with
+# PSRAM: small code keeps a curve operation's hot loop and stack in cache.
+[profile.release.package.curve25519-dalek]
+opt-level = "s"
+[profile.release.package.x25519-dalek]
+opt-level = "s"
+[profile.release.package.ed25519-dalek]
+opt-level = "s"
+[profile.release.package.rvaccel]
+opt-level = "s"

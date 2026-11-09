@@ -98,3 +98,11 @@ for d in /sys/block/vd*; do
 done
 S
 chmod 755 "$T/usr/bin/flashswap-stats"
+# SSH (Dropbear, S50dropbear): host keys in /home/dropbear, so they last
+# across reboots; dropbear -R makes them at the first connection
+ln -sfn /home/dropbear "$T/etc/dropbear"
+mkdir -p "$T/etc/default"
+cat > "$T/etc/default/dropbear" <<'D'
+# read by /etc/init.d/S50dropbear
+mkdir -p -m 700 /home/dropbear
+D

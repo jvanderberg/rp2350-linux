@@ -10,5 +10,10 @@ ram-code = []
 # Host-side instrumentation: unique-code bitmaps and the XIP cache model.
 # Needs `alloc`; leave off for the RP2350 build.
 instrument = []
+# Experimental firmware-specific SBI page operations; off in normal builds.
+pv-pages = []
+# Experimental bounded LZ4 and authenticated-encryption buffer calls.
+pv-buffers = ["dep:rvaccel"]
 
 [dependencies]
+rvaccel = { path = "../rvaccel", optional = true }

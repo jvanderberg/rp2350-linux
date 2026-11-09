@@ -1,0 +1,15 @@
+[package]
+name = "rvaccel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["safe-encode", "safe-decode"] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false }
+chacha20 = { version = "=0.9.1", default-features = false }
+poly1305 = { version = "=0.8.0", default-features = false }
+subtle = { version = "=2.6.1", default-features = false }
+zeroize = { version = "=1.9.1", default-features = false }
+x25519-dalek = { version = "=2.0.1", default-features = false }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
+sntrup761 = { path = "../vendor/sntrup761", default-features = false, features = ["kgen", "ecap", "dcap", "force-scalar"] }

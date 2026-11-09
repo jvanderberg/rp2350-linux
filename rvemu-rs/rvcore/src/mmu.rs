@@ -64,7 +64,7 @@ impl Cpu {
 
     #[inline(always)]
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    fn is_code_page(&self, ppage: u32) -> bool {
+    pub(crate) fn is_code_page(&self, ppage: u32) -> bool {
         if self.code_pages.is_null() {
             return false;
         }

@@ -51,13 +51,42 @@ impl Cpu {
         let mut err = 0i32;
         let mut val = 0u32;
         match eid {
+            crate::benchmark::EXT => {
+                if !bus.benchmark_supported() {
+                    err = ERR_NOT_SUPPORTED;
+                } else if fid == 0 {
+                    if !bus.benchmark_record(self, a0) {
+                        err = ERR_INVALID_PARAM;
+                    }
+                } else if fid == 1 {
+                    match bus.benchmark_report(self) {
+                        Some(n) => val = n,
+                        None => err = ERR_NOT_SUPPORTED,
+                    }
+                } else {
+                    err = ERR_NOT_SUPPORTED;
+                }
+            }
+            #[cfg(feature = "pv-buffers")]
+            crate::pv_buffers::EXT => (err, val) = self.pv_buffer(fid, bus),
+            #[cfg(feature = "pv-pages")]
+            crate::pv_pages::EXT => err = self.pv_page(fid, a0, a1),
             EXT_BASE => match fid {
                 0 => val = 0x0200_0000, // spec v2.0
                 1 => val = 0x5250_3233, // impl id "RP23"
                 2 => val = 1,
                 3 => {
                     val = matches!(a0, EXT_BASE | EXT_TIME | EXT_IPI | EXT_RFENCE | EXT_HSM | EXT_SRST)
-                        as u32
+                        as u32;
+                    if a0 == crate::benchmark::EXT { val = bus.benchmark_supported() as u32; }
+                    #[cfg(feature = "pv-buffers")]
+                    if a0 == crate::pv_buffers::EXT {
+                        val = self.native_buffers_supported() as u32;
+                    }
+                    #[cfg(feature = "pv-pages")]
+                    if a0 == crate::pv_pages::EXT {
+                        val = 1;
+                    }
                 }
                 4..=6 => val = 0,
                 _ => err = ERR_NOT_SUPPORTED,

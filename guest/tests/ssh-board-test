@@ -1,0 +1,69 @@
+#!/bin/sh
+# Real SSH on the board, both endpoints in the guest on 127.0.0.1:2222 with
+# fresh disposable Ed25519 keys (and the server's authorized_keys) in
+# /run/ssh-board-test, chacha20-poly1305@openssh.com and the default key
+# exchange; nothing on flash is touched. Run as root on the console.
+#   ssh-board-test integration MODE [BULK_MIB]   auth, exit status, 64 KiB
+#       each way, BULK_MIB (default 1) streamed each way, wrong key
+#   ssh-board-test connection MODE               one connection; benchmark
+#       points at connect and after authentication (dropbear's
+#       RVEMU_SSH_BENCH), then the firmware's report on the console
+# MODE: on (both endpoints native), off (both software), client or server
+# (only that endpoint native).
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+test=${1:?integration or connection}
+mode=${2:-on}
+bulk=${3:-1}
+T=/run/ssh-board-test
+server=
+fail() { echo "SSH TEST FAIL: $*"; [ -f $T/server.log ] && cat $T/server.log; [ -n "$server" ] && kill "$server"; exit 1; }
+case $mode in on|off|client|server) ;; *) fail "unknown mode $mode";; esac
+rm -rf $T && mkdir -m 700 -p $T || fail mkdir
+echo "SSH OFFLOAD MODE $mode"
+# key generation too: off means no native call at all
+if [ "$mode" = off ]; then export RVEMU_SSH_OFFLOAD=0; else export RVEMU_SSH_OFFLOAD=1; fi
+dropbearkey -t ed25519 -f $T/hostkey >$T/keygen.log 2>&1 || fail hostkey
+dropbearkey -t ed25519 -f $T/clientkey >>$T/keygen.log 2>&1 || fail clientkey
+dropbearkey -y -f $T/clientkey | sed -n '/^ssh-ed25519 /p' > $T/authorized_keys
+chmod 600 $T/authorized_keys
+srv=1; cli=1
+case $mode in off) srv=0; cli=0;; client) srv=0;; server) cli=0;; esac
+RVEMU_SSH_OFFLOAD=$srv dropbear -F -E -s -D $T -p 127.0.0.1:2222 -r $T/hostkey -P $T/dropbear.pid > $T/server.log 2>&1 &
+server=$!
+sleep 1
+export RVEMU_SSH_OFFLOAD=$cli
+ssh() { dbclient -y -y -i $T/clientkey -p 2222 -c chacha20-poly1305@openssh.com root@127.0.0.1 "$@"; }
+finish() { kill "$server"; wait "$server" 2>/dev/null; echo "SSH TEST PASS $test $mode"; exit 0; }
+if [ "$test" = connection ]; then
+    RVEMU_SSH_BENCH=1 ssh true || { fail connection; }
+    echo "SSH CONNECTION PASS"
+    rvemu-bench-report
+    finish
+fi
+[ "$test" = integration ] || fail "unknown test $test"
+[ "$(ssh 'echo authenticated')" = authenticated ] || { fail auth; }
+echo 'SSH AUTH PASS'
+ssh 'exit 7'
+rc=$?
+[ "$rc" = 7 ] || { fail "exit status $rc"; }
+echo 'SSH EXIT STATUS PASS'
+dd if=/dev/urandom of=$T/input bs=1024 count=64 2>/dev/null
+ssh "cat > $T/remote" < $T/input || { fail upload; }
+ssh "cat $T/remote" > $T/output || { fail download; }
+cmp $T/input $T/output || { fail "64 KiB round trip"; }
+echo 'SSH TRANSFER PASS 65536 bytes each direction'
+chunks=$((bulk * 16))
+stream() { i=0; while [ "$i" -lt "$chunks" ]; do cat $T/input; i=$((i+1)); done; }
+stream | sha256sum | cut -d ' ' -f1 > $T/expected.hash
+stream | ssh 'sha256sum' | cut -d ' ' -f1 > $T/upload.hash
+cmp $T/expected.hash $T/upload.hash || { fail upload stream; }
+ssh "i=0; while [ \"\$i\" -lt $chunks ]; do cat $T/remote; i=\$((i+1)); done" | sha256sum | cut -d ' ' -f1 > $T/download.hash
+cmp $T/expected.hash $T/download.hash || { fail download stream; }
+echo "SSH STREAM PASS $bulk MiB each direction"
+dropbearkey -t ed25519 -f $T/wrongkey >$T/wrong-keygen.log 2>&1
+if dbclient -y -y -i $T/wrongkey -p 2222 -c chacha20-poly1305@openssh.com root@127.0.0.1 true 2>$T/wrong.log; then
+    fail "wrong key accepted"
+fi
+grep -q 'No auth methods could be used' $T/wrong.log || { cat $T/wrong.log; fail "wrong key: unexpected error"; }
+echo 'SSH WRONG KEY REJECTED'
+finish

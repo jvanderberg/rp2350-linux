@@ -1,0 +1,17 @@
+sntrup761 0.4.0, https://github.com/mikelodder7/sntrup761
+Crates.io archive SHA256: a7fadfbd0a7d18ce7b04ed753c018a3e5d2ac2b3603f70507cd84012e76fa8a8
+Licenses and original manifest retained.
+
+Local changes:
+- Cargo manifest disables dependency default features (rand, rand_chacha,
+  thiserror, sha2, subtle, zeroize) for allocation-free bare-metal RV32.
+- workspace.rs adds caller-owned scalar reciprocal, product, sampling and
+  encoding scratch. r3.rs, rq.rs, rq/encoding.rs, zx.rs and utils.rs borrow
+  those buffers instead of allocating them on the call stack.
+- lib.rs adds *_with_workspace entry points. Existing entry points retain
+  their signatures and allocate temporary scratch. Workspace APIs erase
+  scratch before return; Workspace also zeroizes on drop.
+
+Polynomial arithmetic, sampling, serialization, hashing and implicit rejection
+are unchanged. rvaccel tests check 16 seeded transcript hashes generated from
+untouched upstream 0.4.0, alongside independent IETF decapsulation vectors.

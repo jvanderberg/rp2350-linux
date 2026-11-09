@@ -301,7 +301,9 @@ in place in a static (`Cpu::init`, about 20 KB) rather than on the stack.
   `main` only runs the guest: a non-inlined `setup()` builds the devices
   in place in statics (`BUS`, `JIT`), so their construction doesn't sit
   on core0's stack.
-- **Memory.** Guest RAM is the 8 MB PSRAM, preceded by the kernel text in
+- **Memory.** Guest RAM is the 8 MB PSRAM less its top 64 KiB (the
+  [native engine](#native-buffer-engine-rvaccel-rvcorepv-buffers)'s
+  workspace), preceded by the kernel text in
   flash (`guest_blob.rs`; flash map in the top-level README). The translator
   has a `CODE_KIB` code cache in SRAM (326 KiB; core1's code, slot, stack
   and rings take most of the rest), in a ring of 8 regions. It has no PSRAM
@@ -537,7 +539,7 @@ the board tier's flashing/reboot behavior.
 
 | Script | |
 |---|---|
-| `scripts/pico-shell.sh [-i] [-b] [-w] [-m MB]` | load the guest and `rvemu-pico-shell` over USB BOOTSEL, then print the console port; `-w` adds the flash swap device |
+| `scripts/pico-shell.sh [-i] [-b] [-w] [-m RAM] [-d DIR]` | load the guest and `rvemu-pico-shell` over USB BOOTSEL, then print the console port; `-w` adds the flash swap device, `-d` loads the disk guest in DIR, `-m` is MiB or KiB as `8128K` (the default) |
 | `scripts/pico-wifi.sh SSID \| --forget` | store or erase the Wi-Fi network |
 | `scripts/pico-linux.sh [TIMEOUT]` | boot benchmark: board against a Mac reference run, same instruction count and console hash |
 | `scripts/pico.sh` | jittest on the board against the Mac |
@@ -605,3 +607,82 @@ The model accounts for the current design:
 - **A hot-threshold policy barely helps.** The cost is thrashing of hot
   code, not translating cold code once.
 - **A ring of regions beats flush-all** at the same size.
+
+## Native buffer engine (`rvaccel/`, `rvcore/pv-buffers`)
+
+`rvaccel` runs LZ4, ChaCha20-Poly1305, the SSH packet cipher, X25519,
+Ed25519 and sntrup761 as native code, and `rvcore/pv-buffers` gives it to
+the guest as SBI extension `0x0A000001`. The guest's drivers and the
+operations' byte layouts are in
+[guest/README.md](../guest/README.md#native-crypto-devices). Libraries:
+`lz4_flex` 0.14.0, RustCrypto `chacha20poly1305` 0.10.1, `x25519-dalek`
+2.0.1, `ed25519-dalek` 2.2.0 and `vendor/sntrup761` (0.4.0, with its large
+temporaries in caller-owned scratch; see its `PROVENANCE`). `rvaccel`,
+`curve25519-dalek`, `x25519-dalek` and `ed25519-dalek` build at
+`opt-level = "s"` (`Cargo.toml`).
+
+**Calls.** FID = operation (0-12). `a0..a5`: destination PA, capacity,
+source PA, length, parameters PA, parameters length. Success returns
+`a0 = 0`, `a1` = output length. Errors: -1 the operation failed
+(authentication, signature, codec), -2 unknown FID, -3 bad arguments, -7
+busy. All three buffers must be in guest RAM; the destination must be
+writable and must not overlap the others. On any error the output is
+undefined. The whole destination is reported dirty to the translator, which
+invalidates translated code on each page it covers.
+
+**Pausing.** `FID | 0x100` lets the engine pause the operation: it returns
+-100 (pending) when its time slice runs out, `0x200` runs the next slice and
+`0x201` drops it. A new operation while one is paused fails with -7. A
+plain FID runs to completion. Each slice's native time is added to the
+guest's clock.
+
+**Workspace** (`rvaccel::Workspace`, 52 KiB). Each CPU owns one: a 24 KiB
+execution stack, the KEM scratch and per-operation stack peaks. An
+operation runs on that stack as a coroutine of the emulator
+(`rvaccel_switch` saves the callee-saved registers on one stack and
+resumes the other), so a pause is a switch back to the emulator with the
+operation's state left on its stack. Between operations the stack holds a
+paint pattern: after each operation the first word that differs gives its
+peak, and repainting from there up erases what it left. A 256-byte guard at
+the bottom is checked after every slice. Dropping a paused operation erases
+its stack and scratch. `rvaccel::run` is the hosted entry point, on the
+caller's stack.
+
+**Where it is.**
+- `rvemu-pico-shell` always has it, in the top 64 KiB of PSRAM, with the
+  benchmark log (`NATIVE_BASE`, `BENCH_BASE`), so the guest has at most
+  8128 KiB of PSRAM, after the kernel text in flash. Operations are paused by core0's SIO machine timer
+  (`MTIMECMP`) after 2 ms (`NATIVE_SLICE_US`): the interrupt is taken on
+  the operation's stack and its handler (`MachineTimer`) switches back to
+  the emulator.
+- `rvemu` and `rvemu-virt` have it with `--features pv-buffers`
+  (`RVEMU_FEATURES=pv-buffers scripts/virt.sh ...`); there operations run
+  to completion. `rvemu -M` and `-S` refuse it.
+- Firmware without a workspace reports the extension as missing.
+
+**Benchmark points** (`rvcore/src/benchmark.rs`, SBI `0x0A000002`). FID 0
+records point `a0` (0-3); FID 1 prints the points and clears them.
+`rvemu-pico-shell` records core0's cycles and instructions and the XIP
+cache's hit and access counters, and its report adds the native call and
+preemption counts, the stack peaks and both cores' stack depth. The Mac
+host and `rvemu-virt` record guest instructions, native call counts and
+idle time.
+
+**Tests.** `cargo test -p rvaccel -p rvcore --features
+rvcore/pv-buffers,rvcore/pv-pages,instrument` (RFC 7748, RFC 8032, RFC 8439,
+the SSH draft's and the sntrup761 draft's vectors, the workspace and the
+pause protocol). Under QEMU: `scripts/native-crypto-eval.py` runs every
+operation's vectors and rejections in translator/interpreter lockstep,
+`scripts/pv-buffers-eval.py` compares LZ4 and AEAD as translated guest code
+with the native calls, and `scripts/ssh-eval.py` runs Dropbear in an
+initramfs guest (`guest/tests/build-ssh-eval.sh`). On the board:
+[docs/development.md](../docs/development.md#native-crypto-on-the-board).
+
+## Native page operations (`rvcore/pv-pages`)
+
+Off by default; no guest driver uses it. SBI extension `0x0A000000`: FID 0
+zeroes the 4 KiB page at physical address `a0`, FID 1 copies the page at
+`a1` to it. Both pages must be in guest RAM and the destination writable;
+-2 is an unknown FID, -3 an invalid address. A destination with translated
+code is invalidated. `scripts/pv-pages-eval.py` compares the calls with
+translated loops under QEMU.

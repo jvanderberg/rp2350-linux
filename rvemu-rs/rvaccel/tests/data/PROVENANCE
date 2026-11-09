@@ -1,0 +1,12 @@
+sntrup761 test vectors 0 and 1 from draft-josefsson-ntruprime-streamlined-00
+https://www.ietf.org/archive/id/draft-josefsson-ntruprime-streamlined-00.html
+Copied from sntrup761 0.4.0 tests/data, byte-for-byte; upstream package archive
+hash and licenses are preserved in ../../../vendor/sntrup761/.
+
+SNTRUP workspace refactor regression fixture: sntrup761-upstream.sha512.
+Generated with the untouched crates.io sntrup761 0.4.0 runtime source, force-scalar,
+and its original manifest. For i=0..15: keypair seed=[i;32], encapsulation
+seed=[i+64;32]. SHA-512 transcript is pk || sk || ct || ss || rejected_ss,
+where rejected_ss decapsulates ct with byte i*61 XOR 1. Valid decapsulation
+was also checked against ss. This checks seeded byte-for-byte compatibility,
+including implicit rejection, independently of the modified implementation.
