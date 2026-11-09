@@ -1,0 +1,122 @@
+#!/bin/sh
+# claude-remote: run Claude Code on another machine while it works on files HERE,
+# with every file read, edit and shell command carried over ssh. Nothing to install on
+# the remote beyond claude and socat (or python3). Written for the rp2350 Linux guest:
+# BusyBox ash, Dropbear dbclient, MicroPython.
+#
+#   claude-remote [-d DIR] [-i KEY] [--claude CMD] [--keep-native] user@host [-- claude args]
+#
+# Session 1 (no tty) runs the MCP tool server here and pipes it to a unix socket on the
+# remote. Session 2 (tty) runs claude there, configured to use that socket as an MCP server.
+# Claude's own Read/Edit/Bash tools are disabled so it uses the device's tools, unless
+# --keep-native is given. Without a key the password is asked once and reused.
+
+set -u
+
+DIR=$PWD
+KEY=
+CLAUDE=claude
+REMOTE=
+KEEP=
+SERVER=${CLAUDE_GUEST_MCP:-}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -d) DIR=$2; shift 2 ;;
+    -i) KEY=$2; shift 2 ;;
+    --claude) CLAUDE=$2; shift 2 ;;
+    --keep-native) KEEP=1; shift ;;
+    --) shift; break ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown option $1" >&2; exit 2 ;;
+    *) if [ -z "$REMOTE" ]; then REMOTE=$1; shift; else break; fi ;;
+  esac
+done
+[ -n "$REMOTE" ] || { echo "usage: claude-remote [-d DIR] [-i KEY] user@host [-- claude args]" >&2; exit 2; }
+
+DIR=$(cd "$DIR" 2>/dev/null && pwd -P) || { echo "not a directory: $DIR" >&2; exit 1; }
+
+if [ -z "$SERVER" ]; then
+  for c in "$(dirname "$0")/claude-guest-mcp.py" /usr/lib/claude-guest-mcp.py /usr/local/lib/claude-guest-mcp.py; do
+    [ -f "$c" ] && { SERVER=$c; break; }
+  done
+fi
+[ -n "$SERVER" ] || { echo "claude-guest-mcp.py not found (set CLAUDE_GUEST_MCP)" >&2; exit 1; }
+if command -v micropython >/dev/null 2>&1; then PY=micropython
+elif command -v python3 >/dev/null 2>&1; then PY=python3
+else echo "need micropython or python3" >&2; exit 1; fi
+
+if command -v dbclient >/dev/null 2>&1; then SSH=dbclient; else SSH=ssh; fi
+[ -n "$KEY" ] && SSH="$SSH -i $KEY"
+
+# One socket per shared directory, so two sessions on different dirs don't collide.
+TAG=$(printf %s "$DIR" | cksum | cut -d' ' -f1)
+NAME="$(basename "$DIR")-$TAG"
+SOCK="/tmp/claude-remote-$NAME.sock"
+
+# Claude's arguments, single-quoted for the remote shell.
+ARGS=
+for a in "$@"; do
+  ARGS="$ARGS '$(printf %s "$a" | sed "s/'/'\\\\''/g")'"
+done
+
+# Remote side of session 1: bridge the socket to this ssh session's stdin/stdout.
+BRIDGE_CMD="rm -f '$SOCK'
+if command -v socat >/dev/null 2>&1; then
+  exec socat -T 600 UNIX-LISTEN:'$SOCK',unlink-early STDIO
+fi
+exec python3 -c 'import socket,sys,os,select
+s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); c,_=s.accept()
+fds=[c.fileno(),0]
+while fds:
+    r,_,_=select.select(fds,[],[])
+    if c.fileno() in r:
+        d=c.recv(65536)
+        if not d: break
+        os.write(1,d)
+    if 0 in r:
+        d=os.read(0,65536)
+        if not d: break
+        c.sendall(d)
+' '$SOCK'"
+
+MCP_JSON="{\"mcpServers\":{\"device\":{\"command\":\"sh\",\"args\":[\"-c\",\"exec socat STDIO UNIX-CONNECT:'$SOCK' 2>/dev/null || exec python3 -c 'import socket,sys,os,select;c=socket.socket(socket.AF_UNIX);c.connect(sys.argv[1]);fds=[c.fileno(),0]\\nwhile 1:\\n r,_,_=select.select(fds,[],[])\\n if c.fileno() in r:\\n  d=c.recv(65536)\\n  if not d: break\\n  os.write(1,d)\\n if 0 in r:\\n  d=os.read(0,65536)\\n  if not d: break\\n  c.sendall(d)' '$SOCK'\"]}}}"
+
+PROMPT="The project files live on a separate device (an RP2350 running Linux) and are reachable ONLY through the mcp__device__* tools. Use them for every file read, edit, search and shell command. Shell commands run on that device under BusyBox sh with a small toolset and 8 MiB of RAM: keep them short and avoid heavy jobs. Paths are relative to the project root $DIR."
+
+NATIVE=
+[ -z "$KEEP" ] && NATIVE="--disallowedTools Read,Edit,Write,MultiEdit,NotebookEdit,Bash,Glob,Grep,LS"
+
+RUN_CMD="WORK=\"\$HOME/.claude-remote/$NAME\"; mkdir -p \"\$WORK\"; cd \"\$WORK\"
+i=0; until [ -S '$SOCK' ]; do i=\$((i+1)); [ \$i -ge 300 ] && { echo 'claude-remote: bridge never came up' >&2; exit 1; }; sleep 0.1; done
+exec $CLAUDE --mcp-config '$(printf %s "$MCP_JSON" | sed "s/'/'\\\\''/g")' --strict-mcp-config $NATIVE --append-system-prompt '$(printf %s "$PROMPT" | sed "s/'/'\\\\''/g")'$ARGS"
+
+TMP=$(mktemp -d /tmp/claude-remote.XXXXXX) || exit 1
+mkfifo "$TMP/fifo" || exit 1
+cleanup() {
+  [ -n "${BPID:-}" ] && kill "$BPID" 2>/dev/null
+  rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+# Dropbear has no connection sharing, so the two sessions below each authenticate.
+# Without a key, ask for the password once and hand it to dbclient through its environment.
+if [ "$SSH" != "${SSH#dbclient}" ] && [ -z "$KEY" ] && [ -z "${DROPBEAR_PASSWORD:-}" ] && [ ! -f "$HOME/.ssh/id_dropbear" ]; then
+  printf 'Password for %s: ' "$REMOTE" >&2
+  stty -echo 2>/dev/null; read -r DROPBEAR_PASSWORD; stty echo 2>/dev/null; echo >&2
+  export DROPBEAR_PASSWORD
+fi
+
+# First contact on a tty, so Dropbear's host-key question can be answered.
+$SSH "$REMOTE" true || { echo "claude-remote: cannot connect to $REMOTE" >&2; exit 1; }
+
+echo "claude-remote: sharing $DIR with $REMOTE" >&2
+# Cross-wire: server stdout -> ssh stdin, ssh stdout -> server stdin (through the fifo).
+( $PY "$SERVER" "$DIR" < "$TMP/fifo" | $SSH -T "$REMOTE" "$BRIDGE_CMD" > "$TMP/fifo" ) &
+BPID=$!
+
+trap '' INT   # Ctrl-C goes to the remote tty, not to this script
+$SSH -t "$REMOTE" "bash -lc '$(printf %s "$RUN_CMD" | sed "s/'/'\\\\''/g")'"
+rc=$?
+trap cleanup INT
+exit $rc

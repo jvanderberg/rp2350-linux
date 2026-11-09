@@ -67,6 +67,12 @@ and the root filesystem.
 - **`LANG=C.UTF-8`** in `/etc/profile`, for tmux and friends.
 - **Not included:** vim (`vi` is BusyBox's), strace and make.
 
+- **`claude-remote`** (`claude-remote/`): runs Claude Code on another host
+  over ssh while it reads, edits and runs commands on this guest, through an
+  MCP tool server in MicroPython. `claude-remote [-d DIR] user@host`; with
+  `~/.ssh/id_dropbear` on the guest there are no prompts. The remote needs
+  `claude` and `socat` or `python3`.
+
 ## /home on flash
 
 jffs2 on the board's 1 MB flash region (the `rvemu,flash` device, `mtd0`),
