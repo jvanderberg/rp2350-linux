@@ -373,6 +373,12 @@ guest gives up 4 KiB of RAM plus the device's own kernel cost.
 - **Wear levelling.** The head starts at a different sector every boot.
   Every 8th write also moves the live page nearest ahead of the head, so
   sectors that hold cold pages keep taking their turn at erases.
+- **Write budget.** Page writes draw on a budget of 448 pages (all of
+  swap) that refills one page every 4 s, so a burst can fill swap at once
+  but sustained swapping can't wear the flash faster than that. A write
+  over budget fails without touching flash: the guest keeps the page in
+  RAM, tries again later and logs `Write-error on swap-device`. Reads and
+  zero pages are free. `pages_refused` counts the pages refused.
 - **Nothing persists.** Swap is empty at every boot, so the map (2.2 KB)
   lives only in the top page of guest RAM, which the `-w` DTB reserves
   (`no-map`), and there's no on-flash metadata. Without `-w` the firmware

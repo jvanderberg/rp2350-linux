@@ -29,6 +29,7 @@ const NR_GETDENTS64: usize = 61;
 const NR_READ: usize = 63;
 const NR_WRITE: usize = 64;
 const NR_EXIT_GROUP: usize = 94;
+const NR_WAITID: usize = 95;
 const NR_KILL: usize = 129;
 const NR_SETPGID: usize = 154;
 const NR_MUNMAP: usize = 215;
@@ -36,7 +37,6 @@ const NR_CLONE: usize = 220;
 const NR_EXECVE: usize = 221;
 const NR_MMAP: usize = 222;
 const NR_MADVISE: usize = 233;
-const NR_WAIT4: usize = 260;
 const NR_STATX: usize = 291;
 const NR_CLOCK_GETTIME64: usize = 403;
 const NR_PPOLL_TIME64: usize = 414;
@@ -216,13 +216,22 @@ pub fn kill(pid: i32, sig: i32) {
     let _ = sc!(NR_KILL, pid, sig);
 }
 
-/// Waits for the child; the raw wait status.
+/// Waits for the child and reaps it; its status as wait() encodes it (exit
+/// code in bits 8-15, or the signal that ended it). riscv32 has no wait4,
+/// only waitid.
 pub fn wait(pid: i32) -> i32 {
-    let mut status = 0i32;
+    const P_PID: usize = 1;
+    const WEXITED: usize = 4;
+    const CLD_EXITED: i32 = 1;
+    // siginfo_t: si_signo, si_errno, si_code, si_pid, si_uid, si_status, ...
+    let mut info = [0i32; 32];
     loop {
-        match sc!(NR_WAIT4, pid, &mut status as *mut i32, 0, 0) {
+        match sc!(NR_WAITID, P_PID, pid, info.as_mut_ptr(), WEXITED, 0) {
             Err(4) => {}
-            _ => return status,
+            Ok(_) if info[2] == CLD_EXITED => return (info[5] & 0xff) << 8,
+            Ok(_) => return info[5] & 0x7f,
+            // no such child: report it as killed
+            Err(_) => return SIGKILL,
         }
     }
 }

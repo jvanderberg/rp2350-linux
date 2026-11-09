@@ -143,10 +143,13 @@ impl Console for TermConsole {
 
 /// The board's swap region (0x10200000-0x103FEFFF) as host memory, with
 /// W25Q128 datasheet-typical erase and program times on a 348 MHz cycle
-/// count, so the swap statistics estimate what the board would stall.
+/// count, so the swap statistics estimate what the board would stall. The
+/// count also runs in real time, for the write budget's refill.
 struct ModelFlash {
     data: Vec<u8>,
-    cycles: u64,
+    /// Modelled erase and program time.
+    busy: u64,
+    start: Instant,
 }
 
 const SWAP_SECTORS: u32 = 511;
@@ -159,7 +162,7 @@ const SWAP_TABLES_SIZE: u32 = 0x1000;
 impl ModelFlash {
     fn new() -> Self {
         // old contents: every sector needs an erase before its first use
-        ModelFlash { data: vec![0; SWAP_SECTORS as usize * PAGE], cycles: 0 }
+        ModelFlash { data: vec![0; SWAP_SECTORS as usize * PAGE], busy: 0, start: Instant::now() }
     }
 }
 
@@ -170,21 +173,22 @@ impl Flash for ModelFlash {
     fn erase(&mut self, sector: u32) -> bool {
         let o = sector as usize * PAGE;
         self.data[o..o + PAGE].fill(0xFF);
-        self.cycles += u64::from(MODEL_HZ) * 45 / 1000;
+        self.busy += u64::from(MODEL_HZ) * 45 / 1000;
         true
     }
     fn program(&mut self, off: u32, data: &[u8; CHUNK]) -> bool {
         for (f, &d) in self.data[off as usize..off as usize + CHUNK].iter_mut().zip(data) {
             *f &= d; // NOR: programming only clears bits
         }
-        self.cycles += u64::from(MODEL_HZ) * 7 / 10_000;
+        self.busy += u64::from(MODEL_HZ) * 7 / 10_000;
         true
     }
     fn read(&self, off: u32, buf: &mut [u8]) {
         buf.copy_from_slice(&self.data[off as usize..off as usize + buf.len()]);
     }
     fn cycles(&self) -> u64 {
-        self.cycles
+        let real = self.start.elapsed().as_micros() as u64 * u64::from(MODEL_HZ) / 1_000_000;
+        self.busy + real
     }
     fn hz(&self) -> u32 {
         MODEL_HZ
@@ -198,6 +202,10 @@ struct HostBus {
     benchmark_epoch: Instant,
     plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>, StubPins>,
     interactive: bool,
+    /// Multi-hart: a hart that executed WFI with nothing pending waits here
+    /// (the run loop wakes it); time moves on only when every hart waits.
+    smp: bool,
+    parked: [bool; rvcore::MAX_HARTS],
 }
 
 impl HostBus {
@@ -222,6 +230,9 @@ impl Bus for HostBus {
     fn external_irq(&self) -> bool {
         self.plat.plic.irq
     }
+    fn external_irq_hart(&self, hart: u32) -> bool {
+        if hart == 0 { self.plat.plic.irq } else { self.plat.plic.irq1 }
+    }
     fn console_putc(&mut self, b: u8) {
         self.plat.con.putc(b)
     }
@@ -237,6 +248,10 @@ impl Bus for HostBus {
     fn wfi(&mut self, cpu: &mut Cpu) {
         self.poll();
         if cpu.sip_value(self) & cpu.sie != 0 {
+            return;
+        }
+        if self.smp {
+            self.parked[cpu.hartid as usize] = true;
             return;
         }
         // as the board does: erase a dirty swap sector while the guest idles
@@ -302,10 +317,36 @@ struct DtsOpts<'a> {
     swap: bool,
     /// the pin devices at IO_BASE (gpio)
     gpio: bool,
+    harts: u32,
 }
 
 fn make_dts(o: &DtsOpts) -> String {
-    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap, gpio } = *o;
+    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap, gpio, harts } = *o;
+    let mut cpus = String::new();
+    let mut plic_irqs = Vec::new();
+    for h in 0..harts {
+        cpus += &format!(
+            r#"    cpu{h}: cpu@{h} {{
+      device_type = "cpu";
+      compatible = "riscv";
+      reg = <{h}>;
+      status = "okay";
+      riscv,isa = "rv32ima";
+      riscv,isa-base = "rv32i";
+      riscv,isa-extensions = "i", "m", "a";
+      mmu-type = "riscv,sv32";
+      cpu{h}_intc: interrupt-controller {{
+        #interrupt-cells = <1>;
+        #address-cells = <0>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      }};
+    }};
+"#
+        );
+        plic_irqs.push(format!("&cpu{h}_intc 9"));
+    }
+    let plic_irqs = plic_irqs.join(" ");
     let initrd = match initrd {
         Some((s, e)) => format!("    linux,initrd-start = <0x{s:x}>;\n    linux,initrd-end = <0x{e:x}>;\n"),
         None => String::new(),
@@ -374,21 +415,7 @@ fn make_dts(o: &DtsOpts) -> String {
     #address-cells = <1>;
     #size-cells = <0>;
     timebase-frequency = <{TIMEBASE_HZ}>;
-    cpu0: cpu@0 {{
-      device_type = "cpu";
-      compatible = "riscv";
-      reg = <0>;
-      status = "okay";
-      riscv,isa = "rv32ima";
-      mmu-type = "riscv,sv32";
-      cpu0_intc: interrupt-controller {{
-        #interrupt-cells = <1>;
-        #address-cells = <0>;
-        interrupt-controller;
-        compatible = "riscv,cpu-intc";
-      }};
-    }};
-  }};
+{cpus}  }};
   memory@{ram_base:x} {{
     device_type = "memory";
     reg = <0x{ram_base:x} 0x{ram_size:x}>;
@@ -404,7 +431,7 @@ fn make_dts(o: &DtsOpts) -> String {
       #interrupt-cells = <1>;
       #address-cells = <0>;
       interrupt-controller;
-      interrupts-extended = <&cpu0_intc 9>;
+      interrupts-extended = <{plic_irqs}>;
       riscv,ndev = <31>;
     }};
     serial@f4000000 {{
@@ -636,6 +663,7 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc picks the devices)
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size in MiB, or KiB as NK (default 64)
+  -c HARTS       harts (CPUs), 1 or 2 (default 1); run in turn
   -X BYTES       the first BYTES of the kernel (its text) are extra, read-only
                  guest RAM, as the RP2350 maps them from flash: RAM = BYTES + MB
   -a ARGS        kernel command line (default \"earlycon console=ttyS0\")
@@ -672,6 +700,8 @@ struct Opts {
     net: bool,
     swap: bool,
     io: bool,
+    /// -c: harts
+    harts: u32,
 }
 
 /// `-m`: MiB, or KiB with a K suffix (`8128K`).
@@ -704,6 +734,7 @@ fn parse_args() -> Result<Opts, String> {
         net: false,
         swap: false,
         io: false,
+        harts: 1,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -733,6 +764,12 @@ fn parse_args() -> Result<Opts, String> {
             "-F" => o.nor = Some(val()?),
             "-W" => o.swap = true,
             "-G" => o.io = true,
+            "-c" => {
+                o.harts = val()?.parse().map_err(|_| "bad -c")?;
+                if !(1..=rvcore::MAX_HARTS as u32).contains(&o.harts) {
+                    return Err(format!("-c: 1..={} harts", rvcore::MAX_HARTS));
+                }
+            }
             "-u" => o.until = Some(val()?),
             "-n" => o.max_insns = val()?.parse().map_err(|_| "bad -n")?,
             "-M" => o.model = true,
@@ -790,6 +827,7 @@ fn run() -> Result<(), String> {
         nor: o.nor.is_some(),
         swap: o.swap,
         gpio: o.io,
+        harts: o.harts,
     });
     if o.dump_dts {
         print!("{dts}");
@@ -854,7 +892,8 @@ fn run() -> Result<(), String> {
         plat = plat.with_io(StubPins::new(), gmem);
     }
     let mut bus = HostBus { plat, interactive: !o.batch,
-        benchmarks: Default::default(), benchmark_epoch: Instant::now() };
+        benchmarks: Default::default(), benchmark_epoch: Instant::now(),
+        smp: o.harts > 1, parked: [false; rvcore::MAX_HARTS] };
 
     eprintln!(
         "[rvemu] RAM {}, kernel {} bytes, initrd {} bytes @0x{:x}, dtb @0x{:x}",
@@ -866,9 +905,52 @@ fn run() -> Result<(), String> {
     );
     drop(initrd);
 
+    if o.harts > 1 {
+        if sim.is_some() || o.model {
+            return Err("-c: no -M/-S with several harts".into());
+        }
+        let t0 = Instant::now();
+        let mut cpu1 = Box::new(unsafe { Cpu::new(ram.as_mut_ptr(), ram_base, ram_size, ram_base, ram_base + dtb_addr) });
+        let r = run_smp(&mut cpu, &mut cpu1, &mut bus, &o);
+        let host_s = t0.elapsed().as_secs_f64();
+        bus.plat.con.restore();
+        let why = match cpu.halt {
+            Some(Halt::Shutdown) => "guest shutdown",
+            Some(Halt::Until) => "--until matched",
+            Some(Halt::MaxInsns) => "instruction limit",
+            Some(Halt::Idle) => "guest idle",
+            Some(Halt::User) => "user exit",
+            Some(Halt::Panic) => "guest kernel panic",
+            Some(Halt::Stopped) | None => "",
+        };
+        eprintln!("\n[rvemu] stopped: {why} at pc=0x{:08x}", cpu.pc);
+        report(&cpu, host_s);
+        eprintln!("hart 1: guest instructions {}  wfi {}  interrupts {}", cpu1.instret, cpu1.stats.wfi, cpu1.stats.interrupts);
+        eprintln!(
+            "smp: rounds of {SMP_QUANTUM}: {} with both harts running, {} with one; wall (busiest hart) {} instructions",
+            r.both, r.one, r.wall
+        );
+        drop(cpu1);
+        drop(cpu);
+        drop(ram);
+        return Ok(());
+    }
+
     let t0 = Instant::now();
+    let prof_path = std::env::var("RVEMU_PROF").ok();
+    let mut prof: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let prof_fn: Option<u32> = std::env::var("RVEMU_PROF_FN").ok().and_then(|v| u32::from_str_radix(&v, 16).ok());
+    let mut callers: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
     while cpu.halt.is_none() {
         for _ in 0..4096 {
+            if prof_path.is_some() {
+                *prof.entry(if cpu.privilege == Priv::S { cpu.pc } else { 1 }).or_insert(0) += 1;
+                if Some(cpu.pc) == prof_fn {
+                    let e = callers.entry(cpu.x[1]).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += u64::from(cpu.x[12]);
+                }
+            }
             let irq = cpu.check_irq(&bus);
             if let Some(s) = &mut sim {
                 s.pre(&mut cpu, irq);
@@ -900,6 +982,17 @@ fn run() -> Result<(), String> {
     }
     let host_s = t0.elapsed().as_secs_f64();
     bus.plat.con.restore();
+    if let Some(p) = &prof_path {
+        use std::io::Write as _;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(p).map_err(|e| e.to_string())?);
+        for (pc, n) in &prof {
+            writeln!(f, "{pc:08x} {n}").map_err(|e| e.to_string())?;
+        }
+        let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{p}.callers")).map_err(|e| e.to_string())?);
+        for (ra, (n, bytes)) in &callers {
+            writeln!(f, "{ra:08x} {n} {bytes}").map_err(|e| e.to_string())?;
+        }
+    }
 
     let why = match cpu.halt {
         Some(Halt::Shutdown) => "guest shutdown",
@@ -908,7 +1001,7 @@ fn run() -> Result<(), String> {
         Some(Halt::Idle) => "guest idle",
         Some(Halt::User) => "user exit",
         Some(Halt::Panic) => "guest kernel panic",
-        None => "",
+        Some(Halt::Stopped) | None => "",
     };
     eprintln!(
         "\n[rvemu] stopped: {why} at pc=0x{:08x} priv={}",
@@ -923,6 +1016,130 @@ fn run() -> Result<(), String> {
     drop(cpu);
     drop(ram);
     Ok(())
+}
+
+/// Instructions a hart runs before the other gets its turn (multi-hart).
+const SMP_QUANTUM: u32 = 32;
+
+#[derive(Default)]
+struct SmpRun {
+    both: u64,
+    one: u64,
+    /// sum over rounds of the busiest hart's instructions: the run's length
+    /// if the harts ran at once
+    wall: u64,
+}
+
+/// Several harts in turn, `SMP_QUANTUM` instructions each (never between a
+/// hart's LR and SC). A hart that waits in WFI is skipped until it has an
+/// interrupt; when all wait, time skips to the earliest timer.
+fn run_smp(cpu0: &mut Cpu, cpu1: &mut Cpu, bus: &mut HostBus, o: &Opts) -> SmpRun {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    use rvcore::{HSM_START_PENDING, HSM_STARTED, Smp};
+    let smp: &'static Smp = Box::leak(Box::new(Smp::new(2)));
+    cpu0.smp = smp;
+    cpu0.hartid = 0;
+    cpu1.smp = smp;
+    cpu1.hartid = 1;
+    cpu1.set_readonly_prefix(o.text);
+    cpu1.halt = Some(Halt::Stopped);
+    let mut r = SmpRun::default();
+    let mut rounds = 0u64;
+    while cpu0.halt.is_none() {
+        if smp.hsm[1].load(Acquire) == HSM_START_PENDING {
+            cpu1.hsm_start(smp.start_pc[1].load(Acquire), smp.start_arg[1].load(Acquire));
+            cpu1.time_skip = cpu0.time();
+            let _ = smp.hsm[1].compare_exchange(HSM_START_PENDING, HSM_STARTED, AcqRel, Acquire);
+            bus.parked[1] = false;
+        }
+        let mut ran = [0u32; 2];
+        let mut until = false;
+        for (h, cpu) in [&mut *cpu0, &mut *cpu1].into_iter().enumerate() {
+            if cpu.halt.is_some() {
+                continue;
+            }
+            if bus.parked[h] {
+                cpu.smp_poll();
+                if cpu.sip_value(&*bus) & cpu.sie == 0 {
+                    continue;
+                }
+                bus.parked[h] = false;
+            }
+            let mut n = 0u32;
+            while n < SMP_QUANTUM || (cpu.res_valid && n < 4096) {
+                cpu.check_irq(&*bus);
+                cpu.step(bus);
+                n += 1;
+                if bus.plat.con.until_hit {
+                    until = true;
+                    break;
+                }
+                if bus.parked[h] || cpu.halt.is_some() {
+                    break;
+                }
+            }
+            ran[h] = n;
+            if until || (h == 0 && cpu.halt.is_some()) {
+                break;
+            }
+        }
+        if until {
+            cpu0.stats.until_instret = cpu0.instret;
+            cpu0.halt = Some(Halt::Until);
+            break;
+        }
+        if matches!(cpu1.halt, Some(Halt::Stopped)) {
+            bus.parked[1] = false;
+        }
+        match (ran[0] > 0, ran[1] > 0) {
+            (true, true) => r.both += 1,
+            (false, false) => {
+                // every hart waits: skip to the earliest timer (after input,
+                // interactively)
+                let harts: [&mut Cpu; 2] = [&mut *cpu0, &mut *cpu1];
+                let now = harts.iter().filter(|c| c.halt.is_none()).map(|c| c.time()).max().unwrap_or(0);
+                let next = harts.iter().filter(|c| c.halt.is_none()).map(|c| c.stimecmp).min().unwrap_or(u64::MAX);
+                if bus.interactive && bus.plat.con.stdin_open {
+                    let ms = if next == u64::MAX { 100 } else { (next.saturating_sub(now) / (TIMEBASE_HZ as u64 / 1000)).min(100) as i32 };
+                    bus.plat.con.flush();
+                    if TermConsole::stdin_readable(ms) {
+                        bus.poll();
+                        continue;
+                    }
+                    if next == u64::MAX {
+                        continue;
+                    }
+                } else if next == u64::MAX {
+                    eprintln!("\n[rvemu] guest idle with no timer and no input");
+                    harts[0].halt = Some(Halt::Idle);
+                    break;
+                }
+                for c in harts {
+                    if c.halt.is_none() && c.time() < next {
+                        let d = next - c.time();
+                        c.time_skip += d;
+                        c.stats.idle_ticks += d;
+                    }
+                }
+            }
+            _ => r.one += 1,
+        }
+        r.wall += u64::from(ran[0].max(ran[1]));
+        rounds += 1;
+        if rounds.is_multiple_of(128) {
+            bus.poll();
+            if bus.plat.con.user_quit {
+                cpu0.halt = Some(Halt::User);
+            }
+            if o.batch && bus.plat.con.panicked && cpu0.halt.is_none() {
+                cpu0.halt = Some(Halt::Panic);
+            }
+            if o.max_insns != 0 && cpu0.instret >= o.max_insns && cpu0.halt.is_none() {
+                cpu0.halt = Some(Halt::MaxInsns);
+            }
+        }
+    }
+    r
 }
 
 fn main() -> ExitCode {

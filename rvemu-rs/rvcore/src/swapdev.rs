@@ -16,6 +16,12 @@
 //!   sector keeps taking its turn, for 1/`MOVE_EVERY` more writes. A move
 //!   only uses an already erased sector, so it never adds an erase to a
 //!   request (it waits for the next write instead).
+//! - **Write budget.** Page writes draw on a token bucket that holds the
+//!   whole swap area and refills one page every `REFILL_SECS`: a burst
+//!   can fill swap at once, but sustained thrashing can't wear the flash
+//!   faster than the refill rate. A write over budget fails (the guest
+//!   keeps the page in RAM and tries again later); reads, zero pages and
+//!   wear-levelling moves are free.
 //! - **Nothing persists.** Swap is empty at every boot, so the map lives in
 //!   host RAM only and there is no on-flash metadata to keep consistent.
 //!   Sectors are of unknown state at boot: blank ones are found by reading.
@@ -37,6 +43,8 @@ const CHUNKS: usize = PAGE / CHUNK;
 pub const MAX_SECTORS: usize = 512;
 /// One wear-levelling move per this many page writes.
 const MOVE_EVERY: u32 = 8;
+/// The write budget gains one page per this many seconds.
+pub const REFILL_SECS: u64 = 4;
 
 /// A region of NOR flash, addressed from its start.
 pub trait Flash {
@@ -48,7 +56,8 @@ pub trait Flash {
     fn program(&mut self, off: u32, data: &[u8; CHUNK]) -> bool;
     /// Read `buf.len()` bytes at byte offset `off`.
     fn read(&self, off: u32, buf: &mut [u8]);
-    /// A free-running cycle counter, for the timings in the statistics.
+    /// A free-running cycle counter in real time: the timings in the
+    /// statistics, and the write budget's refill.
     fn cycles(&self) -> u64;
     /// Cycles per second of `cycles`.
     fn hz(&self) -> u32;
@@ -68,6 +77,8 @@ pub struct Stats {
     /// Pages moved for wear levelling (not counted in `pages_written`).
     pub pages_moved: u64,
     pub zero_pages: u64,
+    /// Pages of writes refused for want of budget.
+    pub pages_refused: u64,
     pub pages_read: u64,
     pub programs: u64,
     pub programs_skipped: u64,
@@ -96,6 +107,9 @@ pub struct FlashSwap<F: Flash> {
     to_erase: u32,
     /// Page writes since the last wear-levelling move.
     since_move: u32,
+    /// The write budget, as the cycle count at which it is full again
+    /// (each page written moves it on by `REFILL_SECS`).
+    budget_full_at: u64,
     pub stats: Stats,
 }
 
@@ -118,6 +132,7 @@ impl<F: Flash> FlashSwap<F> {
             head: 0,
             to_erase: nsect,
             since_move: 0,
+            budget_full_at: 0,
             stats: Stats::default(),
         }
     }
@@ -146,6 +161,7 @@ impl<F: Flash> FlashSwap<F> {
             addr_of_mut!((*p).head).write(0);
             addr_of_mut!((*p).to_erase).write(nsect);
             addr_of_mut!((*p).since_move).write(0);
+            addr_of_mut!((*p).budget_full_at).write(0);
             addr_of_mut!((*p).stats).write(Stats::default());
             &mut *p
         }
@@ -165,6 +181,19 @@ impl<F: Flash> FlashSwap<F> {
     /// write (mkswap): a guest that doesn't use swap never erases flash.
     pub fn wants_erase(&self) -> bool {
         self.to_erase != 0 && self.stats.pages_written + self.stats.zero_pages != 0
+    }
+
+    /// Charges `n` page writes to the budget; false, charging nothing, when
+    /// that would overdraw it.
+    fn take_budget(&mut self, n: u32) -> bool {
+        let per_page = u64::from(self.flash.hz()) * REFILL_SECS;
+        let now = self.flash.cycles();
+        let full_at = self.budget_full_at.max(now) + u64::from(n) * per_page;
+        if full_at - now > u64::from(self.pages) * per_page {
+            return false;
+        }
+        self.budget_full_at = full_at;
+        true
     }
 
     fn timed_erase(&mut self, s: u32) -> bool {
@@ -354,7 +383,7 @@ impl<F: Flash> FlashSwap<F> {
         let _ = write!(
             w,
             "pages {}\nsectors {}\nlive {}\nerased {}\ndirty {}\nzero_mapped {}\n\
-             pages_written {}\npages_moved {}\nzero_pages {}\npages_read {}\nprograms {}\nprograms_skipped {}\n\
+             pages_written {}\npages_moved {}\nzero_pages {}\npages_refused {}\npages_read {}\nprograms {}\nprograms_skipped {}\n\
              erases_sync {}\nerases_idle {}\nblank_found {}\nerrors {}\n\
              erase_us_total {}\nerase_us_max {}\nprogram_us_total {}\nprogram_us_max {}\n\
              write_us_total {}\nwrite_us_max {}\n",
@@ -367,6 +396,7 @@ impl<F: Flash> FlashSwap<F> {
             s.pages_written,
             s.pages_moved,
             s.zero_pages,
+            s.pages_refused,
             s.pages_read,
             s.programs,
             s.programs_skipped,
@@ -439,9 +469,22 @@ impl<F: Flash> crate::virtio::Disk for FlashSwap<F> {
         if !buf.len().is_multiple_of(512) || off + buf.len() > self.pages as usize * PAGE {
             return false;
         }
+        // pages that take flash: all but whole pages of zeros
+        let first = off / PAGE;
+        let last = (off + buf.len()).div_ceil(PAGE);
+        let flash_pages = (first..last)
+            .filter(|&lp| {
+                let (a, b) = (lp * PAGE, (lp + 1) * PAGE);
+                a < off || b > off + buf.len() || buf[a - off..b - off].iter().any(|&x| x != 0)
+            })
+            .count() as u32;
+        if !self.take_budget(flash_pages) {
+            self.stats.pages_refused += u64::from(flash_pages);
+            return false;
+        }
         let t0 = self.flash.cycles();
         let mut ok = true;
-        let mut lp = off / PAGE;
+        let mut lp = first;
         while lp * PAGE < off + buf.len() {
             let base = lp * PAGE;
             let new = |c: usize| {

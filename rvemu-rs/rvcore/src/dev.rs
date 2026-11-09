@@ -37,6 +37,11 @@ pub struct Plic {
     level: u32,
     /// Output: S-mode external interrupt to hart 0.
     pub irq: bool,
+    /// Hart 1's S-mode context (multi-hart machines): enables, threshold,
+    /// output.
+    pub enable1: u32,
+    pub threshold1: u32,
+    pub irq1: bool,
 }
 
 impl Plic {
@@ -44,13 +49,20 @@ impl Plic {
         self.pending |= self.level & !self.claimed;
         let cand = self.pending & self.enable;
         self.irq = (1..32).any(|i| cand & (1 << i) != 0 && self.prio[i] > self.threshold);
+        if self.enable1 != 0 {
+            let cand = self.pending & self.enable1;
+            self.irq1 = (1..32).any(|i| cand & (1 << i) != 0 && self.prio[i] > self.threshold1);
+        } else {
+            self.irq1 = false;
+        }
     }
 
-    fn claim(&mut self) -> u32 {
-        let cand = self.pending & self.enable;
+    fn claim(&mut self, ctx: usize) -> u32 {
+        let (enable, threshold) = if ctx == 0 { (self.enable, self.threshold) } else { (self.enable1, self.threshold1) };
+        let cand = self.pending & enable;
         let (mut best, mut best_prio) = (0, 0);
         for i in 1..32 {
-            if cand & (1 << i) != 0 && self.prio[i] > self.threshold && self.prio[i] > best_prio {
+            if cand & (1 << i) != 0 && self.prio[i] > threshold && self.prio[i] > best_prio {
                 best = i as u32;
                 best_prio = self.prio[i];
             }
@@ -79,9 +91,16 @@ impl Plic {
             0..=0x7F => self.prio[(off >> 2) as usize],
             0x1000 => self.pending,
             0x2000 => self.enable,
+            0x2080 => self.enable1,
             0x20_0000 => self.threshold,
             0x20_0004 => {
-                let v = self.claim();
+                let v = self.claim(0);
+                self.update();
+                v
+            }
+            0x20_1000 => self.threshold1,
+            0x20_1004 => {
+                let v = self.claim(1);
                 self.update();
                 v
             }
@@ -100,8 +119,10 @@ impl Plic {
                 }
             }
             0x2000 => self.enable = v & !1,
+            0x2080 => self.enable1 = v & !1,
             0x20_0000 => self.threshold = v & 7,
-            0x20_0004 if v < 32 => self.claimed &= !(1 << v),
+            0x20_0004 | 0x20_1004 if v < 32 => self.claimed &= !(1 << v),
+            0x20_1000 => self.threshold1 = v & 7,
             _ => {}
         }
         self.update();

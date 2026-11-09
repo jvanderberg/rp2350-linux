@@ -57,7 +57,8 @@ pub mod emit;
 
 use core::mem::{MaybeUninit, offset_of};
 use emit::*;
-use rvcore::{ACC_R, ACC_W, ACC_X, Bus, Cpu, JitRegs, Priv, TlbEntry};
+use core::sync::atomic::{AtomicU32, Ordering};
+use rvcore::{ACC_R, ACC_W, ACC_X, Bus, Cpu, JitRegs, MAX_HARTS, Priv, TlbEntry};
 
 pub const S: Reg = 3;
 pub const K0: Reg = 4;
@@ -112,6 +113,9 @@ pub struct JcEntry {
     pub _pad: u32,
 }
 impl JcEntry {
+    /// Matches no va. (The translator's own empty entries also point `code`
+    /// at the jump routine's miss path, `Jit::jc_empty`: another hart may be
+    /// reading the entry as it is emptied, and must not jump to 0.)
     pub const EMPTY: JcEntry = JcEntry { va: 1, addend: 0, code: 0, _pad: 0 };
 }
 
@@ -127,6 +131,8 @@ const OFF_IRQ_PENDING: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, irq_pen
 const OFF_SIE_BIT: i32 = offset_of!(Cpu, sie_bit) as i32;
 const OFF_RES_VALID: i32 = offset_of!(Cpu, res_valid) as i32;
 const OFF_RES_ADDR: i32 = offset_of!(Cpu, res_addr) as i32;
+const OFF_RES_VAL: i32 = offset_of!(Cpu, res_val) as i32;
+const OFF_AMO_DENY: i32 = (offset_of!(Cpu, jit) + offset_of!(JitRegs, amo_deny)) as i32;
 /// sstatus as csr_read composes it: (field, bit)
 const SSTATUS_BITS: [(i32, u32); 5] = [
     (offset_of!(Cpu, sie_bit) as i32, 1),
@@ -363,9 +369,10 @@ fn insn_at(host0: usize, k: usize) -> u32 {
 /// uninitialized otherwise: zero-filling it cost more than the scan).
 type Kinds = [MaybeUninit<Kind>; MAX_BLOCK];
 
-/// A translated LR.W / SC.W (out of line like `emit_csr`).
+/// A translated LR.W / SC.W (out of line like `emit_csr`; not in the hot
+/// code, as blocks with LR/SC are few: with `AmoLock` it runs holding the
+/// lock's spinlock, see `AmoLock`).
 #[inline(never)]
-#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn emit_lrsc<'a>(mut a: Asm<'a>, r: &Routines, insn: u32) -> Asm<'a> {
     let rd = (insn >> 7) & 31;
     let rs1 = (insn >> 15) & 31;
@@ -383,15 +390,24 @@ fn emit_lrsc<'a>(mut a: Asm<'a>, r: &Routines, insn: u32) -> Asm<'a> {
     }
     // A slow case (miss, MMIO, fault, misaligned) leaves at the helper call
     // with the reservation as it was, and the interpreter does it all.
+    let smp = r.amo_begin != 0;
     if insn >> 27 == 2 {
         // LR.W
         a.sw(K0, S, OFF_RES_ADDR);
         call!(K3, r.helper[0][2]);
-        if spilled(rd) {
+        if spilled(rd) || (smp && rd == 0) {
             a.lw(K1, K0, 0);
-            a.sw(K1, S, xoff(rd));
+            if rd != 0 {
+                a.sw(K1, S, xoff(rd));
+            }
+            if smp {
+                a.sw(K1, S, OFF_RES_VAL);
+            }
         } else {
             a.lw(rd, K0, 0); // (rd = x0 still loads)
+            if smp {
+                a.sw(rd, S, OFF_RES_VAL);
+            }
         }
         a.addi(K1, ZERO, 1);
         a.store(0, K1, S, OFF_RES_VALID); // sb
@@ -408,14 +424,31 @@ fn emit_lrsc<'a>(mut a: Asm<'a>, r: &Routines, insn: u32) -> Asm<'a> {
     let here = a.pos();
     a.fix(misaligned, here);
     call!(K3, r.helper[1][2]);
+    // several harts: the store only if the word still holds what LR read,
+    // with the other harts locked out
+    let mut changed = None;
+    if smp {
+        call!(K3, r.amo_begin);
+        a.lw(K2, K0, 0);
+        a.lw(K1, S, OFF_RES_VAL);
+        changed = Some(a.branch_fwd(1, K2, K1));
+    }
     if spilled(rs2) {
         a.lw(K1, S, xoff(rs2));
         a.sw(K1, K0, 0);
     } else {
         a.sw(rs2, K0, 0);
     }
+    if smp {
+        call!(K3, r.amo_end);
+    }
     a.addi(K2, ZERO, 0);
     let done = a.jump_fwd();
+    if let Some(c) = changed {
+        let here = a.pos();
+        a.fix(c, here);
+        call!(K3, r.amo_end);
+    }
     let here = a.pos();
     a.fix(fail1, here);
     a.fix(fail2, here);
@@ -681,6 +714,58 @@ pub struct JitMem<'m> {
     pub store_epochs: &'m mut [u8],
 }
 
+/// What the harts of a multi-hart machine share with the translator they
+/// share: its lock (the code buffer, hash chains, page bits and jump-cache
+/// purges are changed only under it) and whether each hart is in translated
+/// code. A hart enters code only while holding the lock, so once the holder
+/// sees a hart out of code it stays out until the holder lets go; that is
+/// how a region is known to be unused before it is overwritten.
+pub struct JitSmp {
+    lock: AtomicU32,
+    in_code: [AtomicU32; MAX_HARTS],
+}
+
+impl JitSmp {
+    pub const fn new() -> Self {
+        JitSmp { lock: AtomicU32::new(0), in_code: [const { AtomicU32::new(0) }; MAX_HARTS] }
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn lock(&self) {
+        while self.lock.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn unlock(&self) {
+        self.lock.store(0, Ordering::Release);
+    }
+}
+
+impl Default for JitSmp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How translated AMOs and SCs exclude the other harts' accesses when guest
+/// RAM has no host atomics (the RP2350's PSRAM): spin on `spin` until a load
+/// of it returns nonzero, then store the hart's `JitRegs::amo_deny` to
+/// `ctrl`; afterwards store `allow` to `ctrl` and release `spin` with a
+/// store. (On the RP2350: an SIO spinlock, and ACCESSCTRL's XIP_MAIN
+/// register with the other core's bit clear.) The translator also holds
+/// `spin` while it runs its code outside the hot section (`emit_lrsc`): a
+/// hart locked out while it runs flash code cannot be resumed.
+#[derive(Clone, Copy)]
+pub struct AmoLock {
+    pub spin: u32,
+    pub ctrl: u32,
+    pub allow: u32,
+}
+
 pub struct Jit<'m> {
     code: &'m mut [u32],
     code_base: usize,
@@ -697,10 +782,19 @@ pub struct Jit<'m> {
     store: Store<'m>,
     jc: &'m mut [JcEntry],
     generation: u32,
-    force_interp: bool,
-    /// (pc, host, code) that chain() just looked up for the pc the next
-    /// step starts at
-    next: Option<(u32, usize, u32)>,
+    /// every hart's jump cache (as long as hart 0's) and state; [0] is
+    /// hart 0's (`jc`)
+    harts: [(*mut JcEntry, *mut Cpu); MAX_HARTS],
+    nharts: usize,
+    /// shared with the other harts (null: one hart)
+    smp: *const JitSmp,
+    amo_lock: Option<AmoLock>,
+    /// the hart holding the lock (multi-hart)
+    holder: *const Cpu,
+    /// Most instructions one entry into translated code may retire. A
+    /// multi-hart machine keeps it short, so a hart sees IPIs and fence
+    /// requests soon and leaves code a region it is about to reuse.
+    pub budget_cap: u64,
     /// Translate AMOs to the host AMO (true) or to a plain load / operate /
     /// store sequence (false). RP2350 only supports exclusives, and so
     /// Hazard3 AMOs, on main SRAM: an AMO to guest RAM in PSRAM is a
@@ -767,6 +861,27 @@ struct Routines {
     mem_miss: usize,
     /// TLB helpers, [store][log2 size]
     helper: [[usize; 3]; 2],
+    /// Multi-hart AMO lock (`AmoLock`), `jal K3`; both clobber K1 and K2.
+    /// 0: none.
+    amo_begin: usize,
+    amo_end: usize,
+    /// The jump routine's jump-cache miss (K0 = va, K3 = fetch addend): an
+    /// empty entry's code (`Jit::jc_empty`)
+    jc_miss: usize,
+}
+
+/// Take and release a hardware spinlock as `AmoLock::spin` describes it (a
+/// load returns nonzero once taken, any store releases it).
+#[inline(always)]
+fn spin_take(addr: u32) {
+    // SAFETY: the platform's spinlock register (`AmoLock`).
+    while unsafe { (addr as usize as *const u32).read_volatile() } == 0 {}
+}
+
+#[inline(always)]
+fn spin_give(addr: u32) {
+    // SAFETY: as above.
+    unsafe { (addr as usize as *mut u32).write_volatile(1) };
 }
 
 #[inline(always)]
@@ -822,8 +937,12 @@ impl<'m> Jit<'m> {
             store: Store { len: mem.store.len() - nidx, mem: mem.store, epochs: mem.store_epochs, nidx, wabs: 0 },
             jc: mem.jump_cache,
             generation: 0,
-            force_interp: false,
-            next: None,
+            harts: [(core::ptr::null_mut(), core::ptr::null_mut()); MAX_HARTS],
+            nharts: 1,
+            smp: core::ptr::null(),
+            amo_lock: None,
+            holder: core::ptr::null(),
+            budget_cap: BUDGET_CAP,
             native_amo: true,
             measure_only: false,
             stats: JitStats::default(),
@@ -837,7 +956,76 @@ impl<'m> Jit<'m> {
         cpu.code_pages = j.code_pages.as_ptr();
         cpu.jit.jc_base = j.jc.as_ptr() as usize;
         cpu.sync_tlb_ptrs();
+        j.harts[0] = (j.jc.as_mut_ptr(), cpu as *mut Cpu);
         j
+    }
+
+    /// Share this translator with another hart: its state and its own jump
+    /// cache (as long as hart 0's), and the block the harts share. Then
+    /// every hart runs `run_one` with its own `Cpu`, at once if the host
+    /// has the cores. `amo` must be given if guest RAM has no host atomics
+    /// (`native_amo` false). Before any code runs.
+    ///
+    /// # Safety
+    /// `cpu` and `jc` must outlive the translator and are written by it
+    /// from whichever hart holds the lock; `smp` likewise.
+    pub unsafe fn add_hart(&mut self, cpu: &mut Cpu, jc: &'m mut [JcEntry], smp: &'m JitSmp, amo: Option<AmoLock>) {
+        assert!(jc.len() == self.jc.len() && self.nharts < MAX_HARTS);
+        assert!(self.native_amo || amo.is_some());
+        jc.fill(self.jc_empty());
+        cpu.code_pages = self.code_pages.as_ptr();
+        cpu.jit.jc_base = jc.as_ptr() as usize;
+        cpu.sync_tlb_ptrs();
+        self.harts[self.nharts] = (jc.as_mut_ptr(), cpu as *mut Cpu);
+        self.nharts += 1;
+        self.smp = smp;
+        if amo.is_some() && self.amo_lock.is_none() {
+            self.amo_lock = amo;
+            // the lock routines live in the prelude: emit it again (no
+            // blocks yet)
+            self.emit_prelude();
+            self.ring.region_words = (self.code.len() - self.code_start) / self.ring.regions;
+            self.reset_tables();
+        }
+    }
+
+    /// Every hart's jump cache: drop the entries `drop` picks.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn purge_jcs(&mut self, drop: impl Fn(&JcEntry) -> bool) {
+        let n = self.jc.len();
+        let empty = self.jc_empty();
+        for h in 0..self.nharts {
+            // SAFETY: each registered jump cache is `n` entries that outlive
+            // the translator; under the lock nothing else writes them except
+            // that hart's own code, which is out of code or racing benignly
+            // (see `wait_others_out`).
+            let jc = unsafe { core::slice::from_raw_parts_mut(self.harts[h].0, n) };
+            for e in jc.iter_mut() {
+                if drop(e) {
+                    *e = empty;
+                }
+            }
+        }
+    }
+
+    /// Multi-hart: wait until no other hart is in translated code (it
+    /// cannot enter while this hart holds the lock), so nothing still runs
+    /// code about to be overwritten.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn wait_others_out(&self) {
+        let me = self.holder;
+        if self.smp.is_null() {
+            return;
+        }
+        // SAFETY: non-null `smp` outlives the translator.
+        let smp = unsafe { &*self.smp };
+        for h in 0..self.nharts {
+            if !core::ptr::eq(self.harts[h].1, me) {
+                while smp.in_code[h].load(Ordering::Acquire) != 0 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
     }
 
     /// Shared routines at the start of the code buffer.
@@ -981,6 +1169,7 @@ impl<'m> Jit<'m> {
         a.jalr(ZERO, K2, 0);
         // jump-cache miss: K0 = va, K3 = addend. K3 = pa - va from here on.
         let walk = a.pos();
+        r.jc_miss = walk;
         a.fix(miss2, walk);
         a.fix(miss3, walk);
         a.li(K1, self.ram_off);
@@ -1075,6 +1264,26 @@ impl<'m> Jit<'m> {
             }
         }
 
+        if let Some(l) = self.amo_lock {
+            r.amo_begin = a.pos();
+            a.li(K1, l.spin);
+            let spin = a.pos();
+            a.lw(K2, K1, 0);
+            a.emit(b_type(0, K2, ZERO, -4)); // beq K2, zero, spin
+            debug_assert!(a.pos() == spin + 2);
+            a.li(K1, l.ctrl);
+            a.lw(K2, S, OFF_AMO_DENY);
+            a.sw(K2, K1, 0);
+            a.jalr(ZERO, K3, 0);
+            r.amo_end = a.pos();
+            a.li(K1, l.ctrl);
+            a.li(K2, l.allow);
+            a.sw(K2, K1, 0);
+            a.li(K1, l.spin);
+            a.sw(K1, K1, 0);
+            a.jalr(ZERO, K3, 0);
+        }
+
         assert!(!a.overflowed());
         self.enter = self.code_base + enter * 4;
         self.code_start = a.pos();
@@ -1083,6 +1292,7 @@ impl<'m> Jit<'m> {
         fence_i();
     }
 
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn reset_tables(&mut self) {
         self.buckets.fill(EMPTY);
         // with a backing store, pages keep their write protection: stored
@@ -1090,7 +1300,12 @@ impl<'m> Jit<'m> {
         if self.store.nidx == 0 {
             self.code_pages.fill(0);
         }
-        self.jc.fill(JcEntry::EMPTY);
+        self.jc.fill(self.jc_empty());
+        if self.nharts > 1 {
+            self.purge_jcs(|_| true);
+            self.wait_others_out();
+            self.purge_jcs(|_| true);
+        }
         self.pos = self.code_start;
         self.generation = self.generation.wrapping_add(1);
         let g = &mut self.ring;
@@ -1170,9 +1385,21 @@ impl<'m> Jit<'m> {
         self.ring.nlog[r] = 0;
         self.ring.seq[r] = 0;
         let (lo, hi) = (self.code_addr(lo) as u32, self.code_addr(hi) as u32);
-        for e in self.jc.iter_mut() {
-            if e.code >= lo && e.code < hi {
-                *e = JcEntry::EMPTY;
+        if self.nharts > 1 {
+            // no hart may find the region's blocks from here on; the others
+            // may still run them, or fill jump-cache entries from a hash
+            // walk that began before: wait for them to leave code, then purge
+            // again
+            let inr = |e: &JcEntry| e.code >= lo && e.code < hi;
+            self.purge_jcs(inr);
+            self.wait_others_out();
+            self.purge_jcs(inr);
+        } else {
+            let empty = self.jc_empty();
+            for e in self.jc.iter_mut() {
+                if e.code >= lo && e.code < hi {
+                    *e = empty;
+                }
             }
         }
         fence_i();
@@ -1233,7 +1460,11 @@ impl<'m> Jit<'m> {
                 i = next;
             }
         }
-        self.jc.fill(JcEntry::EMPTY);
+        if self.nharts > 1 {
+            self.purge_jcs(|_| true);
+        } else {
+            self.jc.fill(self.jc_empty());
+        }
         let n = ((ppage - cpu.ram_base()) >> 12) as usize;
         self.code_pages[n >> 3] &= !(1 << (n & 7));
         self.stats.smc_invalidations += 1;
@@ -1249,7 +1480,39 @@ impl<'m> Jit<'m> {
             self.code_pages[n >> 3] |= 1 << (n & 7);
             let host_page = cpu.ram_ptr() as usize + (n << 12);
             cpu.tlb_evict_writes_to(host_page);
+            if self.nharts > 1 {
+                self.mark_code_page_others(cpu, host_page);
+            }
         }
+    }
+
+    /// The other harts' write entries for a page that just became code. A
+    /// hart filling one at the same time looks at the page bit again after
+    /// publishing it (`Cpu::tlb_fill`); a store already past its TLB lookup
+    /// lands within a few cycles, before this hart reads the page.
+    #[inline(never)]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn mark_code_page_others(&mut self, cpu: &Cpu, host_page: usize) {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        for h in 0..self.nharts {
+            let other = self.harts[h].1;
+            if !core::ptr::eq(other, cpu) {
+                // SAFETY: a registered hart's state; it only reads these
+                // entries while its own refills write them (see above).
+                unsafe { (*other).tlb_evict_writes_to(host_page) };
+            }
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        for i in 0..256u32 {
+            core::hint::black_box(i);
+        }
+    }
+
+    /// An empty jump-cache entry (see `JcEntry::EMPTY`).
+    #[inline]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn jc_empty(&self) -> JcEntry {
+        JcEntry { code: self.code_addr(self.r.jc_miss as u32) as u32, ..JcEntry::EMPTY }
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
@@ -1406,6 +1669,7 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
+        let cold_lock = self.amo_lock.map(|l| l.spin);
         // pass 1: find the block
         let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
         let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0, &mut kinds);
@@ -1574,7 +1838,16 @@ impl<'m> Jit<'m> {
                 }
                 Kind::Nop => {}
                 Kind::Csr => a = emit_csr(a, r, insn, pc, n - 1 - k),
-                Kind::LrSc => a = emit_lrsc(a, r, insn),
+                Kind::LrSc => {
+                    // (in flash: see `emit_lrsc`)
+                    if let Some(l) = cold_lock {
+                        spin_take(l);
+                    }
+                    a = emit_lrsc(a, r, insn);
+                    if let Some(l) = cold_lock {
+                        spin_give(l);
+                    }
+                }
                 Kind::Amo => {
                     // misaligned AMOs and every slow case go to the interpreter
                     if spilled(rs1) {
@@ -1586,6 +1859,10 @@ impl<'m> Jit<'m> {
                     a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
                     call!(K3, r.mem_miss);
                     call!(K3, r.helper[1][2]);
+                    let locked = r.amo_begin != 0 && !self.native_amo;
+                    if locked {
+                        call!(K3, r.amo_begin);
+                    }
                     let src = if spilled(rs2) {
                         a.lw(K1, S, xoff(rs2));
                         K1
@@ -1641,6 +1918,9 @@ impl<'m> Jit<'m> {
                         } else if rd != 0 {
                             a.addi(rd, K2, 0);
                         }
+                        if locked {
+                            call!(K3, r.amo_end);
+                        }
                     }
                 }
                 Kind::Interp => unreachable!(),
@@ -1687,6 +1967,26 @@ impl<'m> Jit<'m> {
         }
         cpu.step(bus);
         self.stats.interp_steps += 1;
+        let dma = bus.take_dma_write();
+        if !self.smp.is_null() {
+            if cpu.smc_page.is_none() && !cpu.has_native_write() && dma.is_none() {
+                return;
+            }
+            // SAFETY: non-null `smp` outlives the translator.
+            let smp = unsafe { &*self.smp };
+            smp.lock();
+            self.holder = cpu;
+            self.invalidations(cpu, bus, dma);
+            smp.unlock();
+            return;
+        }
+        self.invalidations(cpu, bus, dma);
+    }
+
+    /// Drop code a store, a native call or a device (`dma`, then any more
+    /// the bus has) just wrote over.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn invalidations<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, mut dma: Option<(u32, u32)>) {
         if let Some(p) = cpu.smc_page.take() {
             self.invalidate_page(cpu, p);
         }
@@ -1702,7 +2002,7 @@ impl<'m> Jit<'m> {
             }
         }
         // device writes to guest RAM (always from an interpreted MMIO store)
-        while let Some((lo, hi)) = bus.take_dma_write() {
+        while let Some((lo, hi)) = dma.take().or_else(|| bus.take_dma_write()) {
             let mut page = lo & !0xFFF;
             while page < hi {
                 let n = (page.wrapping_sub(cpu.ram_base()) >> 12) as usize;
@@ -1726,7 +2026,11 @@ impl<'m> Jit<'m> {
             return;
         }
         // the next step starts there: save it the lookup
-        self.next = Some((target, host, code));
+        cpu.jit.next_valid = true;
+        cpu.jit.next_pc = target;
+        cpu.jit.next_host = host;
+        cpu.jit.next_code = code;
+        cpu.jit.next_gen = self.generation;
         let slot = (slot_addr - self.code_base) / 4;
         let off = (code as isize - slot as isize) * 4;
         if (-(1 << 20)..(1 << 20)).contains(&off) {
@@ -1778,10 +2082,14 @@ impl<'m> Jit<'m> {
         loop {
             // SAFETY: instruction k of the block, in the same guest RAM page.
             let insn = unsafe { ((host0 + 4 * k as usize) as *const u32).read() };
+            let locked = self.r.amo_begin != 0;
             seen += match classify(insn, pc0.wrapping_add(4 * k), cpu.privilege == Priv::S) {
                 Kind::Load | Kind::Store | Kind::Jalr => 1,
+                Kind::Amo if locked && !self.native_amo => 4,
                 Kind::Amo => 2,
                 Kind::Csr => csr_sites(insn),
+                // SC: the helper, the lock, two unlocks
+                Kind::LrSc if locked && insn >> 27 == 3 => 4,
                 Kind::LrSc => 1,
                 _ => 0,
             };
@@ -1806,30 +2114,33 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn run_one_inner<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Event {
-        let next = self.next.take();
+        if !self.smp.is_null() {
+            return self.run_one_smp(cpu, bus);
+        }
+        let next = cpu.jit.next_valid;
+        cpu.jit.next_valid = false;
         if cpu.check_irq(bus) {
-            self.force_interp = false;
+            cpu.jit.force_interp = false;
             return Event::Irq;
         }
-        if self.force_interp {
-            self.force_interp = false;
+        if cpu.jit.force_interp {
+            cpu.jit.force_interp = false;
             self.interp(cpu, bus);
             return Event::Interp;
         }
         let pc = cpu.pc;
-        let (host, code) = match next {
-            Some((npc, host, code)) if npc == pc => (host, code),
-            _ => {
-                let Ok((pa, host)) = cpu.translate_pc(pc) else {
-                    self.interp(cpu, bus); // raises the fetch fault
-                    return Event::Interp;
-                };
-                let code = match self.lookup(pc, pa) {
-                    Some(c) => c,
-                    None => self.translate(cpu, pc, pa),
-                };
-                (host, code)
-            }
+        let (host, code) = if next && cpu.jit.next_pc == pc {
+            (cpu.jit.next_host, cpu.jit.next_code)
+        } else {
+            let Ok((pa, host)) = cpu.translate_pc(pc) else {
+                self.interp(cpu, bus); // raises the fetch fault
+                return Event::Interp;
+            };
+            let code = match self.lookup(pc, pa) {
+                Some(c) => c,
+                None => self.translate(cpu, pc, pa),
+            };
+            (host, code)
         };
         if code == NO_CODE {
             self.interp(cpu, bus);
@@ -1844,7 +2155,7 @@ impl<'m> Jit<'m> {
             _pad: 0,
         };
 
-        let budget = cpu.timer_deadline().min(BUDGET_CAP) as i32;
+        let budget = cpu.timer_deadline().min(self.budget_cap) as i32;
         cpu.jit.budget = budget;
         // SAFETY: `enter` is the trampoline emitted in emit_prelude; the code
         // it jumps to was produced by `translate`.
@@ -1858,30 +2169,119 @@ impl<'m> Jit<'m> {
         if info & 3 == EXIT_MEM {
             self.mem_exit(cpu, (info & !3) as usize);
         }
+        self.after_exit(cpu, budget, info);
+        if info & 3 == EXIT_JUMP && info != 0 {
+            self.chain(cpu, info as usize, cpu.pc);
+        }
+        Event::Block { va: pc }
+    }
+
+    /// Account the instructions an entry retired and decide what follows.
+    #[inline(always)]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn after_exit(&mut self, cpu: &mut Cpu, budget: i32, info: u32) {
         let executed = (budget - cpu.jit.budget) as u64;
         cpu.instret += executed;
         self.stats.jit_insns += executed;
         self.stats.entries += 1;
         cpu.pc = cpu.jit.exit_pc;
         match info & 3 {
-            EXIT_JUMP => {
-                self.stats.exit_jump += 1;
-                if info != 0 {
-                    self.chain(cpu, info as usize, cpu.pc);
-                }
-            }
-            EXIT_INTERP => {
+            EXIT_JUMP => self.stats.exit_jump += 1,
+            EXIT_INTERP | EXIT_MEM => {
                 self.stats.exit_interp += 1;
-                self.force_interp = true;
-            }
-            EXIT_MEM => {
-                self.stats.exit_interp += 1;
-                self.force_interp = true;
+                cpu.jit.force_interp = true;
             }
             _ => {
                 self.stats.exit_budget += 1;
-                self.force_interp = true;
+                cpu.jit.force_interp = true;
             }
+        }
+    }
+
+    /// `run_one` on a multi-hart machine: the translator's tables only
+    /// under the shared lock, translated code outside it. A hart other than
+    /// the first may call it directly (one copy for every caller; hart 0's
+    /// `run_one` stays inlined into its loop).
+    #[inline(never)]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn run_one_smp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Event {
+        // SAFETY: non-null `smp` outlives the translator.
+        let smp = unsafe { &*self.smp };
+        let h = cpu.hartid as usize;
+        let next = cpu.jit.next_valid;
+        cpu.jit.next_valid = false;
+        if cpu.check_irq(bus) {
+            cpu.jit.force_interp = false;
+            return Event::Irq;
+        }
+        if cpu.jit.force_interp {
+            cpu.jit.force_interp = false;
+            self.interp(cpu, bus);
+            return Event::Interp;
+        }
+        let pc = cpu.pc;
+        smp.lock();
+        self.holder = cpu;
+        let (host, code) = if next && cpu.jit.next_pc == pc && cpu.jit.next_gen == self.generation {
+            (cpu.jit.next_host, cpu.jit.next_code)
+        } else {
+            let Ok((pa, host)) = cpu.translate_pc(pc) else {
+                smp.unlock();
+                self.interp(cpu, bus); // raises the fetch fault
+                return Event::Interp;
+            };
+            let code = match self.lookup(pc, pa) {
+                Some(c) => c,
+                None => self.translate(cpu, pc, pa),
+            };
+            (host, code)
+        };
+        if code == NO_CODE {
+            smp.unlock();
+            self.interp(cpu, bus);
+            return Event::Interp;
+        }
+        let jcn = self.jc.len();
+        let jci = ((pc >> 2) as usize) & (jcn - 1);
+        // SAFETY: this hart's own jump cache (`jc_base`, `jcn` entries).
+        unsafe {
+            (cpu.jit.jc_base as *mut JcEntry).add(jci).write(JcEntry {
+                va: pc,
+                addend: host.wrapping_sub(pc as usize) as u32,
+                code: self.code_addr(code) as u32,
+                _pad: 0,
+            });
+        }
+        let gen0 = self.generation;
+        let budget = cpu.timer_deadline().min(self.budget_cap) as i32;
+        cpu.jit.budget = budget;
+        let entry = self.code_addr(code);
+        let enter = self.enter;
+        smp.in_code[h].store(1, Ordering::Relaxed);
+        smp.unlock();
+        let t0 = host_instret();
+        // SAFETY: as in `run_one_inner`; the blocks stay while this hart is
+        // in code (`wait_others_out`).
+        unsafe {
+            let enter: EnterFn = core::mem::transmute(enter);
+            enter(cpu, entry);
+        }
+        self.stats.h_code += host_instret() - t0;
+        let info = cpu.jit.exit_info;
+        // (reads the block it left: still in code, so it stays)
+        if info & 3 == EXIT_MEM {
+            self.mem_exit(cpu, (info & !3) as usize);
+        }
+        smp.in_code[h].store(0, Ordering::Release);
+        self.after_exit(cpu, budget, info);
+        if info & 3 == EXIT_JUMP && info != 0 {
+            smp.lock();
+            self.holder = cpu;
+            // the slot's block may be gone since this hart left it
+            if self.generation == gen0 {
+                self.chain(cpu, info as usize, cpu.pc);
+            }
+            smp.unlock();
         }
         Event::Block { va: pc }
     }

@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 /* /dev/rvemu-crypto: the rvemu machine's native buffer engine, one operation
  * per ioctl (rvemu-crypto.h). Keys and random seeds come from the caller.
- * Each open owns kernel bounce buffers, which a mutex serializes for shared
- * descriptors; a failed operation copies nothing back, and every buffer used
- * is wiped. */
+ * Operations share the engine's kernel bounce buffers, one at a time; a
+ * failed operation copies nothing back, and every buffer used is wiped. */
 #include <linux/init.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/module.h>
+#include <linux/err.h>
 #include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/cpumask.h>
 #include <asm/sbi.h>
 #include <asm/io.h>
 #include "rvemu-crypto.h"
@@ -25,17 +26,39 @@
 #define ABORT 0x201
 #define PENDING (-100)
 
+/* One operation at a time, so one set of buffers: allocated at boot, while
+ * memory is still contiguous, and held from copy-in to copy-out. */
 static DEFINE_MUTEX(native_lock);
+static struct rvemu_native_buffers native_buffers;
 
+struct rvemu_native_buffers *rvemu_native_get(void)
+{
+    if (!native_buffers.in) return ERR_PTR(-ENODEV);
+    if (mutex_lock_killable(&native_lock)) return ERR_PTR(-EINTR);
+    return &native_buffers;
+}
+void rvemu_native_put(unsigned long in_len, unsigned long out_len, unsigned long plen)
+{
+    memzero_explicit(native_buffers.in, in_len);
+    memzero_explicit(native_buffers.out, out_len);
+    memzero_explicit(native_buffers.params, plen);
+    mutex_unlock(&native_lock);
+}
 /* Between slices the guest takes its interrupts and other tasks run; the
- * caller's buffers (kernel-owned) stay put until the operation is done. */
-struct sbiret rvemu_native_call(unsigned long op, phys_addr_t out, unsigned long cap,
-                                phys_addr_t in, unsigned long len,
-                                phys_addr_t params, unsigned long plen)
+ * buffers stay put until the operation is done. The engine is hart 0's (its
+ * host core runs it): with several CPUs the caller moves to CPU 0 for the
+ * call. */
+struct sbiret rvemu_native_call(unsigned long op, unsigned long cap, unsigned long len,
+                                unsigned long plen)
 {
     struct sbiret r = { .error = RVEMU_NATIVE_INTERRUPTED };
-    if (mutex_lock_killable(&native_lock)) return r;
-    r = sbi_ecall(RVEMU_NATIVE_EXT, op | MAY_PEND, out, cap, in, len, params, plen);
+#ifdef CONFIG_SMP
+    cpumask_t saved;
+    cpumask_copy(&saved, current->cpus_ptr);
+    if (set_cpus_allowed_ptr(current, cpumask_of(0))) return r;
+#endif
+    r = sbi_ecall(RVEMU_NATIVE_EXT, op | MAY_PEND, virt_to_phys(native_buffers.out), cap,
+                  virt_to_phys(native_buffers.in), len, virt_to_phys(native_buffers.params), plen);
     while (r.error == PENDING) {
         if (fatal_signal_pending(current)) {
             sbi_ecall(RVEMU_NATIVE_EXT, ABORT, 0, 0, 0, 0, 0, 0);
@@ -45,31 +68,16 @@ struct sbiret rvemu_native_call(unsigned long op, phys_addr_t out, unsigned long
         cond_resched();
         r = sbi_ecall(RVEMU_NATIVE_EXT, CONTINUE, 0, 0, 0, 0, 0, 0);
     }
-    mutex_unlock(&native_lock);
+#ifdef CONFIG_SMP
+    set_cpus_allowed_ptr(current, &saved);
+#endif
     return r;
 }
-#define MAX_BUFFER RVEMU_CRYPTO_MAX_BUFFER
-#define MAX_PARAMS RVEMU_CRYPTO_MAX_PARAMS
-struct crypto_context { struct mutex lock; unsigned char *in, *out, *params; };
-static void destroy(struct crypto_context *c)
-{
-    if (!c) return;
-    kfree_sensitive(c->in); kfree_sensitive(c->out); kfree_sensitive(c->params); kfree_sensitive(c);
-}
-static int crypto_open(struct inode *inode, struct file *file)
-{
-    struct crypto_context *c = kzalloc(sizeof(*c), GFP_KERNEL);
-    if (!c) return -ENOMEM;
-    c->in=kmalloc(MAX_BUFFER,GFP_KERNEL); c->out=kmalloc(MAX_BUFFER,GFP_KERNEL);
-    c->params=kmalloc(MAX_PARAMS,GFP_KERNEL);
-    if (!c->in || !c->out || !c->params) { destroy(c); return -ENOMEM; }
-    mutex_init(&c->lock); file->private_data=c;
-    return nonseekable_open(inode,file);
-}
-static int crypto_release(struct inode *inode, struct file *file) { destroy(file->private_data); return 0; }
+#define MAX_BUFFER RVEMU_NATIVE_MAX_BUFFER
+#define MAX_PARAMS RVEMU_NATIVE_MAX_PARAMS
 static long crypto_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    struct crypto_context *c=file->private_data;
+    struct rvemu_native_buffers *b;
     struct rvemu_crypto_request r;
     struct sbiret result;
     long ret=0;
@@ -77,14 +85,14 @@ static long crypto_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     if (copy_from_user(&r,(void __user *)arg,sizeof(r))) return -EFAULT;
     if (r.flags || r.output_len) return -EINVAL;
     if (r.source_len>MAX_BUFFER || r.capacity>MAX_BUFFER || r.parameters_len>MAX_PARAMS) return -EMSGSIZE;
-    mutex_lock(&c->lock);
-    if (copy_from_user(c->in,(void __user *)(unsigned long)r.source,r.source_len) ||
-        copy_from_user(c->params,(void __user *)(unsigned long)r.parameters,r.parameters_len)) {
+    if (r.operation>=MAY_PEND) return -EOPNOTSUPP;
+    b=rvemu_native_get();
+    if (IS_ERR(b)) return PTR_ERR(b);
+    if (copy_from_user(b->in,(void __user *)(unsigned long)r.source,r.source_len) ||
+        copy_from_user(b->params,(void __user *)(unsigned long)r.parameters,r.parameters_len)) {
         ret=-EFAULT; goto done;
     }
-    if (r.operation>=MAY_PEND) { ret=-EOPNOTSUPP; goto done; }
-    result=rvemu_native_call(r.operation,virt_to_phys(c->out),r.capacity,
-        virt_to_phys(c->in),r.source_len,virt_to_phys(c->params),r.parameters_len);
+    result=rvemu_native_call(r.operation,r.capacity,r.source_len,r.parameters_len);
     if (result.error) {
         ret=result.error==-2 ? -EOPNOTSUPP : result.error==-1 ? -EBADMSG :
             result.error==RVEMU_NATIVE_INTERRUPTED ? -EINTR : -EINVAL;
@@ -92,22 +100,29 @@ static long crypto_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     if (result.value>r.capacity) { ret=-EIO; goto done; }
     r.output_len=result.value;
-    if (copy_to_user((void __user *)(unsigned long)r.destination,c->out,r.output_len) ||
+    if (copy_to_user((void __user *)(unsigned long)r.destination,b->out,r.output_len) ||
         copy_to_user((void __user *)arg,&r,sizeof(r))) ret=-EFAULT;
 done:
-    memzero_explicit(c->in,r.source_len); memzero_explicit(c->out,r.capacity);
-    memzero_explicit(c->params,r.parameters_len);
-    mutex_unlock(&c->lock);
+    rvemu_native_put(r.source_len,r.capacity,r.parameters_len);
     return ret;
 }
 static const struct file_operations crypto_ops={
-    .owner=THIS_MODULE, .open=crypto_open, .release=crypto_release, .unlocked_ioctl=crypto_ioctl,
+    .owner=THIS_MODULE, .open=nonseekable_open, .unlocked_ioctl=crypto_ioctl,
 };
 static struct miscdevice crypto_dev={.minor=MISC_DYNAMIC_MINOR,.name="rvemu-crypto",.fops=&crypto_ops,.mode=0600};
 static int __init crypto_init(void)
 {
+    struct rvemu_native_buffers b;
     if (sbi_probe_extension(RVEMU_NATIVE_EXT)<=0) return -ENODEV;
+    b.in=kmalloc(MAX_BUFFER,GFP_KERNEL); b.out=kmalloc(MAX_BUFFER,GFP_KERNEL);
+    b.params=kmalloc(MAX_PARAMS,GFP_KERNEL);
+    if (!b.in || !b.out || !b.params) {
+        kfree(b.in); kfree(b.out); kfree(b.params);
+        return -ENOMEM;
+    }
+    native_buffers=b;
     return misc_register(&crypto_dev);
 }
-device_initcall(crypto_init);
+/* before ssh-rvemu.c's device_initcall */
+subsys_initcall(crypto_init);
 MODULE_LICENSE("GPL");

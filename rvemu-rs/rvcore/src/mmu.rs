@@ -19,6 +19,7 @@ const PFAULT: [u32; ACC_N] = [exc::LOAD_PFAULT, exc::STORE_PFAULT, exc::INSN_PFA
 const AFAULT: [u32; ACC_N] = [exc::LOAD_FAULT, exc::STORE_FAULT, exc::INSN_FAULT];
 
 impl Cpu {
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn tlb_flush_all(&mut self) {
         for set in self.tlb.iter_mut() {
             for table in set.iter_mut() {
@@ -78,9 +79,11 @@ impl Cpu {
     pub fn tlb_evict_writes_to(&mut self, host_page: usize) {
         for set in self.tlb.iter_mut() {
             for (i, e) in set[ACC_W].iter_mut().enumerate() {
+                // the tag only: the hart that owns the entry may be reading
+                // it right now, and must never pair its tag with another
+                // addend
                 if (e.tag as usize).wrapping_add(e.addend) == host_page {
                     e.tag = (((i + 1) & (TLB_SIZE - 1)) as u32) << 12;
-                    e.addend = 0;
                 }
             }
         }
@@ -217,6 +220,18 @@ impl Cpu {
             let e = &mut self.tlb[self.mmu_idx][acc][slot];
             e.tag = vpage;
             e.addend = hp.wrapping_sub(vpage as usize);
+            if acc == ACC_W && !self.smp.is_null() {
+                // another hart may have marked the page as code since the
+                // check above (it then drops write entries, ours included,
+                // after its mark): look again after publishing the entry
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                if self.is_code_page(ppage) {
+                    let e = &mut self.tlb[self.mmu_idx][acc][slot];
+                    e.tag = (((slot + 1) & (TLB_SIZE - 1)) as u32) << 12;
+                    e.addend = 0;
+                    self.smc_page = Some(ppage);
+                }
+            }
             Ok((pa, Some(hp + (va & PAGE_MASK) as usize)))
         } else {
             Ok((pa, None))
