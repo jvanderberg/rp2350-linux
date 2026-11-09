@@ -1,0 +1,7 @@
+[build]
+# The guest is RV32IMA Linux: rv32im has a prebuilt core without compressed
+# instructions; +a for the AMOs the emulator has.
+target = "riscv32im-unknown-none-elf"
+
+[target.riscv32im-unknown-none-elf]
+rustflags = ["-C", "target-feature=+a", "-C", "link-arg=-Tlink.x", "-C", "relocation-model=static"]

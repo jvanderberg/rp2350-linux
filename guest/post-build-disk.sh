@@ -106,6 +106,8 @@ cat > "$T/etc/default/dropbear" <<'D'
 # read by /etc/init.d/S50dropbear
 mkdir -p -m 700 /home/dropbear
 D
-# claude-remote: run Claude Code on another host against files on this guest
+# claude-remote: run Claude Code on another host against files on this guest.
+# The MCP server is a no_std Rust binary built on the host by run-build.sh.
 install -m 755 "$(dirname "$0")/claude-remote/claude-remote" "$T/usr/bin/claude-remote"
-install -m 644 "$(dirname "$0")/claude-remote/claude-guest-mcp.py" "$T/usr/lib/claude-guest-mcp.py"
+install -m 755 "$(dirname "$0")/claude-remote/target/riscv32im-unknown-none-elf/release/claude-guest-mcp" \
+  "$T/usr/bin/claude-guest-mcp"

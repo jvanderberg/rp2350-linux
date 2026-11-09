@@ -2,7 +2,7 @@
 # claude-remote: run Claude Code on another machine while it works on files HERE,
 # with every file read, edit and shell command carried over ssh. Nothing to install on
 # the remote beyond claude and socat (or python3). Written for the rp2350 Linux guest:
-# BusyBox ash, Dropbear dbclient, MicroPython.
+# BusyBox ash, Dropbear dbclient and claude-guest-mcp (a 60 KB static binary).
 #
 #   claude-remote [-d DIR] [-i KEY] [--claude CMD] [--keep-native] user@host [-- claude args]
 #
@@ -37,14 +37,12 @@ done
 DIR=$(cd "$DIR" 2>/dev/null && pwd -P) || { echo "not a directory: $DIR" >&2; exit 1; }
 
 if [ -z "$SERVER" ]; then
-  for c in "$(dirname "$0")/claude-guest-mcp.py" /usr/lib/claude-guest-mcp.py /usr/local/lib/claude-guest-mcp.py; do
-    [ -f "$c" ] && { SERVER=$c; break; }
+  for c in "$(dirname "$0")/claude-guest-mcp" "$(dirname "$0")/target/riscv32im-unknown-none-elf/release/claude-guest-mcp" \
+           /usr/bin/claude-guest-mcp /usr/local/bin/claude-guest-mcp; do
+    [ -x "$c" ] && { SERVER=$c; break; }
   done
 fi
-[ -n "$SERVER" ] || { echo "claude-guest-mcp.py not found (set CLAUDE_GUEST_MCP)" >&2; exit 1; }
-if command -v micropython >/dev/null 2>&1; then PY=micropython
-elif command -v python3 >/dev/null 2>&1; then PY=python3
-else echo "need micropython or python3" >&2; exit 1; fi
+[ -n "$SERVER" ] || { echo "claude-guest-mcp not found (set CLAUDE_GUEST_MCP)" >&2; exit 1; }
 
 if command -v dbclient >/dev/null 2>&1; then SSH=dbclient; else SSH=ssh; fi
 [ -n "$KEY" ] && SSH="$SSH -i $KEY"
@@ -112,7 +110,7 @@ $SSH "$REMOTE" true || { echo "claude-remote: cannot connect to $REMOTE" >&2; ex
 
 echo "claude-remote: sharing $DIR with $REMOTE" >&2
 # Cross-wire: server stdout -> ssh stdin, ssh stdout -> server stdin (through the fifo).
-( $PY "$SERVER" "$DIR" < "$TMP/fifo" | $SSH -T "$REMOTE" "$BRIDGE_CMD" > "$TMP/fifo" ) &
+( "$SERVER" "$DIR" < "$TMP/fifo" | $SSH -T "$REMOTE" "$BRIDGE_CMD" > "$TMP/fifo" ) &
 BPID=$!
 
 trap '' INT   # Ctrl-C goes to the remote tty, not to this script

@@ -35,6 +35,15 @@ if [ -n "$tree" ]; then
   }
 fi
 out=out; [[ $stage != disk* ]] || out=out-disk
+# claude-guest-mcp goes into the disk rootfs; it is built here, with the host's
+# Rust (the build container has none), and post-build-disk.sh installs it
+if [[ $stage == disk || $stage == disk-rootfs ]]; then
+  need_tool cargo 'Install Rust (rustup) to build claude-guest-mcp.'
+  rustup target list --installed | grep -qx riscv32im-unknown-none-elf || {
+    echo 'Run: rustup target add riscv32im-unknown-none-elf' >&2; exit 1;
+  }
+  (cd claude-remote && cargo build --release --locked)
+fi
 # A failed rebuild must not leave a stale success manifest beside its outputs.
 rm -f "$out/build.json"
 # Build trees live in the Docker volume rvemu-guest-work, so rebuilds are incremental
