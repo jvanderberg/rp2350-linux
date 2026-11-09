@@ -27,6 +27,7 @@ Linux rp2350 6.12.116 #29 Sun Nov  8 12:56:58 UTC 2026 riscv32 GNU/Linux
 | [USB console and Wi-Fi](#console-and-network) | on | `screen /dev/cu.usbmodemrvemu1 115200`; `eth0` |
 | [`/home` and `/root` on flash](#home-on-flash) | on | files there are kept across reboots |
 | [SSH](#ssh) | on | `ssh root@ADDRESS` with your key in `/root/.ssh/authorized_keys` |
+| [Claude Code on the board's files](#claude-code) | on | `claude-remote user@mac -d DIR` |
 | [C compiler](#c-compiler) | on | `cc`, `tcc -run`, `tcc -ar` |
 | [Swap on flash](#swap) | off | `scripts/pico-shell.sh -w` |
 | [GPIO, I2C, SPI, PWM, ADC](#gpio-i2c-spi-pwm-adc) | on | `gpioinfo`, `i2cdetect`, MicroPython `machine` |
@@ -136,6 +137,38 @@ $ scp -O notes.txt root@192.168.4.171:
 ```
 
 The board has no SFTP server, so the Mac's `scp` needs `-O`.
+
+## Claude Code
+
+`claude-remote` runs Claude Code on another machine (one with `claude`
+installed, such as the Mac) while every file it reads, edits, searches and
+every shell command it runs happens on the board. The board opens two ssh
+sessions to that machine: one carries `claude-guest-mcp`, a small static
+MCP tool server on the board, to a Unix socket there; the other runs
+`claude` with that socket as its only tool server and its own file and
+shell tools switched off. Nothing is installed on the other machine beyond
+`claude` and `socat` or `python3`.
+
+```
+claude-remote [-d DIR] [-i KEY] [--claude CMD] [--keep-native] user@host [-- claude args]
+```
+
+`-d` is the directory Claude works in (default: the current one).
+`--keep-native` leaves Claude's own tools on, so it can also work on files
+on the remote machine. Arguments after `--` go to `claude`.
+
+For a session without password prompts, give the board a key and put its
+public half in the other machine's `~/.ssh/authorized_keys`; the key lives
+in `/root/.ssh`, on flash:
+
+```
+# dropbearkey -t ed25519 -f ~/.ssh/id_dropbear
+# dropbearkey -y -f ~/.ssh/id_dropbear | grep ^ssh-
+# claude-remote josh@192.168.4.47 -d ~/project
+```
+
+Commands Claude runs on the board get BusyBox sh and the board's tools,
+including `cc`; it is told to keep them small.
 
 ## C compiler
 

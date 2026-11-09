@@ -68,12 +68,13 @@ and the root filesystem.
 - **Not included:** vim (`vi` is BusyBox's), strace and make.
 
 - **`claude-remote`** (`claude-remote/`): runs Claude Code on another host
-  over ssh while it reads, edits and runs commands on this guest, through
-  `claude-guest-mcp`, an MCP tool server: a 60 KB static no_std Rust binary
-  on raw system calls (built on the host by `run-build.sh`, target
-  `riscv32im-unknown-none-elf`), so the guest's RAM stays free for the work.
-  `claude-remote [-d DIR] user@host`; with `~/.ssh/id_dropbear` on the guest
-  there are no prompts. The remote needs `claude` and `socat` or `python3`.
+  over ssh while it reads, edits and runs commands on this guest
+  ([how to use it](../README.md#claude-code)). The tools are
+  `claude-guest-mcp`, an MCP server over stdio: a static no_std Rust
+  binary on raw system calls, so it costs the guest almost no memory.
+  `run-build.sh` builds it on the host with Cargo for
+  `riscv32im-unknown-none-elf` (the build container has no Rust) and
+  `post-build-disk.sh` installs it in `/usr/bin`.
 
 ## /home on flash
 

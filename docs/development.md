@@ -42,6 +42,11 @@ image ID. Console output is retained in `guest/build-STAGE.log`. A failed
 build removes the previous success manifest; output files may still be
 partial or left over from the preceding build.
 
+The `disk` and `disk-rootfs` stages also build `guest/claude-remote`
+(the `claude-guest-mcp` binary) on the host with Cargo, so they need Rust
+with the `riscv32im-unknown-none-elf` target; the result goes into the
+root filesystem through `post-build-disk.sh`.
+
 The wrapper clones Buildroot tag `2026.08.1`, verifies its pinned commit
 (`BR_REV` in `guest/run-build.sh`), and refuses a dirty checkout or
 a different HEAD. It does not reset local changes. Kernel-only stages require
