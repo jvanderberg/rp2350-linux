@@ -115,6 +115,9 @@ int rvemu_spi_skip(struct spi_device *spi, u8 byte, unsigned int max)
 	rs = spi_controller_get_devdata(spi->controller);
 	writel(spi->mode & MODE_BITS, rs->base + RS_MODE);
 	writel(spi->max_speed_hz, rs->base + RS_HZ);
+	/* chip select on, and left on, as a message whose last transfer sets
+	 * cs_change leaves it (mmc_spi's readback) */
+	writel(rs_on(spi), rs->base + RS_CS);
 	writel(byte | min_t(u32, max, SKIP_MAX) << 8, rs->base + RS_SKIP);
 	r = readl(rs->base + RS_SKIP);
 	return r == SKIP_NONE ? -EAGAIN : r;

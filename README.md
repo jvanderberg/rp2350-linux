@@ -229,11 +229,12 @@ Swap:          1788         116        1672
 
 ## SD card
 
-An SD card on SPI1 is `/dev/mmcblk0`. Its first FAT partition (FAT16 or
-FAT32, with long names) is mounted at `/mnt/sd` whenever a card is in,
-including one put in after boot. Run `umount /mnt/sd`, or shut down, before
-taking the card out. The first `df` after mounting takes a while: Linux
-counts the free space itself.
+An SD card on SPI1 is `/dev/mmcblk0`. When a card goes in, at boot or
+later, its first partition (or the whole card, if it has no partition
+table) is mounted at `/mnt/sd` as FAT16 or FAT32, with long names. Run
+`umount /mnt/sd`, or shut down, before taking the card out; an unmounted
+card stays unmounted until it comes out. The first `df` after mounting
+takes a while: Linux counts the free space itself.
 
 | SD signal | Board |
 |---|---|

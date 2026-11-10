@@ -37,8 +37,8 @@ config RVEMU_SPI
 	bool "rvemu SPI controller"
 	depends on SPI_MASTER && OF
 	help
-	  The rvemu machine's SPI controller: the RP2350's SPI0, driven
-	  synchronously by the emulator.
+	  The rvemu machine's SPI controllers, one per RP2350 SPI block
+	  (SPI1 carries the SD card), driven synchronously by the emulator.
 
 config RVEMU_CRYPTO
 	bool "rvemu native crypto engine"

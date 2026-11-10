@@ -434,7 +434,8 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   up). The clock rate (100 kHz to 50 MHz) and mode change per transfer.
   The controller makes the clock, so no device can hold a transfer up; the
   100 kHz floor bounds the longest one (4 KiB, spidev's buffer) to about
-  0.3 s. Chip selects GP17 and GP9 are GPIOs, held for the whole message.
+  0.3 s. Chip selects GP17 and GP9 are GPIOs, held for the whole message,
+  and after it when its last transfer sets `cs_change`.
 - **PWM.** The slice and channel that reach the pin, with the divider and
   TOP worked out from the period. A slice's period can't change while
   another of its pins is running.

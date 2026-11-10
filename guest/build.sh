@@ -89,10 +89,17 @@ disk_kernel() {   # TREE OUT [smp]
   grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
   grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
   # mmc_spi waits for the SD card's tokens and busy in the firmware
-  # (rvemu_spi_skip in drivers/rvemu/spi-rvemu.c); applied once (a reverse
-  # dry run succeeds only when this patch is in)
-  patch -R -p1 -s -f --dry-run < /guest/linux/mmc_spi-rvemu.patch >/dev/null 2>&1 ||
-    patch -p1 -f < /guest/linux/mmc_spi-rvemu.patch
+  # (rvemu_spi_skip in drivers/rvemu/spi-rvemu.c). The patch is applied to
+  # the stock file, kept beside it, so a changed patch applies cleanly; the
+  # file is replaced only when the result differs (no needless rebuild).
+  local mmc=drivers/mmc/host/mmc_spi.c
+  if [[ ! -f $mmc.stock ]]; then
+    grep -q CONFIG_RVEMU_SPI $mmc &&
+      curl -fsSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/$mmc?h=v$KVER" -o $mmc
+    cp $mmc $mmc.stock
+  fi
+  patch -s -f -o $mmc.new $mmc.stock < /guest/linux/mmc_spi-rvemu.patch
+  cmp -s $mmc.new $mmc && rm $mmc.new || mv $mmc.new $mmc
   make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
   scripts/kconfig/merge_config.sh -m .config "${frags[@]}"
   make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig

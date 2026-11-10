@@ -11,7 +11,7 @@
  
  #include <linux/unaligned.h>
  
-@@ -158,6 +162,27 @@
+@@ -158,6 +162,31 @@
  {
  	u8 *cp = host->data->status;
  	unsigned long start = jiffies;
@@ -19,11 +19,15 @@
 +	/* The rvemu controller waits in the firmware, a byte at a time. The
 +	 * limit is the bytes the timeout clocks at the bus rate, so time this
 +	 * task spends preempted (cond_resched) doesn't count against the card.
++	 * Each wait is about a millisecond of bytes, so the bus is never held
++	 * for long.
 +	 */
-+	u64 left = div_u64((u64)jiffies_to_usecs(timeout) * host->spi->max_speed_hz, 8000000) + 1;
++	u32 rate = host->spi->max_speed_hz / 8;
++	u64 left = mul_u64_u32_div(timeout, rate, HZ) + 1;
++	unsigned int step = max(rate / 1000, 1U);
 +
 +	while (left) {
-+		unsigned int chunk = min_t(u64, left, 4096);
++		unsigned int chunk = min_t(u64, left, step);
 +		int status = rvemu_spi_skip(host->spi, byte, chunk);
 +
 +		if (status == -EOPNOTSUPP)
