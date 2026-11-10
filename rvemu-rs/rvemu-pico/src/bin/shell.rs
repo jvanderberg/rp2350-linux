@@ -1023,8 +1023,7 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     macro_rules! free {
         ($($n:literal $f:ident),*) => { $( gp[$n] = Some(Gp::new(pins.$f)); )* };
     }
-    free!(1 gpio1, 2 gpio2, 3 gpio3, 8 gpio8, 9 gpio9, 10 gpio10, 11 gpio11, 12 gpio12, 13 gpio13, 14 gpio14,
-        15 gpio15, 20 gpio20, 21 gpio21, 22 gpio22, 26 gpio26, 27 gpio27, 28 gpio28, 30 gpio30, 31 gpio31,
+    free!(1 gpio1, 2 gpio2, 3 gpio3, 12 gpio12, 13 gpio13, 14 gpio14, 15 gpio15, 20 gpio20, 21 gpio21, 22 gpio22, 26 gpio26, 27 gpio27, 28 gpio28, 30 gpio30, 31 gpio31,
         32 gpio32, 33 gpio33, 34 gpio34, 35 gpio35, 36 gpio36, 37 gpio37, 38 gpio38, 39 gpio39);
     debug_assert!((0..rvcore::periph::NGPIO as usize).all(|n| gp[n].is_some() == (rvcore::periph::FREE_PINS >> n & 1 != 0)));
     use hal::fugit::RateExtU32;
@@ -1049,6 +1048,12 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         (pins.gpio19.reconfigure(), pins.gpio16.reconfigure(), pins.gpio18.reconfigure()),
     )
     .init(&mut pac.RESETS, peri_hz.Hz(), 1.MHz(), pins::SPI_MODE);
+    // the SD card
+    let spi1 = hal::spi::Spi::<_, _, _, 8>::new(
+        pac.SPI1,
+        (pins.gpio11.reconfigure(), pins.gpio8.reconfigure(), pins.gpio10.reconfigure()),
+    )
+    .init(&mut pac.RESETS, peri_hz.Hz(), 400.kHz(), pins::SPI_MODE);
     let adc_pins = [
         pins.gpio40.into_floating_disabled().into_dyn_pin(),
         pins.gpio41.into_floating_disabled().into_dyn_pin(),
@@ -1059,7 +1064,16 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         pins.gpio46.into_floating_disabled().into_dyn_pin(),
         pins.gpio47.into_floating_disabled().into_dyn_pin(),
     ];
-    let set = PinSet { gp, i2c0, i2c1, spi, spi_cs: pins.gpio17.reconfigure(), adc_pins };
+    let set = PinSet {
+        gp,
+        i2c0,
+        i2c1,
+        spi,
+        spi_cs: pins.gpio17.reconfigure(),
+        spi1,
+        spi1_cs: pins.gpio9.reconfigure(),
+        adc_pins,
+    };
     let board_pins = BoardPins::new(set, pac.PWM, pac.ADC, &mut pac.RESETS, sys_hz, peri_hz);
 
     // SAFETY: initialised once, here, before anything borrows it.

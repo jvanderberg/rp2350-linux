@@ -30,6 +30,7 @@ Linux rp2350 6.12.116 #29 Sun Nov  8 12:56:58 UTC 2026 riscv32 GNU/Linux
 | [Claude Code on the board's files](#claude-code) | on | `claude-remote user@mac -d DIR` |
 | [C compiler](#c-compiler) | on | `cc`, `tcc -run`, `tcc -ar` |
 | [Swap on flash](#swap) | off | `scripts/pico-shell.sh -w` |
+| [SD card](#sd-card) | on | files at `/mnt/sd` |
 | [GPIO, I2C, SPI, PWM, ADC](#gpio-i2c-spi-pwm-adc) | on | `gpioinfo`, `i2cdetect`, MicroPython `machine` |
 
 The guest also has editors (nano, mg, BusyBox `vi`), languages
@@ -45,6 +46,7 @@ lines starting with `$` on the Mac the board is plugged into.
   CS1, GP0).
 - An RM2 (CYW43439) Wi-Fi module on the Pico 2 W pins: GP23 WL_ON, GP24
   data/IRQ, GP25 CS, GP29 CLK. Optional: without it `eth0` stays down.
+- Optional: an SD card in an SPI adapter on GP8-GP11 ([SD card](#sd-card)).
 - The board's USB to the Mac, for loading and the console.
 - Optional: an SWD probe (a second RP2350 running debugprobe), for recovery.
 
@@ -225,20 +227,52 @@ Filename				Type		Size		Used		Priority
 Swap:          1788         116        1672
 ```
 
+## SD card
+
+An SD card on SPI1 is `/dev/mmcblk0`. Its first FAT partition (FAT16 or
+FAT32, with long names) is mounted at `/mnt/sd` whenever a card is in,
+including one put in after boot. Run `umount /mnt/sd`, or shut down, before
+taking the card out. The first `df` after mounting takes a while: Linux
+counts the free space itself.
+
+| SD signal | Board |
+|---|---|
+| CLK (SCK) | GP10 |
+| DI (MOSI) | GP11 |
+| DO (MISO) | GP8 |
+| CS | GP9 |
+| VCC, GND | 3V3, GND |
+
+Solder a 10 µF capacitor across VCC and GND at the card holder. Without it
+the card can fail to start, or drop off the bus while writing.
+
+**Example:**
+
+```
+# grep mmc /proc/partitions
+ 179        0   30976000 mmcblk0
+ 179        1   30942208 mmcblk0p1
+ 179        2      32768 mmcblk0p2
+# df -h /mnt/sd
+Filesystem                Size      Used Available Use% Mounted on
+/dev/mmcblk0p1           29.5G     78.3M     29.4G   0% /mnt/sd
+# echo hello > /mnt/sd/hello.txt; sync
+```
+
 ## GPIO, I2C, SPI, PWM, ADC
 
 The guest has the board's pins through the standard Linux interfaces:
 
 | Linux | Board |
 |---|---|
-| `/dev/gpiochip0` (lines 0-47 = GP0-GP47) | free pins GP1-GP3, GP8-GP15, GP20-GP22, GP26-GP28, GP30-GP39; pull-up/pull-down/none, rising/falling edge events |
+| `/dev/gpiochip0` (lines 0-47 = GP0-GP47) | free pins GP1-GP3, GP12-GP15, GP20-GP22, GP26-GP28, GP30-GP39; pull-up/pull-down/none, rising/falling edge events |
 | `/dev/i2c-0`, `/dev/i2c-1` | I2C0 on GP4 (SDA) / GP5 (SCL), I2C1 on GP6 / GP7; 100 kHz, internal pull-ups |
 | `/dev/spidev0.0` | SPI0: GP16 MISO, GP17 CS, GP18 SCK, GP19 MOSI; 100 kHz to 50 MHz, modes 0-3, 8-bit |
 | `/sys/class/pwm/pwmchip0` (channel N = GPN) | any free GPIO below 40; pins on one PWM slice share its period |
 | `/sys/bus/iio/devices/iio:device0` | `in_voltage0..7` = GP40-GP47 (mV = raw x `in_voltage_scale`), `in_temp` (the chip's sensor, m°C = (raw + offset) x scale) |
 
-GP0 (PSRAM) and GP23/24/25/29 (Wi-Fi) are not available; `gpioinfo` names
-every line. The build includes:
+GP0 (PSRAM), GP8-GP11 (the SD card) and GP23/24/25/29 (Wi-Fi) are not
+available; `gpioinfo` names every line. The build includes:
 
 - libgpiod tools (`gpiodetect`, `gpioinfo`, `gpioget`, `gpioset`,
   `gpiomon`), i2c-tools (`i2cdetect`, `i2cget`, `i2cset`, `i2ctransfer`)

@@ -118,9 +118,9 @@ impl Pins for StubPins {
         Ok(())
     }
 
-    fn spi_transfer(&mut self, _hz: u32, _mode: u8, _buf: &mut [u8]) {}
+    fn spi_transfer(&mut self, _bus: usize, _hz: u32, _mode: u8, _buf: &mut [u8]) {}
 
-    fn spi_cs(&mut self, _active: bool) {}
+    fn spi_cs(&mut self, _bus: usize, _active: bool) {}
 
     fn pwm_set(&mut self, _n: u32, pwm: Pwm) -> Pwm {
         match pwm_timing(CLK_HZ, pwm.period_ns, pwm.duty_ns) {

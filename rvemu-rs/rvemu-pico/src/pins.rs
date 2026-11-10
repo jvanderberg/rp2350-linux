@@ -10,6 +10,8 @@
 //!   holding SCL or SDA low would stop the emulator for good.
 //! - SPI0: GP16 RX (MISO), GP17 chip select (driven as a GPIO), GP18 SCK,
 //!   GP19 TX (MOSI).
+//! - SPI1, the SD card: GP8 RX (MISO, pulled up), GP9 chip select (a GPIO),
+//!   GP10 SCK, GP11 TX (MOSI).
 //! - PWM: the slice and channel that can reach the pin (`periph::pwm_slice`).
 //! - ADC: GP40-GP47 and the temperature sensor.
 //!
@@ -22,14 +24,14 @@
 use embedded_hal::digital::{InputPin as _, OutputPin as _};
 use embedded_hal::spi::{MODE_0, Mode, Phase, Polarity, SpiBus as _};
 use hal::fugit::RateExtU32;
-use hal::gpio::bank0::{Gpio4, Gpio5, Gpio6, Gpio7, Gpio16, Gpio17, Gpio18, Gpio19};
+use hal::gpio::bank0::{Gpio4, Gpio5, Gpio6, Gpio7, Gpio8, Gpio9, Gpio10, Gpio11, Gpio16, Gpio17, Gpio18, Gpio19};
 use hal::gpio::{
     DynPinId, DynPullType, FunctionI2C, FunctionNull, FunctionPwm, FunctionSioInput, FunctionSioOutput,
     FunctionSpi, Interrupt, Pin, PinState, PullDown, PullNone, PullUp,
 };
 use hal::pac;
 use hal::pwm::{Slices, ValidSliceMode};
-use hal::spi::{Enabled, FrameFormat, Spi};
+use hal::spi::{Enabled, FrameFormat, Spi, SpiDevice, ValidSpiPinout};
 use rp235x_hal as hal;
 use rp2350_board as board;
 use rvcore::periph::{FREE_PINS, I2cError, I2cOp, Line, NGPIO, Pins, Pwm, pwm_slice, pwm_timing};
@@ -103,6 +105,13 @@ pub type Spi0 = Spi<
     8,
 >;
 pub type SpiCs = Pin<Gpio17, FunctionSioOutput, PullNone>;
+pub type Spi1 = Spi<
+    Enabled,
+    pac::SPI1,
+    (Pin<Gpio11, FunctionSpi, PullNone>, Pin<Gpio8, FunctionSpi, PullUp>, Pin<Gpio10, FunctionSpi, PullNone>),
+    8,
+>;
+pub type Spi1Cs = Pin<Gpio9, FunctionSioOutput, PullNone>;
 
 /// The pins `BoardPins::new` takes over.
 pub struct PinSet {
@@ -112,6 +121,8 @@ pub struct PinSet {
     pub i2c1: I2c1,
     pub spi: Spi0,
     pub spi_cs: SpiCs,
+    pub spi1: Spi1,
+    pub spi1_cs: Spi1Cs,
     /// GP40-GP47, analog.
     pub adc_pins: [Pin<DynPinId, FunctionNull, PullNone>; 8],
 }
@@ -125,8 +136,11 @@ pub struct BoardPins {
     _i2c1: I2c1,
     spi: Spi0,
     spi_cs: SpiCs,
-    spi_hz: u32,
-    spi_mode: u8,
+    spi1: Spi1,
+    spi1_cs: Spi1Cs,
+    /// Each bus's current clock and mode.
+    spi_hz: [u32; 2],
+    spi_mode: [u8; 2],
     peri_hz: u32,
     pwm: Slices,
     /// Pins with PWM on, and each slice's (div16, top).
@@ -144,6 +158,8 @@ impl BoardPins {
         let temp = adc.take_temp_sensor().unwrap();
         let mut spi_cs = set.spi_cs;
         let _ = spi_cs.set_high();
+        let mut spi1_cs = set.spi1_cs;
+        let _ = spi1_cs.set_high();
         let mut adc_pins = set.adc_pins;
         for p in adc_pins.iter_mut() {
             p.set_input_enable(false);
@@ -156,8 +172,10 @@ impl BoardPins {
             _i2c1: set.i2c1,
             spi: set.spi,
             spi_cs,
-            spi_hz: 0,
-            spi_mode: 0,
+            spi1: set.spi1,
+            spi1_cs,
+            spi_hz: [0; 2],
+            spi_mode: [0; 2],
             peri_hz,
             pwm: Slices::new(pwm, resets),
             pwm_on: 0,
@@ -524,25 +542,23 @@ impl Pins for BoardPins {
         i2c_run(&I2cBus::new(bus), u64::from(self.sys_hz / 1_000_000), addr, ops)
     }
 
-    fn spi_transfer(&mut self, hz: u32, mode: u8, buf: &mut [u8]) {
-        if hz != self.spi_hz {
-            self.spi.set_baudrate(self.peri_hz.Hz(), hz.Hz());
-            self.spi_hz = hz;
+    fn spi_transfer(&mut self, bus: usize, hz: u32, mode: u8, buf: &mut [u8]) {
+        let b = bus & 1;
+        let cur = (&mut self.spi_hz[b], &mut self.spi_mode[b]);
+        if b == 0 {
+            spi_run(&mut self.spi, self.peri_hz, cur, hz, mode, buf);
+        } else {
+            spi_run(&mut self.spi1, self.peri_hz, cur, hz, mode, buf);
         }
-        if mode != self.spi_mode {
-            let m = Mode {
-                polarity: if mode & 2 != 0 { Polarity::IdleHigh } else { Polarity::IdleLow },
-                phase: if mode & 1 != 0 { Phase::CaptureOnSecondTransition } else { Phase::CaptureOnFirstTransition },
-            };
-            self.spi.set_format(FrameFormat::MotorolaSpi(m));
-            self.spi_mode = mode;
-        }
-        let _ = self.spi.transfer_in_place(buf);
-        let _ = self.spi.flush();
     }
 
-    fn spi_cs(&mut self, active: bool) {
-        let _ = if active { self.spi_cs.set_low() } else { self.spi_cs.set_high() };
+    fn spi_cs(&mut self, bus: usize, active: bool) {
+        let _ = match (bus & 1, active) {
+            (0, true) => self.spi_cs.set_low(),
+            (0, false) => self.spi_cs.set_high(),
+            (_, true) => self.spi1_cs.set_low(),
+            (_, false) => self.spi1_cs.set_high(),
+        };
     }
 
     fn pwm_set(&mut self, n: u32, want: Pwm) -> Pwm {
@@ -591,6 +607,32 @@ impl Pins for BoardPins {
 
 /// The default SPI mode before the guest picks one.
 pub const SPI_MODE: Mode = MODE_0;
+
+/// One transfer on `spi`, first setting its clock and mode if they changed
+/// (`cur`: what the bus is set to).
+fn spi_run<D: SpiDevice, P: ValidSpiPinout<D>>(
+    spi: &mut Spi<Enabled, D, P, 8>,
+    peri_hz: u32,
+    cur: (&mut u32, &mut u8),
+    hz: u32,
+    mode: u8,
+    buf: &mut [u8],
+) {
+    if hz != *cur.0 {
+        spi.set_baudrate(peri_hz.Hz(), hz.Hz());
+        *cur.0 = hz;
+    }
+    if mode != *cur.1 {
+        let m = Mode {
+            polarity: if mode & 2 != 0 { Polarity::IdleHigh } else { Polarity::IdleLow },
+            phase: if mode & 1 != 0 { Phase::CaptureOnSecondTransition } else { Phase::CaptureOnFirstTransition },
+        };
+        spi.set_format(FrameFormat::MotorolaSpi(m));
+        *cur.1 = mode;
+    }
+    let _ = spi.transfer_in_place(buf);
+    let _ = spi.flush();
+}
 
 /// 100 kHz, the I2C bus speed.
 pub fn i2c_hz() -> hal::fugit::HertzU32 {

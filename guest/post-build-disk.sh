@@ -89,6 +89,41 @@ stop)
 esac
 S
 chmod 755 "$T/etc/init.d/S02swap"
+# the SD card (SPI1, /dev/mmcblk0): its first FAT partition at /mnt/sd,
+# mounted in the background once the kernel has found the card
+cat > "$T/etc/init.d/S03sd" <<'S'
+#!/bin/sh
+# The SD card at /mnt/sd: mounted whenever a card is there (one can take tens
+# of seconds to start, or be put in later), the mount dropped when it's gone.
+PID=/var/run/sd.pid
+mounted() {
+  while read -r _ m _; do [ "$m" = /mnt/sd ] && return 0; done < /proc/mounts
+  return 1
+}
+case "$1" in
+start)
+  mkdir -p /mnt/sd
+  (
+    while :; do
+      if [ -b /dev/mmcblk0 ]; then
+        mounted || for p in /dev/mmcblk0p1 /dev/mmcblk0; do
+          [ -b "$p" ] && mount -t vfat -o noatime "$p" /mnt/sd && break
+        done
+      elif mounted; then
+        umount -l /mnt/sd
+      fi
+      sleep 2
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  echo $! > $PID
+  ;;
+stop)
+  [ -f $PID ] && kill "$(cat $PID)" 2>/dev/null; rm -f $PID
+  umount /mnt/sd 2>/dev/null
+  ;;
+esac
+S
+chmod 755 "$T/etc/init.d/S03sd"
 # the flash swap device's counters and flash timings (its last page)
 cat > "$T/usr/bin/flashswap-stats" <<'S'
 #!/bin/sh

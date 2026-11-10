@@ -88,6 +88,11 @@ disk_kernel() {   # TREE OUT [smp]
   rm -rf drivers/rvemu && cp -r /guest/linux/drivers/rvemu drivers/rvemu
   grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
   grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
+  # mmc_spi waits for the SD card's tokens and busy in the firmware
+  # (rvemu_spi_skip in drivers/rvemu/spi-rvemu.c); applied once (a reverse
+  # dry run succeeds only when this patch is in)
+  patch -R -p1 -s -f --dry-run < /guest/linux/mmc_spi-rvemu.patch >/dev/null 2>&1 ||
+    patch -p1 -f < /guest/linux/mmc_spi-rvemu.patch
   make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
   scripts/kconfig/merge_config.sh -m .config "${frags[@]}"
   make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig

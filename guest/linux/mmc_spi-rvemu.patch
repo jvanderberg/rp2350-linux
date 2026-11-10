@@ -1,0 +1,41 @@
+--- a/drivers/mmc/host/mmc_spi.c
++++ b/drivers/mmc/host/mmc_spi.c
+@@ -25,6 +25,10 @@
+ 
+ #include <linux/spi/spi.h>
+ #include <linux/spi/mmc_spi.h>
++#ifdef CONFIG_RVEMU_SPI
++#include <linux/math64.h>
++#include "../../rvemu/rvemu-spi.h"
++#endif
+ 
+ #include <linux/unaligned.h>
+ 
+@@ -158,6 +162,27 @@
+ {
+ 	u8 *cp = host->data->status;
+ 	unsigned long start = jiffies;
++#ifdef CONFIG_RVEMU_SPI
++	/* The rvemu controller waits in the firmware, a byte at a time. The
++	 * limit is the bytes the timeout clocks at the bus rate, so time this
++	 * task spends preempted (cond_resched) doesn't count against the card.
++	 */
++	u64 left = div_u64((u64)jiffies_to_usecs(timeout) * host->spi->max_speed_hz, 8000000) + 1;
++
++	while (left) {
++		unsigned int chunk = min_t(u64, left, 4096);
++		int status = rvemu_spi_skip(host->spi, byte, chunk);
++
++		if (status == -EOPNOTSUPP)
++			break;
++		if (status != -EAGAIN)
++			return status;
++		left -= chunk;
++		if (!left)
++			return -ETIMEDOUT;
++		cond_resched();
++	}
++#endif
+ 
+ 	do {
+ 		int		status;

@@ -1,11 +1,13 @@
-//! The board's pins as guest devices: GPIO, two I2C buses, SPI, PWM and the
-//! ADC, in guest MMIO 0xF8001000-0xF8002FFF (only GPIO interrupts: PLIC 8).
+//! The board's pins as guest devices: GPIO, two I2C buses, two SPI buses, PWM
+//! and the ADC, in guest MMIO 0xF8001000-0xF8002FFF (only GPIO interrupts:
+//! PLIC 8).
 //!
 //! | Device | Address | IRQ | Guest driver (guest/linux/drivers/rvemu) |
 //! |---|---|---|---|
 //! | GPIO | 0xF8001000 | 8 | `rvemu,gpio` |
 //! | I2C0, I2C1 | 0xF8001200, 0xF8001400 | | `rvemu,i2c` |
 //! | SPI0 | 0xF8001600 | | `rvemu,spi` + spidev |
+//! | SPI1 | 0xF8001C00 | | `rvemu,spi` + `mmc-spi-slot` (the SD card) |
 //! | PWM | 0xF8001800 | | `rvemu,pwm` |
 //! | ADC | 0xF8001A00 | | `rvemu,adc` (IIO) |
 //!
@@ -25,7 +27,7 @@ pub const GPIO_SIZE: u32 = 0x200;
 pub const GPIO_IRQ: u32 = 8;
 pub const I2C_BASE: [u32; 2] = [0xF800_1200, 0xF800_1400];
 pub const I2C_SIZE: u32 = 0x100;
-pub const SPI_BASE: u32 = 0xF800_1600;
+pub const SPI_BASE: [u32; 2] = [0xF800_1600, 0xF800_1C00];
 pub const SPI_SIZE: u32 = 0x100;
 pub const PWM_BASE: u32 = 0xF800_1800;
 pub const PWM_SIZE: u32 = 0x100;
@@ -50,7 +52,7 @@ pub const ADC_CHANNELS: u32 = 9;
 /// DT's `gpio-line-names` comes from here.
 pub const LINE_NAMES: [&str; NGPIO as usize] = [
     "PSRAM_CS", "GP1", "GP2", "GP3", "I2C0_SDA", "I2C0_SCL", "I2C1_SDA", "I2C1_SCL", //
-    "GP8", "GP9", "GP10", "GP11", "GP12", "GP13", "GP14", "GP15", //
+    "SPI1_RX", "SPI1_CS", "SPI1_SCK", "SPI1_TX", "GP12", "GP13", "GP14", "GP15", //
     "SPI0_RX", "SPI0_CS", "SPI0_SCK", "SPI0_TX", "GP20", "GP21", "GP22", "WL_ON", //
     "WL_D", "WL_CS", "GP26", "GP27", "GP28", "WL_CLK", "GP30", "GP31", //
     "GP32", "GP33", "GP34", "GP35", "GP36", "GP37", "GP38", "GP39", //
@@ -191,12 +193,12 @@ pub trait Pins {
     /// One transaction (repeated starts between the messages) with the
     /// device at 7-bit `addr` on `bus`.
     fn i2c(&mut self, bus: usize, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError>;
-    /// Full-duplex SPI, MSB first: send `buf` and replace it with what came
-    /// back, at `hz` (or the nearest rate below), in mode `mode`
+    /// Full-duplex SPI on `bus`, MSB first: send `buf` and replace it with
+    /// what came back, at `hz` (or the nearest rate below), in mode `mode`
     /// (CPOL << 1 | CPHA).
-    fn spi_transfer(&mut self, hz: u32, mode: u8, buf: &mut [u8]);
-    /// Drive the SPI chip select (active low) to active or not.
-    fn spi_cs(&mut self, active: bool);
+    fn spi_transfer(&mut self, bus: usize, hz: u32, mode: u8, buf: &mut [u8]);
+    /// Drive `bus`'s chip select (active low) to active or not.
+    fn spi_cs(&mut self, bus: usize, active: bool);
     /// Configure PWM on pin `n` (only for valid pins) and return what the
     /// hardware does instead (`period_ns` 0: not possible).
     fn pwm_set(&mut self, n: u32, pwm: Pwm) -> Pwm;
@@ -221,8 +223,8 @@ impl Pins for NoPins {
     fn i2c(&mut self, _bus: usize, _addr: u8, _ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
         Err(I2cError::Nack)
     }
-    fn spi_transfer(&mut self, _hz: u32, _mode: u8, _buf: &mut [u8]) {}
-    fn spi_cs(&mut self, _active: bool) {}
+    fn spi_transfer(&mut self, _bus: usize, _hz: u32, _mode: u8, _buf: &mut [u8]) {}
+    fn spi_cs(&mut self, _bus: usize, _active: bool) {}
     fn pwm_set(&mut self, _n: u32, _pwm: Pwm) -> Pwm {
         Pwm::default()
     }
@@ -412,13 +414,20 @@ impl I2c {
 // ------------------------------------------------------------------ SPI
 
 const SPI_MODE_LSB_FIRST: u32 = 8;
-/// Bytes moved per backend transfer.
+/// Bytes sent per backend transfer when nothing is received.
 const SPI_CHUNK: usize = 64;
+/// The most bytes one SKIP clocks.
+pub const SPI_SKIP_MAX: u32 = 4096;
+/// SKIP's result when every byte matched.
+pub const SPI_SKIP_NONE: u32 = 0x100;
 
 /// `rvemu,spi`: TX (0x00) and RX (0x04) guest physical buffers (0: zeros
 /// out, nothing in), LEN (0x08), HZ (0x0c), MODE (0x10: Linux SPI_CPHA,
-/// SPI_CPOL, SPI_LSB_FIRST), CS (0x14: 1 active) and GO (0x18), which runs
-/// the transfer.
+/// SPI_CPOL, SPI_LSB_FIRST), CS (0x14: 1 drives the pin low) and GO (0x18),
+/// which runs the transfer. SKIP (0x1c): a write of BYTE | MAX << 8 sends
+/// 0xff a byte at a time until a byte other than BYTE comes back, at most
+/// MAX bytes (an SD card's wait for a token, or for busy to end); a read
+/// gives that byte, or `SPI_SKIP_NONE`.
 #[derive(Default)]
 struct Spi {
     tx: u32,
@@ -427,6 +436,7 @@ struct Spi {
     hz: u32,
     mode: u32,
     cs: u32,
+    skip: u32,
 }
 
 impl Spi {
@@ -438,11 +448,12 @@ impl Spi {
             0x0c => self.hz,
             0x10 => self.mode,
             0x14 => self.cs,
+            0x1c => self.skip,
             _ => 0,
         }
     }
 
-    fn store(&mut self, off: u32, v: u32, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
+    fn store(&mut self, bus: usize, off: u32, v: u32, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
         match off {
             0x00 => self.tx = v,
             0x04 => self.rx = v,
@@ -451,19 +462,60 @@ impl Spi {
             0x10 => self.mode = v & 0xB,
             0x14 => {
                 self.cs = v & 1;
-                pins.spi_cs(self.cs != 0);
+                pins.spi_cs(bus, self.cs != 0);
             }
-            0x18 => self.go(mem, dirty, pins),
+            0x18 => self.go(bus, mem, dirty, pins),
+            0x1c => self.skip = self.skip_until(bus, v as u8, (v >> 8).clamp(1, SPI_SKIP_MAX), pins),
             _ => {}
         }
     }
 
-    fn go(&mut self, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
+    fn skip_until(&self, bus: usize, byte: u8, max: u32, pins: &mut impl Pins) -> u32 {
+        let lsb = self.mode & SPI_MODE_LSB_FIRST != 0;
+        for _ in 0..max {
+            let mut b = [0xFF];
+            pins.spi_transfer(bus, self.hz, (self.mode & 3) as u8, &mut b);
+            let got = if lsb { b[0].reverse_bits() } else { b[0] };
+            if got != byte {
+                return u32::from(got);
+            }
+        }
+        SPI_SKIP_NONE
+    }
+
+    fn go(&mut self, bus: usize, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
         let (len, tx, rx) = (self.len as usize, u64::from(self.tx), u64::from(self.rx));
         if (tx != 0 && mem.range(tx, len).is_none()) || (rx != 0 && mem.range_mut(rx, len).is_none()) {
             return;
         }
         let lsb = self.mode & SPI_MODE_LSB_FIRST != 0;
+        if rx != 0 {
+            // in place, in the guest's RX buffer: what goes out first, then
+            // the whole transfer at once
+            let p = mem.range_mut(rx, len).unwrap();
+            if tx == 0 {
+                // SAFETY: `len` bytes of guest RAM (checked above).
+                unsafe { core::ptr::write_bytes(p, 0, len) };
+            } else if tx != rx {
+                // SAFETY: as above; `copy` allows the buffers to overlap.
+                unsafe { core::ptr::copy(mem.range(tx, len).unwrap(), p, len) };
+            }
+            // SAFETY: as above, and nothing else holds guest RAM during the
+            // device's register write.
+            let buf = unsafe { core::slice::from_raw_parts_mut(p, len) };
+            if lsb {
+                buf.iter_mut().for_each(|b| *b = b.reverse_bits());
+            }
+            pins.spi_transfer(bus, self.hz, (self.mode & 3) as u8, buf);
+            if lsb {
+                buf.iter_mut().for_each(|b| *b = b.reverse_bits());
+            }
+            if len != 0 {
+                dirty.note(rx, len);
+            }
+            return;
+        }
+        // nothing comes back: send from TX through a small buffer
         let mut at = 0;
         while at < len {
             let n = (len - at).min(SPI_CHUNK);
@@ -476,19 +528,8 @@ impl Spi {
             if lsb {
                 buf.iter_mut().for_each(|b| *b = b.reverse_bits());
             }
-            pins.spi_transfer(self.hz, (self.mode & 3) as u8, buf);
-            if lsb {
-                buf.iter_mut().for_each(|b| *b = b.reverse_bits());
-            }
-            if rx != 0 {
-                let p = mem.range_mut(rx + at as u64, n).unwrap();
-                // SAFETY: as above.
-                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), p, n) };
-            }
+            pins.spi_transfer(bus, self.hz, (self.mode & 3) as u8, buf);
             at += n;
-        }
-        if rx != 0 && len != 0 {
-            dirty.note(rx, len);
         }
     }
 }
@@ -554,7 +595,7 @@ pub struct Io<P: Pins> {
     dirty: Dirty,
     gpio: Gpio,
     i2c: [I2c; 2],
-    spi: Spi,
+    spi: [Spi; 2],
     pwm: PwmDev,
 }
 
@@ -567,7 +608,7 @@ impl<P: Pins> Io<P> {
             // the RP2350's pads come out of reset pulled down
             gpio: Gpio { line: [Line { pull_down: true, ..Line::default() }; NGPIO as usize], pend: 0 },
             i2c: [I2c::default(), I2c::default()],
-            spi: Spi { hz: 1_000_000, ..Spi::default() },
+            spi: [(); 2].map(|_| Spi { hz: 1_000_000, ..Spi::default() }),
             pwm: PwmDev { sel: 0, staged: Pwm::default(), ch: [Pwm::default(); NGPIO as usize] },
         }
     }
@@ -582,7 +623,8 @@ impl<P: Pins> Io<P> {
             GPIO_BASE => self.gpio.load(pa & 0x1FF, pins),
             b if b == I2C_BASE[0] => self.i2c[0].load(off),
             b if b == I2C_BASE[1] => self.i2c[1].load(off),
-            SPI_BASE => self.spi.load(off),
+            b if b == SPI_BASE[0] => self.spi[0].load(off),
+            b if b == SPI_BASE[1] => self.spi[1].load(off),
             PWM_BASE => self.pwm.load(off, pins),
             ADC_BASE if off < 4 * ADC_CHANNELS => pins.adc(off / 4).map_or(1 << 31, u32::from),
             _ => 0,
@@ -599,7 +641,8 @@ impl<P: Pins> Io<P> {
             GPIO_BASE => self.gpio.store(pa & 0x1FF, v, pins),
             b if b == I2C_BASE[0] => self.i2c[0].store(0, off, v, mem, dirty, pins),
             b if b == I2C_BASE[1] => self.i2c[1].store(1, off, v, mem, dirty, pins),
-            SPI_BASE => self.spi.store(off, v, mem, dirty, pins),
+            b if b == SPI_BASE[0] => self.spi[0].store(0, off, v, mem, dirty, pins),
+            b if b == SPI_BASE[1] => self.spi[1].store(1, off, v, mem, dirty, pins),
             PWM_BASE => self.pwm.store(off, v, pins),
             _ => {}
         }

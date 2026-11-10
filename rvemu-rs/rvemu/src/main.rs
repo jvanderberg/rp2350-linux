@@ -452,7 +452,7 @@ fn make_dts(o: &DtsOpts) -> String {
 /// the bus numbers) and the devices on the soc.
 fn io_nodes() -> (String, String) {
     use rvcore::periph::*;
-    // RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc: only these (for measuring)
+    // RVEMU_IO=gpio,i2c0,i2c1,spi0,spi1,pwm,adc: only these (for measuring)
     let only = std::env::var("RVEMU_IO").ok();
     let want = |d: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == d));
     let names = LINE_NAMES.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
@@ -488,20 +488,23 @@ fn io_nodes() -> (String, String) {
 "#
         );
     }
-    if want("spi") {
-        aliases += "    spi0 = &spi0;\n";
+    // SPI0 for spidev; SPI1 for the SD card (mmc_spi), at SD's default speed
+    let spi_child = [
+        format!("      spidev@0 {{\n        compatible = \"rohm,dh2228fv\";\n        reg = <0>;\n        spi-max-frequency = <{SPI_MAX_HZ}>;\n      }};\n"),
+        "      mmc@0 {\n        compatible = \"mmc-spi-slot\";\n        reg = <0>;\n        spi-max-frequency = <25000000>;\n        voltage-ranges = <3300 3300>;\n      };\n".to_string(),
+    ];
+    for (k, (base, child)) in SPI_BASE.into_iter().zip(spi_child).enumerate() {
+        if !want(&format!("spi{k}")) {
+            continue;
+        }
+        aliases += &format!("    spi{k} = &spi{k};\n");
         soc += &format!(
-            r#"    spi0: spi@{SPI_BASE:x} {{
+            r#"    spi{k}: spi@{base:x} {{
       compatible = "rvemu,spi";
-      reg = <0x{SPI_BASE:x} 0x{SPI_SIZE:x}>;
+      reg = <0x{base:x} 0x{SPI_SIZE:x}>;
       #address-cells = <1>;
       #size-cells = <0>;
-      spidev@0 {{
-        compatible = "rohm,dh2228fv";
-        reg = <0>;
-        spi-max-frequency = <{SPI_MAX_HZ}>;
-      }};
-    }};
+{child}    }};
 "#
         );
     }
@@ -660,7 +663,7 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
                  page after the swap area (flashswap-stats)
   -G             the board's pins: GPIO, I2C, SPI, PWM, ADC on a simulated
                  board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins,
-                 RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc picks the devices)
+                 RVEMU_IO=gpio,i2c0,i2c1,spi0,spi1,pwm,adc picks the devices)
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size in MiB, or KiB as NK (default 64)
   -c HARTS       harts (CPUs), 1 or 2 (default 1); run in turn
