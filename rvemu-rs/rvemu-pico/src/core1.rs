@@ -17,7 +17,14 @@
 //! there. `scripts/check-core1.py` checks the result.
 //!
 //! Flash erase and program stall XIP: bracket them with `park()` and
-//! `unpark()`, which hold core1 in an SRAM spin loop meanwhile.
+//! `unpark()`, which keep the other core off XIP meanwhile (core1 in an SRAM
+//! spin loop, or, with two guest harts, the other core locked out of XIP by
+//! ACCESSCTRL, see `xip_hold`).
+//!
+//! The firmware may give core1 more to do after each pass (`set_hook`): a
+//! second guest hart (shell.rs, smp.rs). Code run from the hook may wait;
+//! every such wait calls `pass()`, which serves a park request and runs the
+//! service once, so the I/O goes on and core0 never waits for it forever.
 //!
 //! Between passes core1 sleeps in `wfi` until something happens: a USB
 //! interrupt, the radio's PIO interrupt, a doorbell from core0
@@ -278,17 +285,160 @@ pub fn events() -> u32 {
     EVENTS.load(Ordering::Acquire)
 }
 
+/// Which core this is (Hazard3's mhartid).
+#[inline(always)]
+pub fn on_core1() -> bool {
+    let id: u32;
+    // SAFETY: reading a CSR.
+    unsafe { core::arch::asm!("csrr {0}, mhartid", out(reg) id) };
+    id == 1
+}
+
+// ------------------------------------------------------------------ XIP lockout
+
+/// SIO spinlock 29 (31 is the HAL's critical section): see `xip_hold`.
+pub const XIP_SPINLOCK: u32 = 0xd000_0100 + 4 * 29;
+/// ACCESSCTRL XIP_MAIN: which bus masters may access XIP (flash, PSRAM).
+pub const ACCESSCTRL_XIP_MAIN: u32 = 0x4006_0018;
+/// Everyone (with ACCESSCTRL's password).
+pub const XIP_ALLOW: u32 = 0xacce_00ff;
+/// What core `n` writes to keep the other core off: CORE0 is bit 4, CORE1
+/// bit 5.
+pub const XIP_DENY_OTHER: [u32; 2] = [XIP_ALLOW & !(1 << 5), XIP_ALLOW & !(1 << 4)];
+
+/// Two cores, each with its own trap entry for lockout faults
+/// (`set_xip_guards`): the rules below are in force.
+static XIP_GUARDS: AtomicBool = AtomicBool::new(false);
+/// How deep each core is in `xip_hold`.
+static XIP_DEPTH: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// Turn the XIP rules on (both cores' trap entries are in place).
+pub fn set_xip_guards() {
+    XIP_GUARDS.store(true, Ordering::Release);
+}
+
+/// Whether the XIP rules are in force.
+#[inline(always)]
+pub fn xip_guards() -> bool {
+    XIP_GUARDS.load(Ordering::Relaxed)
+}
+
+/// Hold `XIP_SPINLOCK` (nests per core). With two cores running guest harts
+/// this is the permission to run code from flash: a core locked out of XIP
+/// may only take lockout faults on loads and stores, which its trap entry
+/// retries; one on an instruction fetch cannot be resumed (Hazard3 resumes
+/// it with registers corrupted). So a core holds this while it runs flash
+/// code, and the other core needs it to begin a lockout.
+#[inline]
+#[unsafe(link_section = ".data.core1")]
+pub fn xip_hold() {
+    if !xip_guards() {
+        return;
+    }
+    let c = usize::from(on_core1());
+    let d = XIP_DEPTH[c].load(Ordering::Relaxed);
+    // SAFETY: an SIO spinlock.
+    if d == 0 && (XIP_WANT[c ^ 1].load(Ordering::Relaxed) || unsafe { (XIP_SPINLOCK as *const u32).read_volatile() } == 0) {
+        xip_hold_wait(c);
+    }
+    XIP_DEPTH[c].store(d + 1, Ordering::Relaxed);
+}
+
+/// A core waiting in `xip_hold`: the other one lets it go first (the
+/// spinlock alone would let a core that takes it over and over keep it).
+static XIP_WANT: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+
+#[cold]
+#[inline(never)]
+#[unsafe(link_section = ".data.core1")]
+fn xip_hold_wait(c: usize) {
+    while XIP_WANT[c ^ 1].load(Ordering::Relaxed) {
+        core::hint::spin_loop();
+    }
+    XIP_WANT[c].store(true, Ordering::Relaxed);
+    // SAFETY: an SIO spinlock.
+    while unsafe { (XIP_SPINLOCK as *const u32).read_volatile() } == 0 {}
+    XIP_WANT[c].store(false, Ordering::Relaxed);
+}
+
+/// End one `xip_hold`.
+#[inline]
+#[unsafe(link_section = ".data.core1")]
+pub fn xip_unhold() {
+    if !xip_guards() {
+        return;
+    }
+    let c = usize::from(on_core1());
+    let d = XIP_DEPTH[c].load(Ordering::Relaxed) - 1;
+    XIP_DEPTH[c].store(d, Ordering::Relaxed);
+    if d == 0 {
+        // SAFETY: as above.
+        unsafe { (XIP_SPINLOCK as *mut u32).write_volatile(1) };
+    }
+}
+
+/// In a wait (in SRAM) for the other core while holding `xip_hold`: let it
+/// run its flash code meanwhile (its I/O pass, say).
+#[inline(never)]
+#[unsafe(link_section = ".data.core1")]
+pub fn xip_yield() {
+    if !xip_guards() || XIP_DEPTH[usize::from(on_core1())].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    // SAFETY: the spinlock this core holds; taken back before returning.
+    unsafe {
+        (XIP_SPINLOCK as *mut u32).write_volatile(1);
+        for _ in 0..32 {
+            core::hint::spin_loop();
+        }
+        while (XIP_SPINLOCK as *const u32).read_volatile() == 0 {}
+    }
+}
+
+/// Keep the other core off XIP (flash and PSRAM) until `xip_release`: its
+/// next XIP access faults, and its trap entry (smp.rs) waits for its
+/// ACCESSCTRL bit and retries the access. It cannot be running flash code
+/// (that needs `xip_hold`). Core `core` is this one.
+#[inline(always)]
+pub fn xip_exclusive(core: usize) {
+    xip_hold();
+    // SAFETY: ACCESSCTRL (Secure, M-mode).
+    unsafe { (ACCESSCTRL_XIP_MAIN as *mut u32).write_volatile(XIP_DENY_OTHER[core]) };
+}
+
+#[inline(always)]
+pub fn xip_release() {
+    // SAFETY: as above.
+    unsafe { (ACCESSCTRL_XIP_MAIN as *mut u32).write_volatile(XIP_ALLOW) };
+    xip_unhold();
+}
+
+// ------------------------------------------------------------------ park
+
 static PARK_REQ: AtomicBool = AtomicBool::new(false);
 static PARK_ACK: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// core0: park core1 in an SRAM loop (it never touches flash there), for
-/// flash erase and program; `unpark` lets it go. Waits until core1 is
-/// parked (at most one pass of its service loop). Don't nest. `flash.rs`
-/// calls the pair around every erase and program. Always true.
+/// Keep the other core off XIP, for flash erase and program; `unpark` lets
+/// it go. With the XIP rules in force (`set_xip_guards`), lock the other
+/// core out (`xip_exclusive`; on core1 the flash operation then runs on its
+/// SRAM stack, `on_sram_stack`). Otherwise (core0, core1 only doing I/O):
+/// park core1 in an SRAM loop (it never touches flash there), waiting until
+/// it is parked (at most one pass of its service loop). Don't nest.
+/// `flash.rs` calls the pair around every erase and program. Always true.
 #[unsafe(link_section = ".data.core1")]
 #[inline(never)]
 pub fn park() -> bool {
+    if xip_guards() {
+        xip_exclusive(usize::from(on_core1()));
+        // let an access core0 started before the lockout finish
+        for _ in 0..64 {
+            core::hint::spin_loop();
+        }
+        // SAFETY: reading ACCESSCTRL back: the write has landed.
+        unsafe { (ACCESSCTRL_XIP_MAIN as *const u32).read_volatile() };
+        return true;
+    }
     if RUNNING.load(Ordering::Acquire) {
         PARK_REQ.store(true, Ordering::Release);
         notify_core1();
@@ -299,10 +449,14 @@ pub fn park() -> bool {
     true
 }
 
-/// core0: end `park`.
+/// End `park`.
 #[unsafe(link_section = ".data.core1")]
 #[inline(never)]
 pub fn unpark() {
+    if xip_guards() {
+        xip_release();
+        return;
+    }
     if RUNNING.load(Ordering::Acquire) {
         PARK_REQ.store(false, Ordering::Release);
         while PARK_ACK.load(Ordering::Acquire) {
@@ -311,6 +465,17 @@ pub fn unpark() {
     }
 }
 
+/// core1: if core0 asked for it, stay parked until it lets go. For every
+/// wait on core1 (`pass` calls it).
+#[unsafe(link_section = ".data.core1")]
+#[inline]
+pub fn serve_park() {
+    if PARK_REQ.load(Ordering::Acquire) {
+        parked();
+    }
+}
+
+// a leaf: nothing on the stack (which may be in PSRAM) while parked
 #[unsafe(link_section = ".data.core1")]
 #[inline(never)]
 fn parked() {
@@ -426,10 +591,14 @@ unsafe extern "C" {
 }
 
 #[unsafe(link_section = ".data.core1")]
-extern "C" fn trampoline<S: Service>(arg: *mut S) -> ! {
-    // SAFETY: `launch` built it in SERVICE, which nothing else touches now.
-    let s = unsafe { &mut *arg };
+extern "C" fn trampoline<S: Service>(_arg: *mut S) -> ! {
     board::enable_counters();
+    let trap = TRAP.load(Ordering::Relaxed);
+    if trap != 0 {
+        // SAFETY: an entry `set_trap` was given for core1.
+        unsafe { core::arch::asm!("csrw mtvec, {0}", in(reg) trap) };
+    }
+    SERVICE_POLL.store(poll_service::<S> as *const () as usize, Ordering::Relaxed);
     // Wake sources for `wfi` (interrupts stay off: mstatus.MIE is 0, so
     // nothing is taken, wfi just returns). PIO0's IRQ 0 output follows the
     // radio program's `irq 0` (the chip's data-ready).
@@ -442,21 +611,129 @@ extern "C" fn trampoline<S: Service>(arg: *mut S) -> ! {
         core::arch::asm!("csrs mie, {0}", in(reg) (1u32 << 11) | (1 << 7));
     }
     RUNNING.store(true, Ordering::Release);
-    run(s)
+    run()
+}
+
+#[unsafe(link_section = ".data.core1")]
+fn poll_service<S: Service>(arg: *mut ()) {
+    // SAFETY: the service `launch` built in SERVICE; `pass` never nests.
+    unsafe { (*arg.cast::<S>()).poll() }
+}
+
+/// The service's `poll` (`poll_service::<S>`), set by the trampoline.
+static SERVICE_POLL: AtomicUsize = AtomicUsize::new(0);
+/// core1 is in the service's `poll`.
+static IN_PASS: AtomicBool = AtomicBool::new(false);
+/// What core1 runs after each pass (`set_hook`); 0: nothing.
+static HOOK: AtomicUsize = AtomicUsize::new(0);
+/// core1's trap entry (`set_trap`); 0: core0's, as the bootrom got it.
+static TRAP: AtomicUsize = AtomicUsize::new(0);
+/// core1's SRAM stack pointer while it runs on another stack
+/// (`call_on_stack`); 0 otherwise.
+static SRAM_SP: AtomicUsize = AtomicUsize::new(0);
+
+/// core1: serve a park request, then run the service once (unless this is
+/// already inside its `poll`). What every wait on core1 outside the service
+/// calls.
+#[unsafe(link_section = ".data.core1")]
+#[inline(never)]
+pub fn pass() {
+    serve_park();
+    if IN_PASS.load(Ordering::Relaxed) {
+        return;
+    }
+    let f = SERVICE_POLL.load(Ordering::Relaxed);
+    if f == 0 {
+        return;
+    }
+    IN_PASS.store(true, Ordering::Relaxed);
+    // the service has cold paths in flash (formatting for RTT, the radio's
+    // bring-up)
+    xip_hold();
+    // SAFETY: `poll_service::<S>` for the service in SERVICE (trampoline).
+    unsafe { core::mem::transmute::<usize, fn(*mut ())>(f)(ARG.load(Ordering::Relaxed) as *mut ()) };
+    xip_unhold();
+    IN_PASS.store(false, Ordering::Relaxed);
+}
+
+/// Run `f` on core1 after each pass of the service; `f` returning true means
+/// it has more to do (core1 doesn't sleep). `f` must be in SRAM, and must
+/// call `pass` in any wait.
+pub fn set_hook(f: fn() -> bool) {
+    HOOK.store(f as *const () as usize, Ordering::Release);
+    notify_core1();
+}
+
+/// core1's trap entry (before `launch`).
+pub fn set_trap(entry: usize) {
+    TRAP.store(entry, Ordering::Relaxed);
+}
+
+/// core1: run `f` on the stack that ends at `top` (16-byte aligned).
+#[unsafe(link_section = ".data.core1")]
+#[inline(never)]
+pub fn call_on_stack(top: usize, f: extern "C" fn()) {
+    // SAFETY: `top` ends a stack nothing else uses; `f` returns; s2 and s3
+    // are callee-saved, so they survive `f`.
+    unsafe {
+        core::arch::asm!(
+            "mv s3, sp",
+            "sw sp, 0(s2)",
+            "mv sp, {top}",
+            "jalr {f}",
+            "mv sp, s3",
+            "sw zero, 0(s2)",
+            top = in(reg) top,
+            f = in(reg) f,
+            inout("s2") SRAM_SP.as_ptr() => _,
+            out("s3") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// Run `f(arg)` on an SRAM stack: core1's own when it is on another one
+/// (`call_on_stack`), else the current one. For code that runs while XIP is
+/// stopped (a flash operation), when the stack may be in PSRAM.
+#[unsafe(link_section = ".data.core1")]
+#[inline(never)]
+pub fn on_sram_stack(f: extern "C" fn(*mut ()), arg: *mut ()) {
+    let sp = if on_core1() { SRAM_SP.load(Ordering::Relaxed) } else { 0 };
+    if sp == 0 {
+        f(arg);
+        return;
+    }
+    // SAFETY: below `sp` core1's SRAM stack is free (its frames are above);
+    // s3 is callee-saved.
+    unsafe {
+        core::arch::asm!(
+            "mv s3, sp",
+            "andi sp, {sp}, -16",
+            "jalr {f}",
+            "mv sp, s3",
+            sp = in(reg) sp,
+            f = in(reg) f,
+            in("a0") arg,
+            out("s3") _,
+            clobber_abi("C"),
+        );
+    }
 }
 
 #[unsafe(link_section = ".data.core1")]
 #[inline(never)]
-fn run<S: Service>(s: &mut S) -> ! {
+fn run() -> ! {
     let tick = u64::from(TICK_SYS_MHZ.load(Ordering::Relaxed)) * u64::from(TICK_US);
     loop {
         // acknowledge doorbells first: one rung during the pass wakes the
         // wfi below at once
         wr(DOORBELL_IN_CLR, !0);
-        if PARK_REQ.load(Ordering::Acquire) {
-            parked();
+        pass();
+        let hook = HOOK.load(Ordering::Acquire);
+        // SAFETY: a `fn() -> bool` from `set_hook`.
+        if hook != 0 && unsafe { core::mem::transmute::<usize, fn() -> bool>(hook)() } {
+            continue;
         }
-        s.poll();
         let t = now() + tick;
         wr(MTIMECMPH, u32::MAX);
         wr(MTIMECMP, t as u32);
@@ -542,6 +819,14 @@ pub fn painted_stack_used(bottom: usize, top: usize) -> usize {
 /// Paint the stack below the caller's frame (keeping `margin` bytes clear),
 /// down to `bottom`.
 #[inline(never)]
+pub fn paint(bottom: usize, top: usize) {
+    for a in (bottom..top).step_by(4) {
+        // SAFETY: the caller's unused stack.
+        unsafe { (a as *mut u32).write_volatile(STACK_PAINT) };
+    }
+}
+
+/// Paint core0's stack below its live part (`margin` bytes under sp).
 pub fn paint_stack(bottom: usize, margin: usize) {
     let sp: usize;
     // SAFETY: reading sp.

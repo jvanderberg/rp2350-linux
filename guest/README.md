@@ -160,7 +160,9 @@ the tools and examples are in the top-level README; the devices are in
   `rvemu,*` node in the guest's device tree (`pico-shell.sh` adds the
   nodes when the kernel has the drivers).
 - **Kernel options** (`linux-disk.fragment`): `GPIO_CDEV` (v2 only),
-  `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO` without buffers or triggers.
+  `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO` without buffers or triggers;
+  `MMC_SPI`, `MMC_BLOCK` and `VFAT_FS` for the SD card on SPI1, which
+  `S03sd` mounts at `/mnt/sd`.
 - **Packages** (`buildroot-disk.defconfig`): libgpiod 2 tools (`gpiodetect`,
   `gpioinfo`, `gpioget`, `gpioset`, `gpiomon`, ...), i2c-tools,
   `spidev_test`, and two of this repository's (`br-external/package/`):

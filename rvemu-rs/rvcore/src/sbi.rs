@@ -17,6 +17,11 @@ fn hart0_in_mask(mask: u32, base: u32) -> bool {
     base == u32::MAX || (base == 0 && mask & 1 != 0)
 }
 
+/// Hart `h` is in the SBI hart mask (`base` = u32::MAX: every hart).
+fn in_mask(mask: u32, base: u32, h: u32) -> bool {
+    base == u32::MAX || (h >= base && h - base < 32 && mask & (1 << (h - base)) != 0)
+}
+
 impl Cpu {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub(crate) fn sbi_call<B: Bus>(&mut self, bus: &mut B) {
@@ -68,7 +73,11 @@ impl Cpu {
                 }
             }
             #[cfg(feature = "pv-buffers")]
-            crate::pv_buffers::EXT => (err, val) = self.pv_buffer(fid, bus),
+            crate::pv_buffers::EXT => {
+                bus.cold_begin();
+                (err, val) = self.pv_buffer(fid, bus);
+                bus.cold_end();
+            }
             #[cfg(feature = "pv-pages")]
             crate::pv_pages::EXT => err = self.pv_page(fid, a0, a1),
             EXT_BASE => match fid {
@@ -97,6 +106,25 @@ impl Cpu {
                 } else {
                     err = ERR_NOT_SUPPORTED;
                 }
+            }
+            EXT_IPI if !self.smp.is_null() => {
+                if fid == 0 {
+                    self.smp_ipi(bus, a0, a1);
+                } else {
+                    err = ERR_NOT_SUPPORTED;
+                }
+            }
+            EXT_RFENCE if !self.smp.is_null() => match fid {
+                // fence.i: nothing to do on any hart; a store to translated
+                // code drops its translations for every hart as it happens
+                0 => {}
+                1 | 2 => self.smp_sfence_vma(bus, a0, a1),
+                _ => err = ERR_NOT_SUPPORTED,
+            },
+            EXT_HSM if !self.smp.is_null() => {
+                bus.cold_begin();
+                (err, val) = self.smp_hsm(bus, fid);
+                bus.cold_end();
             }
             EXT_IPI => {
                 if fid == 0 {
@@ -132,5 +160,92 @@ impl Cpu {
         }
         self.x[10] = err as u32;
         self.x[11] = val;
+    }
+
+    fn smp(&self) -> &Smp {
+        // SAFETY: only called with a non-null `smp`, the machine's block.
+        unsafe { &*self.smp }
+    }
+
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn smp_ipi<B: Bus>(&mut self, bus: &mut B, mask: u32, base: u32) {
+        use core::sync::atomic::Ordering::Release;
+        for h in 0..self.smp().nharts {
+            if !in_mask(mask, base, h) {
+                continue;
+            }
+            if h == self.hartid {
+                self.sip |= MIP_SSIP;
+            } else {
+                self.smp().ipi[h as usize].store(1, Release);
+                bus.kick(h);
+            }
+        }
+    }
+
+    /// Remote sfence.vma: this hart's own now, the others' before returning
+    /// (or before they next run guest code, `Bus::hart_running`).
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn smp_sfence_vma<B: Bus>(&mut self, bus: &mut B, mask: u32, base: u32) {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+        for h in 0..self.smp().nharts {
+            if !in_mask(mask, base, h) {
+                continue;
+            }
+            if h == self.hartid {
+                self.tlb_flush_all();
+            } else if self.smp().hsm[h as usize].load(Acquire) == HSM_STARTED {
+                self.smp().fence[h as usize].fetch_or(FENCE_VMA, AcqRel);
+                // against the other hart's own fence between marking itself
+                // running and taking its requests
+                core::sync::atomic::fence(SeqCst);
+                bus.kick(h);
+                // the other hart may be waiting for this one's fence: keep
+                // taking requests while waiting
+                while bus.concurrent_harts() && bus.hart_running(h) && self.smp().fence[h as usize].load(Acquire) != 0 {
+                    self.smp_poll();
+                    bus.fence_wait();
+                }
+            }
+        }
+    }
+
+    fn smp_hsm<B: Bus>(&mut self, bus: &mut B, fid: u32) -> (i32, u32) {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let (a0, a1, a2) = (self.x[10], self.x[11], self.x[12]);
+        let smp = self.smp();
+        match fid {
+            // hart_start(hartid, start_addr, opaque)
+            0 => {
+                if a0 >= smp.nharts {
+                    return (ERR_INVALID_PARAM, 0);
+                }
+                let h = a0 as usize;
+                smp.start_pc[h].store(a1, Release);
+                smp.start_arg[h].store(a2, Release);
+                if smp.hsm[h].compare_exchange(HSM_STOPPED, HSM_START_PENDING, AcqRel, Acquire).is_err() {
+                    return (ERR_ALREADY_AVAILABLE, 0);
+                }
+                bus.kick(a0);
+                (0, 0)
+            }
+            // hart_stop: the host parks this hart until a start
+            1 => {
+                if self.hartid == 0 {
+                    return (ERR_NOT_SUPPORTED, 0);
+                }
+                smp.hsm[self.hartid as usize].store(HSM_STOPPED, Release);
+                self.halt = Some(Halt::Stopped);
+                (0, 0)
+            }
+            // hart_get_status(hartid)
+            2 => {
+                if a0 >= smp.nharts {
+                    return (ERR_INVALID_PARAM, 0);
+                }
+                (0, smp.hsm[a0 as usize].load(Acquire))
+            }
+            _ => (ERR_NOT_SUPPORTED, 0),
+        }
     }
 }

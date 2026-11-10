@@ -1,0 +1,4 @@
+# The disk guest's kernel for two harts (build.sh disk-smp-kernel; rvemu -c 2,
+# scripts/pico-shell.sh -c 2).
+CONFIG_SMP=y
+CONFIG_NR_CPUS=2

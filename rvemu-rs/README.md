@@ -34,7 +34,7 @@ guest to `login:` in under a second.
 | `-d FILE` | disk image for the read-only virtio-blk device. Without `-i`, the default command line roots on it: `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`. |
 | `-F FILE` | the NOR flash device (the board's 1 MB `/home` region), backed by FILE, which is created blank (0xFF) if missing and written through, so `/home` persists across runs. `RVEMU_NOR_CUT=N` simulates a power cut: the N-th program or erase is applied halfway and the emulator exits. |
 | `-W` | the swap device (below) on a modelled copy of the board's swap flash (511 sectors), with datasheet-typical erase and program times in its statistics. The guest's init enables it as `/dev/vdb`. |
-| `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N. `RVEMU_IO=gpio,i2c0,i2c1,spi,pwm,adc` picks which of them go in the device tree. |
+| `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N. `RVEMU_IO=gpio,i2c0,i2c1,spi0,spi1,pwm,adc` picks which of them go in the device tree. |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
 | `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `_etext - _start` from `System.map`, rounded down to a page (2998272 for the disk kernel). |
 | `-b FILE` | use this DTB instead of generating one |
@@ -146,6 +146,7 @@ receive the same generated device tree, including the fixed entropy seed.
 | GPIO | 0xF8001000 | 8 |
 | I2C0, I2C1 | 0xF8001200, 0xF8001400 | |
 | SPI0 | 0xF8001600 | |
+| SPI1 (the SD card) | 0xF8001C00 | |
 | PWM | 0xF8001800 | |
 | ADC | 0xF8001A00 | |
 
@@ -373,6 +374,12 @@ guest gives up 4 KiB of RAM plus the device's own kernel cost.
 - **Wear levelling.** The head starts at a different sector every boot.
   Every 8th write also moves the live page nearest ahead of the head, so
   sectors that hold cold pages keep taking their turn at erases.
+- **Write budget.** Page writes draw on a budget of 448 pages (all of
+  swap) that refills one page every 4 s, so a burst can fill swap at once
+  but sustained swapping can't wear the flash faster than that. A write
+  over budget fails without touching flash: the guest keeps the page in
+  RAM, tries again later and logs `Write-error on swap-device`. Reads and
+  zero pages are free. `pages_refused` counts the pages refused.
 - **Nothing persists.** Swap is empty at every boot, so the map (2.2 KB)
   lives only in the top page of guest RAM, which the `-w` DTB reserves
   (`no-map`), and there's no on-flash metadata. Without `-w` the firmware
@@ -422,10 +429,13 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   fails with `-ETIMEDOUT`: a stuck bus can't stop the emulator.
   The controller can't send an address without data, so a zero-length
   write (i2cdetect's probe) becomes a one-byte read.
-- **SPI.** `hal::spi::Spi`, 8-bit frames; the clock rate (100 kHz to
-  50 MHz) and mode change per transfer. The controller makes the clock, so
-  no device can hold a transfer up; the 100 kHz floor bounds the longest
-  one (4 KiB, spidev's buffer) to about 0.3 s. Chip select GP17 is a GPIO, held for the whole message.
+- **SPI.** `hal::spi::Spi`, 8-bit frames: SPI0 on GP16-GP19 for spidev,
+  SPI1 on GP8-GP11 for the SD card (`mmc-spi-slot` at 25 MHz, MISO pulled
+  up). The clock rate (100 kHz to 50 MHz) and mode change per transfer.
+  The controller makes the clock, so no device can hold a transfer up; the
+  100 kHz floor bounds the longest one (4 KiB, spidev's buffer) to about
+  0.3 s. Chip selects GP17 and GP9 are GPIOs, held for the whole message,
+  and after it when its last transfer sets `cs_change`.
 - **PWM.** The slice and channel that reach the pin, with the divider and
   TOP worked out from the period. A slice's period can't change while
   another of its pins is running.

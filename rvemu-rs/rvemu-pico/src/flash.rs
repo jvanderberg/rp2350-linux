@@ -6,8 +6,10 @@
 //! XIP access to either chip select may happen, so every operation:
 //! - refuses any range outside `REGIONS`: never the firmware, the Wi-Fi
 //!   sector at 0x103FF000, the guest blob, the squashfs or the kernel text;
-//! - parks core 1 in SRAM (`core1::park()`, so it can't fetch from flash);
-//! - masks interrupts and runs from SRAM: it saves the QMI window settings
+//! - keeps the other core off XIP (`core1::park()`: core 1 spins in SRAM,
+//!   core 0 is locked out by ACCESSCTRL when core 1 writes);
+//! - masks interrupts and runs from SRAM, on an SRAM stack (core 1 may be
+//!   running a guest hart on a stack in PSRAM): it saves the QMI window settings
 //!   (the board's 348 MHz flash timing, the PSRAM's QPI setup on CS1), the
 //!   QSPI pads and XIP_CTRL, calls the bootrom's `connect_internal_flash`,
 //!   `flash_exit_xip` and erase/program, then restores all of them;
@@ -21,6 +23,8 @@
 //!
 //! Addresses are XIP addresses (0x10xxxxxx). Sources may be anywhere,
 //! PSRAM included: each page is copied into an SRAM buffer before XIP stops.
+//! Either core may write, one at a time (the guest's devices are behind one
+//! lock).
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
@@ -96,12 +100,12 @@ pub fn erase_sector(addr: u32) -> Result<(), Error> {
         return Err(Error::Range);
     }
     if is_erased(addr, SECTOR) {
-        // SAFETY: core 0 only.
+        // SAFETY: one writer at a time (see the module docs).
         unsafe { (*core::ptr::addr_of_mut!(STATS)).erases_skipped += 1 };
         return Ok(());
     }
     run(Op::Erase, addr, core::ptr::null())?;
-    // SAFETY: core 0 only.
+    // SAFETY: one writer at a time (see the module docs).
     unsafe { (*core::ptr::addr_of_mut!(STATS)).erases += 1 };
     Ok(())
 }
@@ -141,7 +145,7 @@ pub fn program_page(addr: u32, page: &[u8; PAGE as usize]) -> Result<(), Error> 
         return Err(Error::Range);
     }
     run(Op::Program, addr, page.as_ptr())?;
-    // SAFETY: core 0 only.
+    // SAFETY: one writer at a time (see the module docs).
     unsafe { (*core::ptr::addr_of_mut!(STATS)).pages += 1 };
     Ok(())
 }
@@ -263,23 +267,55 @@ fn run(op: Op, addr: u32, page: *const u8) -> Result<(), Error> {
         erase: rom_data::flash_range_erase::ptr(),
         program: rom_data::flash_range_program::ptr(),
     };
+    // core 1's stack may be in PSRAM: the page goes to SRAM first
+    let page = if !page.is_null() && crate::core1::on_core1() {
+        // SAFETY: one writer at a time (see the module docs); `page` is PAGE bytes.
+        unsafe {
+            let buf = &raw mut PAGE1;
+            core::ptr::copy_nonoverlapping(page, buf.cast::<u8>(), PAGE as usize);
+            buf.cast::<u8>().cast_const()
+        }
+    } else {
+        page
+    };
     if !park_core1() {
         return Err(Error::Core1);
     }
     let mie = irq_off();
     let t0 = board::mcycle64();
-    // SAFETY: `in_ram` touches flash only through the bootrom; `page` is in SRAM.
-    unsafe { in_ram(&rom, op, addr - XIP_BASE, page) };
+    let mut args = InRam { rom, op, offs: addr - XIP_BASE, page };
+    crate::core1::on_sram_stack(in_ram_args, (&raw mut args).cast());
     let dt = u32::try_from(board::mcycle64() - t0).unwrap_or(u32::MAX);
     irq_restore(mie);
     unpark_core1();
-    // SAFETY: core 0 only.
+    // SAFETY: one writer at a time (see the module docs).
     unsafe {
         let s = &mut *core::ptr::addr_of_mut!(STATS);
         s.stall_cycles_max = s.stall_cycles_max.max(dt);
         s.stall_cycles_total += u64::from(dt);
     }
     Ok(())
+}
+
+/// A page being programmed from core 1, in SRAM.
+static mut PAGE1: [u8; PAGE as usize] = [0; PAGE as usize];
+
+struct InRam {
+    rom: Rom,
+    op: Op,
+    offs: u32,
+    page: *const u8,
+}
+
+/// `in_ram` with its arguments copied onto this (SRAM) stack first: they may
+/// be in PSRAM, which goes away with XIP.
+#[inline(never)]
+#[unsafe(link_section = ".data.ram_func")]
+extern "C" fn in_ram_args(a: *mut ()) {
+    // SAFETY: an `InRam` (`run`), read before XIP stops.
+    let a = unsafe { core::ptr::read_volatile(a.cast::<InRam>()) };
+    // SAFETY: `in_ram` touches flash only through the bootrom; `page` is in SRAM.
+    unsafe { in_ram(&a.rom, a.op, a.offs, a.page) };
 }
 
 /// The part that runs with XIP stopped: SRAM code calling only the bootrom.

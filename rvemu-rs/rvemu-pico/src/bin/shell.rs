@@ -14,6 +14,9 @@
 //! output is kept while no terminal is open, so connecting late shows the
 //! end of the boot log (`dmesg` has all of the kernel's).
 //!
+//! With a two-CPU DTB (`pico-shell.sh -c 2`) the guest gets a second hart
+//! on core1, in slices between core1's I/O passes (`smp.rs`).
+//!
 //! Back to BOOTSEL: open the port at 1200 baud and close it
 //! (`stty -f /dev/cu.usbmodemXXXX 1200`), or the SWD request in
 //! `rp2350-board::bootsel_if_requested`. RTT carries status lines for a
@@ -45,6 +48,9 @@ use guest_blob::{BLOB_ADDR, BlobHeader};
 
 #[path = "../core1.rs"]
 mod core1;
+#[path = "../smp.rs"]
+mod smp;
+use smp::BusGuard;
 #[path = "../usbcon.rs"]
 mod usbcon;
 use usbcon::{CON_IN, CON_OUT};
@@ -197,6 +203,13 @@ impl NorFlash for BoardNor {
 /// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
 const CODE_KIB: usize = 326;
 const CODE_WORDS: usize = CODE_KIB * 256;
+/// With two harts, the top of the code buffer is hart 1's (in SRAM, as hart
+/// 0's is): its Cpu, its jump cache and the stack core1 runs it on.
+const HART1_WORDS: usize = (core::mem::size_of::<Cpu>() + NJC * core::mem::size_of::<JcEntry>() + smp::HART1_STACK_BYTES + 32) / 4;
+const _: () = assert!(core::mem::align_of::<Cpu>() <= 16 && core::mem::align_of::<JcEntry>() <= 16);
+/// Hart 1's Cpu and the top of its stack (`setup_hart1`).
+static mut HART1_CPU: usize = 0;
+static mut HART1_STACK: (usize, usize) = (0, 0);
 const NBUCKETS: usize = 1024;
 const NJC: usize = 1024;
 /// Ring of 8 regions (simulator: 7.9 s to login: against 8.8 s flush-all);
@@ -210,7 +223,9 @@ const GUEST_MAX: u32 = RAM_MAX + guest_blob::TEXT_MAX;
 static mut CODE_PAGES: [u8; (GUEST_MAX >> 15) as usize] = [0; (GUEST_MAX >> 15) as usize];
 static mut JUMP_CACHE: [JcEntry; NJC] = [JcEntry::EMPTY; NJC];
 static mut CHAIN_LOG: [u32; REGIONS * 128] = [0; REGIONS * 128];
-static mut STORE_EPOCHS: [u8; (GUEST_MAX >> 12) as usize] = [0; (GUEST_MAX >> 12) as usize];
+/// One per guest page, with a store (none without).
+const STORE_PAGES: usize = if STORE_WORDS == 0 { 0 } else { (GUEST_MAX >> 12) as usize };
+static mut STORE_EPOCHS: [u8; STORE_PAGES] = [0; STORE_PAGES];
 static mut CPU: MaybeUninit<Cpu> = MaybeUninit::uninit();
 static mut USB_BUS: MaybeUninit<UsbBusAllocator<hal::usb::UsbBus>> = MaybeUninit::uninit();
 // The bus and the translator live here rather than on main's stack: `setup`
@@ -253,9 +268,16 @@ impl Console for RingConsole {
         if !CON_OUT.push(b) {
             // full: core1 is sending to a terminal (or about to drop old
             // output)
+            // (from hart 1, core1 drains it itself)
+            let c1 = core1::on_core1();
             let t0 = board::mcycle64();
             while !CON_OUT.push(b) && board::mcycle64() - t0 < self.wait_cycles {
-                core1::notify_core1();
+                if c1 {
+                    core1::pass();
+                } else {
+                    core1::notify_core1();
+                    core1::xip_yield();
+                }
             }
         }
         core1::notify_core1();
@@ -275,10 +297,18 @@ struct RingLink {
 }
 
 impl NetLink for RingLink {
+    /// In SRAM: it lets core1 run its flash code while it waits.
+    #[unsafe(link_section = ".data.rvemu_hot")]
     fn mac(&self) -> [u8; 6] {
+        // (from hart 1, core1 brings the radio up meanwhile)
+        let c1 = core1::on_core1();
         let t0 = board::mcycle64();
         while wifi::RADIO.load(Ordering::Acquire) == wifi::RADIO_STARTING && board::mcycle64() - t0 < self.wait_cycles {
-            core::hint::spin_loop();
+            if c1 {
+                core1::pass();
+            } else {
+                core1::xip_yield();
+            }
         }
         if wifi::RADIO.load(Ordering::Acquire) != wifi::RADIO_UP {
             return [0; 6];
@@ -369,7 +399,9 @@ fn mtime() -> u64 {
 /// enabled only while one runs (rvaccel enables them on its stack), so this
 /// interrupted it: pause it, back to the emulator. Returns when the guest
 /// continues the operation (`native_slice_begin` has re-armed the timer).
+/// With two harts, core0's trap entry in smp.rs calls it.
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".data.rvemu_hot")]
 extern "C" fn MachineTimer() {
     // SAFETY: mie is core0's; the workspace is the CPU's, at NATIVE_BASE.
     unsafe {
@@ -431,24 +463,64 @@ impl PicoBus {
     #[unsafe(link_section = ".data.rvemu_hot")]
     #[inline]
     fn poll(&mut self) {
+        let _g = BusGuard::new();
         let e = core1::events();
         if e != self.seen {
             self.seen = e;
-            self.plat.update_irqs();
+            update_irqs(&mut self.plat);
         }
         // GPIO edges (only lines the guest armed; one register read otherwise)
-        self.plat.poll_pins();
+        poll_pins(&mut self.plat);
         self.bench.sample_xip();
     }
 }
 
-impl Bus for PicoBus {
-    fn benchmark_supported(&self) -> bool {
-        true
+/// The guest's devices (`Plat`). With two harts the bus methods are in SRAM
+/// and take `BusGuard` before anything in flash runs; these are their parts
+/// in flash.
+type Plat = Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>, BoardPins>;
+
+#[inline(never)]
+fn update_irqs(p: &mut Plat) {
+    p.update_irqs();
+}
+
+#[inline(never)]
+fn poll_pins(p: &mut Plat) {
+    p.poll_pins();
+}
+
+#[inline(never)]
+fn plat_mmio_load(p: &mut Plat, pa: u32, size: u32) -> Result<u32, u32> {
+    p.mmio_load(pa, size)
+}
+
+#[inline(never)]
+fn plat_mmio_store(p: &mut Plat, pa: u32, size: u32, val: u32) -> Result<(), u32> {
+    p.mmio_store(pa, size, val)
+}
+
+#[inline(never)]
+fn plat_take_dma_write(p: &mut Plat) -> Option<(u32, u32)> {
+    p.take_dma_write()
+}
+
+/// One dirty swap sector erased, if there is one; whether it was.
+#[inline(never)]
+fn idle_erase(p: &mut Plat) -> bool {
+    if let Some(w) = &mut p.swap
+        && w.disk.wants_erase()
+    {
+        w.disk.idle_erase();
+        return true;
     }
+    false
+}
+
+impl PicoBus {
     /// `host` is core0's cycle count, `ns` the same in nanoseconds.
     #[inline(never)]
-    fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
+    fn benchmark_record_cold(&mut self, cpu: &Cpu, tag: u32) -> bool {
         let cycles = board::mcycle64();
         let instret = board::minstret64();
         self.bench.sample_xip();
@@ -463,7 +535,7 @@ impl Bus for PicoBus {
     /// The points so far, the native operations' stack peaks and both
     /// cores' stack depth, on the console; then an empty log.
     #[inline(never)]
-    fn benchmark_report(&mut self, cpu: &Cpu) -> Option<u32> {
+    fn benchmark_report_cold(&mut self, cpu: &Cpu) -> Option<u32> {
         use core::fmt::Write as _;
         let b = &mut *self.bench;
         let n = b.log.points().len();
@@ -498,6 +570,35 @@ impl Bus for PicoBus {
         b.log.clear();
         Some(n as u32)
     }
+}
+
+impl Bus for PicoBus {
+    fn benchmark_supported(&self) -> bool {
+        true
+    }
+    #[unsafe(link_section = ".data.rvemu_hot")]
+    fn benchmark_record(&mut self, cpu: &Cpu, tag: u32) -> bool {
+        let _g = BusGuard::new();
+        self.benchmark_record_cold(cpu, tag)
+    }
+    #[unsafe(link_section = ".data.rvemu_hot")]
+    fn benchmark_report(&mut self, cpu: &Cpu) -> Option<u32> {
+        let _g = BusGuard::new();
+        self.benchmark_report_cold(cpu)
+    }
+    /// A native operation runs in flash.
+    #[inline]
+    fn cold_begin(&mut self) {
+        if smp::on() {
+            core1::xip_hold();
+        }
+    }
+    #[inline]
+    fn cold_end(&mut self) {
+        if smp::on() {
+            core1::xip_unhold();
+        }
+    }
     fn native_preemptible(&self) -> bool {
         true
     }
@@ -520,29 +621,89 @@ impl Bus for PicoBus {
         let cycles = board::mcycle64() - self.slice.0;
         cpu.time_skip += cycles * u64::from(TIMEBASE_HZ) / u64::from(self.sys_hz);
     }
+    #[unsafe(link_section = ".data.rvemu_hot")]
     fn mmio_load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
-        self.plat.mmio_load(pa, size)
+        let _g = BusGuard::new();
+        plat_mmio_load(&mut self.plat, pa, size)
     }
+    #[unsafe(link_section = ".data.rvemu_hot")]
     fn mmio_store(&mut self, pa: u32, size: u32, val: u32) -> Result<(), u32> {
-        self.plat.mmio_store(pa, size, val)
+        let _g = BusGuard::new();
+        plat_mmio_store(&mut self.plat, pa, size, val)
     }
     fn external_irq(&self) -> bool {
-        self.plat.plic.irq
+        self.external_irq_hart(0)
+    }
+    /// (read without the lock: the other hart may be updating the PLIC)
+    #[inline]
+    fn external_irq_hart(&self, hart: u32) -> bool {
+        let p = if hart == 0 { &raw const self.plat.plic.irq } else { &raw const self.plat.plic.irq1 };
+        // SAFETY: a bool in the bus.
+        unsafe { p.read_volatile() }
+    }
+    fn kick(&mut self, hart: u32) {
+        // hart 0 waits in `wfi` watching smp::SMP itself
+        if hart == 1 {
+            core1::notify_core1();
+        }
+    }
+    /// (hart `n` runs on core `n`)
+    #[inline(always)]
+    fn atomic_begin(&mut self) {
+        smp::atomic_begin(usize::from(core1::on_core1()));
+    }
+    #[inline(always)]
+    fn atomic_end(&mut self) {
+        smp::atomic_end();
+    }
+    fn concurrent_harts(&self) -> bool {
+        smp::on()
+    }
+    #[inline]
+    fn hart_running(&self, hart: u32) -> bool {
+        hart != 1 || smp::hart1_in_guest()
+    }
+    fn fence_wait(&mut self) {
+        if core1::on_core1() {
+            core1::pass();
+        } else {
+            core::hint::spin_loop();
+        }
     }
     fn console_putc(&mut self, b: u8) {
+        let _g = BusGuard::new();
         self.plat.con.putc(b)
     }
     fn console_getc(&mut self) -> Option<u8> {
+        let _g = BusGuard::new();
         self.plat.con.getc()
     }
+    #[unsafe(link_section = ".data.rvemu_hot")]
     fn take_dma_write(&mut self) -> Option<(u32, u32)> {
-        self.plat.take_dma_write()
+        let _g = BusGuard::new();
+        plat_take_dma_write(&mut self.plat)
     }
+    /// Hart 0: `wfi_one`, or `wfi_two` with two harts. Hart 1 (core1) only
+    /// stops running until something is pending (`smp::hart1_wfi`).
+    #[unsafe(link_section = ".data.rvemu_hot")]
+    fn wfi(&mut self, cpu: &mut Cpu) {
+        if !smp::on() {
+            self.wfi_one(cpu);
+        } else if cpu.hartid == 1 {
+            smp::hart1_wfi(cpu, self);
+        } else {
+            self.wfi_two(cpu);
+        }
+    }
+}
+
+impl PicoBus {
     /// Interactive policy (as the Mac host's): wait in real time, at most
     /// 100 ms, for input or the timer deadline, then skip to the deadline.
     /// core1 bumps its event word when input or a frame arrives, which ends
     /// the wait at once.
-    fn wfi(&mut self, cpu: &mut Cpu) {
+    #[inline(never)]
+    fn wfi_one(&mut self, cpu: &mut Cpu) {
         self.poll();
         if cpu.sip_value(self) & cpu.sie != 0 {
             return;
@@ -557,14 +718,7 @@ impl Bus for PicoBus {
         let t0 = board::mcycle64();
         // Erase one dirty swap sector (about 45 ms) unless the guest wakes
         // within 2 ms. Erasing stalls everything, so idle time is the place.
-        let mut erased = false;
-        if wait >= hz / 500
-            && let Some(w) = &mut self.plat.swap
-            && w.disk.wants_erase()
-        {
-            w.disk.idle_erase();
-            erased = true;
-        }
+        let erased = wait >= hz / 500 && idle_erase(&mut self.plat);
         while board::mcycle64() - t0 < wait {
             if core1::events() != self.seen {
                 self.poll();
@@ -590,6 +744,120 @@ impl Bus for PicoBus {
         cpu.time_skip += ticks;
         cpu.stats.idle_ticks += ticks;
     }
+
+    /// `wfi_one` with two harts, in SRAM (flash code only under
+    /// `BusGuard`). While hart 1 runs its clock is the machine's, so the wait
+    /// is for hart 1's time to reach the deadline (no skip); while both wait,
+    /// for the earlier of the two deadlines. Anything hart 1 sends this hart
+    /// ends the wait.
+    #[inline(never)]
+    #[unsafe(link_section = ".data.rvemu_hot")]
+    fn wfi_two(&mut self, cpu: &mut Cpu) {
+        self.poll();
+        cpu.smp_poll();
+        if cpu.sip_value(self) & cpu.sie != 0 {
+            return;
+        }
+        let hart1_active = smp::hart1_active();
+        let deadline = cpu.stimecmp.min(smp::hart1_deadline());
+        let now = cpu.time();
+        if deadline <= now {
+            core1::notify_core1();
+            return;
+        }
+        let hz = u64::from(self.sys_hz);
+        let ticks = deadline - now;
+        let wait = (ticks.saturating_mul(hz) / u64::from(TIMEBASE_HZ)).min(hz / 10);
+        let erased = wait >= hz / 500 && !hart1_active && {
+            let _g = BusGuard::new();
+            idle_erase(&mut self.plat)
+        };
+        let mut t0 = board::mcycle64();
+        // the pins every 10 us: each look holds the device lock, and with it
+        // the flash, which hart 1's atomics need
+        let pins_every = hz / 100_000;
+        let mut pins_at = t0;
+        while board::mcycle64() - t0 < wait {
+            if core1::events() != self.seen {
+                self.poll();
+                if cpu.sip_value(self) & cpu.sie != 0 {
+                    return;
+                }
+            }
+            // a GPIO edge the guest armed ends the wait too
+            let c = board::mcycle64();
+            if c - pins_at >= pins_every {
+                pins_at = c;
+                let _g = BusGuard::new();
+                poll_pins(&mut self.plat);
+            }
+            if self.external_irq_hart(0) && cpu.sip_value(self) & cpu.sie != 0 {
+                return;
+            }
+            if smp::hart0_wake(cpu, hart1_active) {
+                return;
+            }
+            if hart1_active {
+                // hart 1 keeps the time
+                t0 = board::mcycle64();
+            }
+        }
+        if deadline == u64::MAX {
+            return; // no timer armed: keep waiting for input
+        }
+        let ticks = if erased {
+            ticks.max((board::mcycle64() - t0) * u64::from(TIMEBASE_HZ) / hz)
+        } else {
+            ticks
+        };
+        cpu.time_skip += ticks;
+        cpu.stats.idle_ticks += ticks;
+        // hart 1's deadline may be the one reached
+        cpu.smp_poll();
+        core1::notify_core1();
+    }
+}
+
+/// How long one of hart 1's slices on core1 may run (`hart1_slice`).
+const HART1_SLICE_US: u64 = 200;
+static mut HART1_SLICE_CYCLES: u64 = 0;
+
+/// core1's hook: hart 1's slice, on its own stack. True if it has more to
+/// do.
+#[unsafe(link_section = ".data.core1")]
+fn hart1_hook() -> bool {
+    // SAFETY: set before the hook.
+    core1::call_on_stack(unsafe { HART1_STACK.1 }, hart1_slice);
+    smp::hart1_active()
+}
+
+/// Run hart 1 for up to a slice, unless it waits (core1, on hart 1's stack).
+#[inline(never)]
+#[unsafe(link_section = ".data.rvemu_hot")]
+extern "C" fn hart1_slice() {
+    // SAFETY: `setup_hart1` made all of these before setting the hook. The
+    // translator is shared under its own lock (rvjit `add_hart`), what both
+    // harts change in the bus is behind `BusGuard`, and only this core uses
+    // hart 1's Cpu.
+    let (jit, cpu, bus, slice) = unsafe {
+        (
+            (*addr_of_mut!(JIT)).assume_init_mut(),
+            &mut *(*addr_of_mut!(HART1_CPU) as *mut Cpu),
+            (*addr_of_mut!(BUS)).assume_init_mut(),
+            *addr_of_mut!(HART1_SLICE_CYCLES),
+        )
+    };
+    if !smp::hart1_runnable(cpu, bus) {
+        return;
+    }
+    smp::hart1_enter(cpu);
+    let t0 = core1::now();
+    while cpu.halt.is_none() && !smp::hart1_parked() && core1::now() - t0 < slice {
+        core1::serve_park();
+        jit.run_one_smp(cpu, bus);
+    }
+    smp::hart1_leave();
+    smp::hart1_after(cpu);
 }
 
 /// What core1 runs: the console, the radio, a status line on RTT.
@@ -642,6 +910,11 @@ impl Status {
             core1::stack_used(),
             core1::STACK_BYTES
         );
+        // SAFETY: set once by `setup_hart1`, before the hook runs.
+        let (lo1, hi1) = unsafe { *addr_of_mut!(HART1_STACK) };
+        if hi1 != 0 {
+            rprintln!("[core1] hart 1's stack use: {} of {} B", core1::painted_stack_used(lo1, hi1), hi1 - lo1);
+        }
     }
 }
 
@@ -679,6 +952,9 @@ fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus) {
         // something for the guest, plus the pins' pending check
         if events & 0xFF == 0 {
             bus.poll();
+            if smp::on() && let Some(h) = smp::take_halt() {
+                cpu.halt = Some(h);
+            }
         }
     }
 }
@@ -727,6 +1003,13 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         fail("run scripts/pico-shell.sh");
     }
     let seed = trng_seed(&pac.TRNG, &mut pac.RESETS);
+    let two_harts = dtb_has_cpu1(&h);
+    if two_harts {
+        // both cores' trap entries, before either can lock the other out
+        smp::init_locks();
+        smp::install_trap0();
+        core1::set_trap(smp::trap_entry(1));
+    }
 
     let radio_pins = RadioPins { pwr: pins.gpio23, dio: pins.gpio24, cs: pins.gpio25, clk: pins.gpio29 };
     let creds = Creds::from_flash();
@@ -740,8 +1023,7 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     macro_rules! free {
         ($($n:literal $f:ident),*) => { $( gp[$n] = Some(Gp::new(pins.$f)); )* };
     }
-    free!(1 gpio1, 2 gpio2, 3 gpio3, 8 gpio8, 9 gpio9, 10 gpio10, 11 gpio11, 12 gpio12, 13 gpio13, 14 gpio14,
-        15 gpio15, 20 gpio20, 21 gpio21, 22 gpio22, 26 gpio26, 27 gpio27, 28 gpio28, 30 gpio30, 31 gpio31,
+    free!(1 gpio1, 2 gpio2, 3 gpio3, 12 gpio12, 13 gpio13, 14 gpio14, 15 gpio15, 20 gpio20, 21 gpio21, 22 gpio22, 26 gpio26, 27 gpio27, 28 gpio28, 30 gpio30, 31 gpio31,
         32 gpio32, 33 gpio33, 34 gpio34, 35 gpio35, 36 gpio36, 37 gpio37, 38 gpio38, 39 gpio39);
     debug_assert!((0..rvcore::periph::NGPIO as usize).all(|n| gp[n].is_some() == (rvcore::periph::FREE_PINS >> n & 1 != 0)));
     use hal::fugit::RateExtU32;
@@ -766,6 +1048,12 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         (pins.gpio19.reconfigure(), pins.gpio16.reconfigure(), pins.gpio18.reconfigure()),
     )
     .init(&mut pac.RESETS, peri_hz.Hz(), 1.MHz(), pins::SPI_MODE);
+    // the SD card
+    let spi1 = hal::spi::Spi::<_, _, _, 8>::new(
+        pac.SPI1,
+        (pins.gpio11.reconfigure(), pins.gpio8.reconfigure(), pins.gpio10.reconfigure()),
+    )
+    .init(&mut pac.RESETS, peri_hz.Hz(), 400.kHz(), pins::SPI_MODE);
     let adc_pins = [
         pins.gpio40.into_floating_disabled().into_dyn_pin(),
         pins.gpio41.into_floating_disabled().into_dyn_pin(),
@@ -776,7 +1064,16 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         pins.gpio46.into_floating_disabled().into_dyn_pin(),
         pins.gpio47.into_floating_disabled().into_dyn_pin(),
     ];
-    let set = PinSet { gp, i2c0, i2c1, spi, spi_cs: pins.gpio17.reconfigure(), adc_pins };
+    let set = PinSet {
+        gp,
+        i2c0,
+        i2c1,
+        spi,
+        spi_cs: pins.gpio17.reconfigure(),
+        spi1,
+        spi1_cs: pins.gpio9.reconfigure(),
+        adc_pins,
+    };
     let board_pins = BoardPins::new(set, pac.PWM, pac.ADC, &mut pac.RESETS, sys_hz, peri_hz);
 
     // SAFETY: initialised once, here, before anything borrows it.
@@ -873,18 +1170,62 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         c.set_readonly_prefix(h.text_len);
         c
     };
-    let jit = make_jit(cpu);
+    let jit = make_jit(cpu, if two_harts { CODE_WORDS - HART1_WORDS } else { CODE_WORDS });
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
+    if two_harts {
+        setup_hart1(jit, cpu, &h, dtb, sys_hz);
+    }
     rprintln!(
-        "guest RAM {} KiB, translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
+        "guest RAM {} KiB, {} hart(s), translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
         h.ram_size >> 10,
-        CODE_WORDS * 4 / 1024,
+        if two_harts { 2 } else { 1 },
+        if two_harts { CODE_WORDS - HART1_WORDS } else { CODE_WORDS } * 4 / 1024,
         STORE_WORDS * 4 / 1024,
         disk_kib,
         if swap_on { "on" } else { "off" }
     );
     (jit, cpu, bus, sys_hz)
+}
+
+/// Whether the guest's DTB has a second CPU.
+fn dtb_has_cpu1(h: &BlobHeader) -> bool {
+    const NODE: &[u8] = b"cpu@1\0";
+    // SAFETY: as in `dtb_has_swap`.
+    let dtb = unsafe { core::slice::from_raw_parts((BLOB_ADDR + h.dtb_off as usize) as *const u8, h.dtb_len as usize) };
+    dtb.windows(NODE.len()).any(|w| w == NODE)
+}
+
+/// Hart 1: its Cpu, jump cache and stack at the top of the code buffer
+/// (which `make_jit` left out), joined to hart 0's translator, then core1's
+/// hook to run it. It starts stopped, until the guest starts it (SBI HSM).
+#[inline(never)]
+fn setup_hart1(jit: &mut Jit<'static>, cpu: &mut Cpu, h: &BlobHeader, dtb: u32, sys_hz: u32) {
+    cpu.smp = &smp::SMP;
+    cpu.hartid = 0;
+    cpu.jit.amo_deny = smp::AMO_DENY[0];
+    // SAFETY: the code buffer's last HART1_WORDS, which the translator
+    // doesn't have, used by nothing else.
+    unsafe {
+        let end = (&raw mut CODE) as usize + CODE_WORDS * 4;
+        let at = (end - HART1_WORDS * 4).next_multiple_of(16);
+        let jc = (at + core::mem::size_of::<Cpu>()).next_multiple_of(16);
+        let stack = (jc + NJC * core::mem::size_of::<JcEntry>(), end & !15);
+        core1::paint(stack.0, stack.1);
+        *addr_of_mut!(HART1_CPU) = at;
+        *addr_of_mut!(HART1_STACK) = stack;
+        let c1 = Cpu::init(at as *mut Cpu, h.ram_host() as *mut u8, 0, h.ram_size, 0, dtb);
+        c1.set_readonly_prefix(h.text_len);
+        c1.smp = &smp::SMP;
+        c1.hartid = 1;
+        c1.jit.amo_deny = smp::AMO_DENY[1];
+        let jc1 = core::slice::from_raw_parts_mut(jc as *mut JcEntry, NJC);
+        jit.add_hart(c1, jc1, &smp::JIT_SMP, Some(smp::AMO_LOCK));
+        *addr_of_mut!(HART1_SLICE_CYCLES) = u64::from(sys_hz / 1_000_000) * HART1_SLICE_US;
+    }
+    jit.budget_cap = smp::BUDGET_CAP;
+    smp::enable();
+    core1::set_hook(hart1_hook);
 }
 
 /// The guest's devices, built straight into the static bus (a `with_*`
@@ -902,13 +1243,13 @@ fn add_devices(bus: &mut PicoBus, pins: BoardPins, disk: Option<MemDisk>, gmem: 
 
 /// The translator, in the static `JIT`, in a frame of its own.
 #[inline(never)]
-fn make_jit(cpu: &mut Cpu) -> &'static mut Jit<'static> {
+fn make_jit(cpu: &mut Cpu, code_words: usize) -> &'static mut Jit<'static> {
     // SAFETY: the translator tables are used only by this Jit, from here on.
     unsafe {
         (*addr_of_mut!(JIT)).write(Jit::new(
             cpu,
             JitMem {
-                code: &mut *addr_of_mut!(CODE),
+                code: &mut (&mut *addr_of_mut!(CODE))[..code_words],
                 buckets: &mut *addr_of_mut!(BUCKETS),
                 code_pages: &mut *addr_of_mut!(CODE_PAGES),
                 jump_cache: &mut *addr_of_mut!(JUMP_CACHE),

@@ -1,56 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
 /* /dev/rvemu-ssh: one SSH chacha20-poly1305@openssh.com packet per ioctl
  * (rvemu-ssh.h), sealed or opened by the rvemu machine's native engine.
- * Each open owns contiguous kernel buffers that the firmware reads and
- * writes by physical address; user pointers never reach it. */
+ * Packets go through the engine's kernel bounce buffers (rvemu-native.h),
+ * which the firmware reads and writes by physical address; user pointers
+ * never reach it. */
 #include <linux/init.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
-#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
+#include <linux/err.h>
 #include <asm/sbi.h>
-#include <asm/io.h>
 #include "rvemu-ssh.h"
 #include "rvemu-native.h"
-#define MAX_BYTES 32768
+#define MAX_BYTES RVEMU_NATIVE_MAX_BUFFER
 
-struct rvemu_ssh_context {
-    struct mutex lock;
-    unsigned char *input, *output, *params;
-};
-static void free_context(struct rvemu_ssh_context *c)
-{
-    if (!c) return;
-    kfree_sensitive(c->params);
-    kfree_sensitive(c->output);
-    kfree_sensitive(c->input);
-    kfree_sensitive(c);
-}
-static int rvemu_ssh_open(struct inode *inode, struct file *file)
-{
-    struct rvemu_ssh_context *c = kzalloc(sizeof(*c), GFP_KERNEL);
-    if (!c) return -ENOMEM;
-    c->input = kmalloc(MAX_BYTES, GFP_KERNEL);
-    c->output = kmalloc(MAX_BYTES, GFP_KERNEL);
-    c->params = kmalloc(72, GFP_KERNEL);
-    if (!c->input || !c->output || !c->params) {
-        free_context(c);
-        return -ENOMEM;
-    }
-    mutex_init(&c->lock);
-    file->private_data = c;
-    return nonseekable_open(inode, file);
-}
-static int rvemu_ssh_release(struct inode *inode, struct file *file)
-{
-    free_context(file->private_data);
-    return 0;
-}
 static long rvemu_ssh_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    struct rvemu_ssh_context *c = file->private_data;
+    struct rvemu_native_buffers *b;
     struct rvemu_ssh_request r = {0};
     struct sbiret result;
     unsigned int outlen, i;
@@ -67,17 +34,16 @@ static long rvemu_ssh_ioctl(struct file *file, unsigned int cmd, unsigned long a
     }
     outlen = r.operation == 4 ? r.length + 16 : r.length - 16;
     if (outlen > MAX_BYTES) { ret = -EMSGSIZE; goto done; }
-    /* A descriptor can be shared across threads/fork: serialize its buffers. */
-    mutex_lock(&c->lock);
-    if (copy_from_user(c->input, (void __user *)(unsigned long)r.source, r.length)) {
+    b = rvemu_native_get();
+    if (IS_ERR(b)) { ret = PTR_ERR(b); goto done; }
+    if (copy_from_user(b->in, (void __user *)(unsigned long)r.source, r.length)) {
         ret = -EFAULT;
         goto unlock;
     }
-    memcpy(c->params, r.key, 64);
-    memset(c->params + 64, 0, 4);
-    for (i = 0; i < 4; i++) c->params[68+i] = r.sequence >> (24-8*i);
-    result = rvemu_native_call(r.operation, virt_to_phys(c->output), outlen,
-                               virt_to_phys(c->input), r.length, virt_to_phys(c->params), 72);
+    memcpy(b->params, r.key, 64);
+    memset(b->params + 64, 0, 4);
+    for (i = 0; i < 4; i++) b->params[68+i] = r.sequence >> (24-8*i);
+    result = rvemu_native_call(r.operation, outlen, r.length, 72);
     if (result.error) {
         ret = result.error == -2 ? -EOPNOTSUPP :
               result.error == -1 ? -EBADMSG :
@@ -85,20 +51,16 @@ static long rvemu_ssh_ioctl(struct file *file, unsigned int cmd, unsigned long a
         goto unlock;
     }
     if (result.value != outlen) { ret = -EIO; goto unlock; }
-    ret = copy_to_user((void __user *)(unsigned long)r.destination, c->output, outlen) ? -EFAULT : 0;
+    ret = copy_to_user((void __user *)(unsigned long)r.destination, b->out, outlen) ? -EFAULT : 0;
 unlock:
-    memzero_explicit(c->params, 72);
-    memzero_explicit(c->input, r.length);
-    memzero_explicit(c->output, outlen);
-    mutex_unlock(&c->lock);
+    rvemu_native_put(r.length, outlen, 72);
 done:
     memzero_explicit(&r, sizeof(r));
     return ret;
 }
 static const struct file_operations rvemu_ssh_ops = {
     .owner = THIS_MODULE,
-    .open = rvemu_ssh_open,
-    .release = rvemu_ssh_release,
+    .open = nonseekable_open,
     .unlocked_ioctl = rvemu_ssh_ioctl,
 };
 static struct miscdevice rvemu_ssh_dev = {

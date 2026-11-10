@@ -89,6 +89,58 @@ stop)
 esac
 S
 chmod 755 "$T/etc/init.d/S02swap"
+# the SD card (SPI1, /dev/mmcblk0): its first FAT partition at /mnt/sd,
+# mounted in the background once the kernel has found the card
+cat > "$T/etc/init.d/S03sd" <<'S'
+#!/bin/sh
+# The SD card at /mnt/sd: each card is mounted once when it goes in (one can
+# take tens of seconds to start, or be put in after boot), and its mount is
+# dropped when it comes out. A card unmounted by hand stays unmounted. Each
+# card put in is a new disk, a new sysfs node: its inode tells cards apart.
+PID=/var/run/sd.pid
+mounted() {
+  while read -r _ m _; do [ "$m" = /mnt/sd ] && return 0; done < /proc/mounts
+  return 1
+}
+follow() {
+  seen=
+  while :; do
+    if [ -e /sys/block/mmcblk0 ]; then
+      set -- $(ls -id /sys/block/mmcblk0)
+      if [ "$1" != "$seen" ]; then
+        seen=$1
+        mounted && umount -l /mnt/sd
+        sleep 1 # the partitions are read just after the disk appears
+        p=/dev/mmcblk0p1
+        [ -b $p ] || p=/dev/mmcblk0
+        mount -t vfat -o noatime $p /mnt/sd
+      fi
+    elif [ -n "$seen" ]; then
+      seen=
+      mounted && umount -l /mnt/sd
+    fi
+    sleep 2
+  done
+}
+case "$1" in
+start)
+  [ -f $PID ] && kill -0 "$(cat $PID)" 2>/dev/null && exit 0
+  mkdir -p /mnt/sd
+  follow </dev/null >/dev/null 2>&1 &
+  echo $! > $PID
+  ;;
+stop)
+  [ -f $PID ] && kill "$(cat $PID)" 2>/dev/null
+  rm -f $PID
+  umount /mnt/sd 2>/dev/null
+  ;;
+restart)
+  "$0" stop
+  "$0" start
+  ;;
+esac
+S
+chmod 755 "$T/etc/init.d/S03sd"
 # the flash swap device's counters and flash timings (its last page)
 cat > "$T/usr/bin/flashswap-stats" <<'S'
 #!/bin/sh

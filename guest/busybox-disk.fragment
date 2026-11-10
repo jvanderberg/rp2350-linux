@@ -3,3 +3,5 @@
 # dynamic loader and its relocation and GOT pages. The other programs still
 # link against libc.so.
 CONFIG_STATIC=y
+# taskset: run a program on a chosen CPU (the two-CPU kernel, pico-shell.sh -c 2)
+CONFIG_TASKSET=y

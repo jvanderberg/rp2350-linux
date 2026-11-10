@@ -50,9 +50,69 @@ ext_rebuild() {   # BR_OUT
   done
 }
 
+# The disk guest's kernel, built in TREE into OUT, with linux.fragment,
+# linux-disk.fragment, and with `smp` linux-smp.fragment too.
+disk_kernel() {   # TREE OUT [smp]
+  local K=$1 out=$2 smp=${3:-}
+  local CROSS=/work/br-disk/host/bin/riscv32-buildroot-linux-musl-
+  # its own source tree (the initramfs kernel builds in linux-$KVER, and
+  # kbuild refuses out-of-tree builds from a tree built in place)
+  if [[ ! -d $K ]]; then
+    mkdir -p "$K" && curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar xJ -C "$K" --strip-components=1
+  fi
+  cd "$K"
+  # the rvemu NOR flash driver for /home (guest/linux/rvemu-flash.c); the
+  # tree is shared, and builds without CONFIG_MTD_RVEMU_FLASH ignore it
+  cmp -s /guest/linux/rvemu-flash.c drivers/mtd/devices/rvemu-flash.c || cp /guest/linux/rvemu-flash.c drivers/mtd/devices/
+  grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Kconfig ||
+    sed -i '$i config MTD_RVEMU_FLASH\n\ttristate "rvemu NOR flash device"\n\tdepends on HAS_IOMEM \&\& OF\n' drivers/mtd/devices/Kconfig
+  grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Makefile ||
+    echo "obj-\$(CONFIG_MTD_RVEMU_FLASH) += rvemu-flash.o" >> drivers/mtd/devices/Makefile
+  # jffs2's GC thread CRC-checks every node after a mount: idle time only
+  # (SCHED_IDLE, not nice 10), so a full /home doesn't hold up the boot. A
+  # writer that runs out of space collects garbage itself.
+  sed -i 's|^\tset_user_nice(current, 10);$|\tsched_setscheduler_nocheck(current, SCHED_IDLE, \&(struct sched_param){ 0 });|' fs/jffs2/background.c
+  local frags=(/guest/linux.fragment /guest/linux-disk.fragment)
+  if [[ $smp == smp ]]; then
+    frags+=(/guest/linux-smp.fragment)
+    # two CPUs (a tree of its own): no mmiowb tracking (rvemu's MMIO is
+    # strongly ordered), and the spinlock API inline, as a single-CPU kernel
+    # has it
+    sed -i '/^\tselect ARCH_HAS_MMIOWB$/d' arch/riscv/Kconfig
+    grep -q 'ARCH_INLINE_SPIN_LOCK$' arch/riscv/Kconfig ||
+      sed -i 's/^\tselect ARCH_HAS_BINFMT_FLAT$/&\n\tselect ARCH_INLINE_SPIN_LOCK\n\tselect ARCH_INLINE_SPIN_LOCK_IRQ\n\tselect ARCH_INLINE_SPIN_LOCK_IRQSAVE\n\tselect ARCH_INLINE_SPIN_LOCK_BH\n\tselect ARCH_INLINE_SPIN_TRYLOCK\n\tselect ARCH_INLINE_SPIN_UNLOCK\n\tselect ARCH_INLINE_SPIN_UNLOCK_IRQ\n\tselect ARCH_INLINE_SPIN_UNLOCK_IRQRESTORE\n\tselect ARCH_INLINE_SPIN_UNLOCK_BH/' arch/riscv/Kconfig
+    sed -i 's/^static inline \(void do_raw_spin_lock(raw_spinlock_t \*lock) __acquires(lock)\)/static __always_inline \1/; s/^static inline \(int do_raw_spin_trylock(raw_spinlock_t \*lock)\)/static __always_inline \1/; s/^static inline \(void do_raw_spin_unlock(raw_spinlock_t \*lock) __releases(lock)\)/static __always_inline \1/' include/linux/spinlock.h
+  fi
+  # the rvemu machine's own drivers (guest/linux/drivers/rvemu); each one
+  # is off unless its Kconfig symbol is set
+  rm -rf drivers/rvemu && cp -r /guest/linux/drivers/rvemu drivers/rvemu
+  grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
+  grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
+  # mmc_spi waits for the SD card's tokens and busy in the firmware
+  # (rvemu_spi_skip in drivers/rvemu/spi-rvemu.c). The patch is applied to
+  # the stock file, kept beside it, so a changed patch applies cleanly; the
+  # file is replaced only when the result differs (no needless rebuild).
+  local mmc=drivers/mmc/host/mmc_spi.c
+  if [[ ! -f $mmc.stock ]]; then
+    grep -q CONFIG_RVEMU_SPI $mmc &&
+      curl -fsSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/$mmc?h=v$KVER" -o $mmc
+    cp $mmc $mmc.stock
+  fi
+  patch -s -f -o $mmc.new $mmc.stock < /guest/linux/mmc_spi-rvemu.patch
+  cmp -s $mmc.new $mmc && rm $mmc.new || mv $mmc.new $mmc
+  make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
+  scripts/kconfig/merge_config.sh -m .config "${frags[@]}"
+  make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig
+  make ARCH=riscv CROSS_COMPILE=$CROSS -j"$JOBS" Image vmlinux
+  mkdir -p "$out"
+  cp arch/riscv/boot/Image vmlinux System.map "$out/"
+  cp .config "$out/linux.config"
+}
+
 # disk / disk-rootfs / disk-kernel: the squashfs-root variant, into /out-disk
 # (buildroot-disk.defconfig, linux.fragment + linux-disk.fragment), with the
-# board's pins.
+# board's pins. disk-smp-kernel: the same kernel for two CPUs
+# (+ linux-smp.fragment), into /out-disk/smp.
 if [[ $stage == disk* ]]; then
   if [[ $stage == disk || $stage == disk-rootfs ]]; then
     mkdir -p /work/br-disk
@@ -79,36 +139,10 @@ if [[ $stage == disk* ]]; then
     cp /work/br-disk/images/rootfs.squashfs /out-disk/rootfs.squashfs
   fi
   if [[ $stage == disk || $stage == disk-kernel ]]; then
-    CROSS=/work/br-disk/host/bin/riscv32-buildroot-linux-musl-
-    # its own source tree (the initramfs kernel builds in linux-$KVER, and
-    # kbuild refuses out-of-tree builds from a tree built in place)
-    K=/work/linux-disk-$KVER
-    if [[ ! -d $K ]]; then
-      mkdir -p "$K" && curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz" | tar xJ -C "$K" --strip-components=1
-    fi
-    cd "$K"
-    # the rvemu NOR flash driver for /home (guest/linux/rvemu-flash.c); the
-    # tree is shared, and builds without CONFIG_MTD_RVEMU_FLASH ignore it
-    cmp -s /guest/linux/rvemu-flash.c drivers/mtd/devices/rvemu-flash.c || cp /guest/linux/rvemu-flash.c drivers/mtd/devices/
-    grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Kconfig ||
-      sed -i '$i config MTD_RVEMU_FLASH\n\ttristate "rvemu NOR flash device"\n\tdepends on HAS_IOMEM \&\& OF\n' drivers/mtd/devices/Kconfig
-    grep -q MTD_RVEMU_FLASH drivers/mtd/devices/Makefile ||
-      echo "obj-\$(CONFIG_MTD_RVEMU_FLASH) += rvemu-flash.o" >> drivers/mtd/devices/Makefile
-    # jffs2's GC thread CRC-checks every node after a mount: idle time only
-    # (SCHED_IDLE, not nice 10), so a full /home doesn't hold up the boot. A
-    # writer that runs out of space collects garbage itself.
-    sed -i 's|^\tset_user_nice(current, 10);$|\tsched_setscheduler_nocheck(current, SCHED_IDLE, \&(struct sched_param){ 0 });|' fs/jffs2/background.c
-    # the rvemu machine's own drivers (guest/linux/drivers/rvemu); each one
-    # is off unless its Kconfig symbol is set
-    rm -rf drivers/rvemu && cp -r /guest/linux/drivers/rvemu drivers/rvemu
-    grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
-    grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
-    make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
-    scripts/kconfig/merge_config.sh -m .config /guest/linux.fragment /guest/linux-disk.fragment
-    make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig
-    make ARCH=riscv CROSS_COMPILE=$CROSS -j"$JOBS" Image vmlinux
-    cp arch/riscv/boot/Image vmlinux System.map /out-disk/
-    cp .config /out-disk/linux.config
+    disk_kernel /work/linux-disk-$KVER /out-disk
+  fi
+  if [[ $stage == disk-smp-kernel ]]; then
+    disk_kernel /work/linux-disk-smp-$KVER /out-disk/smp smp
   fi
   ls -la /out-disk
   exit 0

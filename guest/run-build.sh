@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Host wrapper: build the guest kernel + rootfs in Docker. Usage: ./run-build.sh [all|rootfs|kernel|disk|disk-rootfs|disk-kernel]
+# Host wrapper: build the guest kernel + rootfs in Docker. Usage: ./run-build.sh [all|rootfs|kernel|disk|disk-rootfs|disk-kernel|disk-smp-kernel]
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../scripts/preflight.sh
 stage=${1:-all}
-case "$stage" in all|rootfs|kernel|disk|disk-rootfs|disk-kernel) ;; *)
-  echo "Usage: $0 [all|rootfs|kernel|disk|disk-rootfs|disk-kernel]" >&2; exit 2;;
+case "$stage" in all|rootfs|kernel|disk|disk-rootfs|disk-kernel|disk-smp-kernel) ;; *)
+  echo "Usage: $0 [all|rootfs|kernel|disk|disk-rootfs|disk-kernel|disk-smp-kernel]" >&2; exit 2;;
 esac
 for tool in git docker python3; do need_tool "$tool" 'See docs/development.md.'; done
 docker info >/dev/null || { echo 'Start Docker and retry.' >&2; exit 1; }
@@ -27,7 +27,7 @@ fi
 mkdir -p out out-disk
 # Kernel-only stages require the matching Buildroot toolchain from a full build.
 case "$stage" in
-  kernel) tree=br;; disk-kernel) tree=br-disk;; *) tree=;;
+  kernel) tree=br;; disk-kernel|disk-smp-kernel) tree=br-disk;; *) tree=;;
 esac
 if [ -n "$tree" ]; then
   docker run --rm -v rvemu-guest-work:/work:ro debian:bookworm test -x "/work/$tree/host/bin/riscv32-buildroot-linux-musl-gcc" || {
@@ -35,6 +35,7 @@ if [ -n "$tree" ]; then
   }
 fi
 out=out; [[ $stage != disk* ]] || out=out-disk
+[[ $stage != disk-smp-kernel ]] || { out=out-disk/smp; mkdir -p "$out"; }
 # claude-guest-mcp goes into the disk rootfs; it is built here, with the host's
 # Rust (the build container has none), and post-build-disk.sh installs it
 if [[ $stage == disk || $stage == disk-rootfs ]]; then

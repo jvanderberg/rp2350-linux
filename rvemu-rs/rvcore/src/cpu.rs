@@ -52,6 +52,65 @@ pub const MIP_SSIP: u32 = 1 << IRQ_SSI;
 pub const MIP_STIP: u32 = 1 << IRQ_STI;
 pub const MIP_SEIP: u32 = 1 << IRQ_SEI;
 
+/// Harts a machine can have.
+pub const MAX_HARTS: usize = 2;
+/// SBI HSM states (`Smp::hsm`).
+pub const HSM_STARTED: u32 = 0;
+pub const HSM_STOPPED: u32 = 1;
+pub const HSM_START_PENDING: u32 = 2;
+/// Remote fence requests (`Smp::fence`): an sfence.vma.
+pub const FENCE_VMA: u32 = 1;
+
+/// What the harts of a multi-hart machine share: words only, so each hart
+/// may run on its own host core. A single-hart machine has none
+/// (`Cpu::smp` is null) and never looks at any of this.
+#[repr(C)]
+pub struct Smp {
+    pub nharts: u32,
+    /// An IPI is pending for the hart (sets its SSIP at its next check).
+    pub ipi: [core::sync::atomic::AtomicU32; MAX_HARTS],
+    /// Remote fence requests for the hart (`FENCE_*`), cleared when done.
+    pub fence: [core::sync::atomic::AtomicU32; MAX_HARTS],
+    /// HSM state (`HSM_*`), and where a pending start begins.
+    pub hsm: [core::sync::atomic::AtomicU32; MAX_HARTS],
+    pub start_pc: [core::sync::atomic::AtomicU32; MAX_HARTS],
+    pub start_arg: [core::sync::atomic::AtomicU32; MAX_HARTS],
+    /// Each hart's guest time at its last check (lo, hi; hi written last).
+    /// A hart's time only moves forward, and never trails another's by more
+    /// than one check: `time` is `max` over the harts.
+    pub time: [[core::sync::atomic::AtomicU32; 2]; MAX_HARTS],
+}
+
+impl Smp {
+    pub const fn new(nharts: u32) -> Self {
+        use core::sync::atomic::AtomicU32 as A;
+        Smp {
+            nharts,
+            ipi: [const { A::new(0) }; MAX_HARTS],
+            fence: [const { A::new(0) }; MAX_HARTS],
+            hsm: [A::new(HSM_STARTED), A::new(HSM_STOPPED)],
+            start_pc: [const { A::new(0) }; MAX_HARTS],
+            start_arg: [const { A::new(0) }; MAX_HARTS],
+            time: [const { [A::new(0), A::new(0)] }; MAX_HARTS],
+        }
+    }
+
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn time_of(&self, h: usize) -> u64 {
+        use core::sync::atomic::Ordering::Acquire;
+        let hi = self.time[h][1].load(Acquire);
+        let lo = self.time[h][0].load(Acquire);
+        (u64::from(hi) << 32) | u64::from(lo)
+    }
+
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn publish_time(&self, h: usize, t: u64) {
+        use core::sync::atomic::Ordering::Release;
+        self.time[h][0].store(t as u32, Release);
+        self.time[h][1].store((t >> 32) as u32, Release);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Halt {
     Shutdown,
@@ -61,6 +120,8 @@ pub enum Halt {
     User,
     /// The guest kernel panicked (the host saw its message).
     Panic,
+    /// SBI HSM hart_stop (a secondary hart; the host parks it).
+    Stopped,
 }
 
 /// One soft-TLB slot: `host = va + addend` for the page `tag`. An empty slot
@@ -92,6 +153,39 @@ pub trait Bus {
     fn mmio_store(&mut self, pa: u32, size: u32, val: u32) -> Result<(), u32>;
     /// Level of the PLIC's S-mode external interrupt output.
     fn external_irq(&self) -> bool;
+    /// The same for hart `hart`'s context (multi-hart machines).
+    #[inline(always)]
+    fn external_irq_hart(&self, hart: u32) -> bool {
+        hart == 0 && self.external_irq()
+    }
+    /// Multi-hart: hart `hart` has something new (an IPI, a fence request,
+    /// a start): wake it if it waits.
+    fn kick(&mut self, _hart: u32) {}
+    /// Multi-hart: make the next few accesses to guest RAM atomic with
+    /// respect to every other hart's accesses, plain stores included (an
+    /// AMO's or SC's read-modify-write), and end that.
+    fn atomic_begin(&mut self) {}
+    fn atomic_end(&mut self) {}
+    /// Multi-hart: whether the harts run at once, on host cores of their
+    /// own. Then a hart that asks another for a fence waits until it is
+    /// done (`Smp::fence` back to 0), calling `fence_wait` meanwhile. A host
+    /// that runs the harts in turn needs no wait: the other hart takes the
+    /// request before its next instruction.
+    fn concurrent_harts(&self) -> bool {
+        false
+    }
+    /// One pause in such a wait.
+    fn fence_wait(&mut self) {}
+    /// Multi-hart: whether hart `hart` may be running guest code now. One
+    /// that isn't takes its fence requests (`Cpu::smp_poll`) before it runs
+    /// again, so a fence for it needn't wait.
+    fn hart_running(&self, _hart: u32) -> bool {
+        true
+    }
+    /// Around rarely used host code (a native operation, HSM calls) that a
+    /// host may keep out of fast memory and need to bracket.
+    fn cold_begin(&mut self) {}
+    fn cold_end(&mut self) {}
     fn console_putc(&mut self, b: u8);
     fn console_getc(&mut self) -> Option<u8>;
     /// Guest executed WFI. May advance `cpu.time_skip` or set `cpu.halt`.
@@ -124,6 +218,19 @@ pub struct JitRegs {
     /// code; they cannot change while it runs. Translated code that sets
     /// sstatus.SIE exits to the dispatcher if any.
     pub irq_pending: u32,
+    /// Translator dispatcher state of this hart: interpret the next
+    /// instruction; the block the next step starts in (pc, host, code), as
+    /// chain() looked it up, valid while the translator's generation is
+    /// `next_gen`.
+    pub force_interp: bool,
+    pub next_valid: bool,
+    pub next_pc: u32,
+    pub next_host: usize,
+    pub next_code: u32,
+    pub next_gen: u32,
+    /// Multi-hart AMOs in translated code: what the lock routine stores to
+    /// lock the other harts out (the platform's choice; 0 if unused).
+    pub amo_deny: u32,
 }
 
 #[repr(C)]
@@ -156,6 +263,13 @@ pub struct Cpu {
     /// LR/SC reservation (a translator does LR/SC itself)
     pub res_valid: bool,
     pub res_addr: u32,
+    /// The value LR.W loaded: with several harts SC.W succeeds only if the
+    /// word still holds it (checked inside the bus's atomic section).
+    pub res_val: u32,
+    /// This hart's id, and what it shares with the others (null: the only
+    /// hart).
+    pub hartid: u32,
+    pub smp: *const Smp,
 
     pub(crate) ram: *mut u8,
     pub(crate) ram_base: u32,
@@ -210,40 +324,31 @@ fn imm_j(insn: u32) -> u32 {
         | ((insn >> 20) & 0x7FE)
 }
 
-impl Cpu {
-    /// # Safety
-    /// `ram` must point to `ram_size` writable bytes that outlive the `Cpu`
-    /// and are not accessed through other references while it runs.
-    pub unsafe fn new(ram: *mut u8, ram_base: u32, ram_size: u32, entry: u32, dtb: u32) -> Self {
-        let mut c = Self::fresh(ram, ram_base, ram_size, entry);
-        c.boot_regs(dtb);
-        c
-    }
-
-    /// `new`, written straight into `place` and returned from there. The
-    /// struct is ~20 KB (mostly TLB): built in place it needs no stack
-    /// frame or return slot of that size (the RP2350 stack is ~48 KB).
-    ///
-    /// # Safety
-    /// As `new`; `place` must be valid for writes and not in use.
-    pub unsafe fn init<'a>(place: *mut Cpu, ram: *mut u8, ram_base: u32, ram_size: u32, entry: u32, dtb: u32) -> &'a mut Cpu {
-        // SAFETY: per the contract.
-        unsafe {
-            place.write(Self::fresh(ram, ram_base, ram_size, entry));
-            let c = &mut *place;
-            c.boot_regs(dtb);
-            c
-        }
-    }
-
-    #[inline(always)]
-    fn fresh(ram: *mut u8, ram_base: u32, ram_size: u32, entry: u32) -> Self {
-        Cpu {
+/// A fresh `Cpu`'s fields but its TLB, handed to `$m` (`Cpu::fresh` builds
+/// the struct from them, `Cpu::init` writes them in place).
+macro_rules! cpu_fields {
+    ($m:ident, $ram:expr, $ram_base:expr, $ram_size:expr, $entry:expr) => {
+        $m! {
             #[cfg(feature = "pv-buffers")]
             native_workspace: core::ptr::null_mut(),
             x: [0; 32],
-            pc: entry,
-            jit: JitRegs { budget: 0, exit_pc: 0, exit_info: 0, host_sp: 0, tlb_cur: [0; ACC_N], jc_base: 0, irq_pending: 0 },
+            pc: $entry,
+            jit: JitRegs {
+                budget: 0,
+                exit_pc: 0,
+                exit_info: 0,
+                host_sp: 0,
+                tlb_cur: [0; ACC_N],
+                jc_base: 0,
+                irq_pending: 0,
+                force_interp: false,
+                next_valid: false,
+                next_pc: 0,
+                next_host: 0,
+                next_code: 0,
+                next_gen: 0,
+                amo_deny: 0,
+            },
             privilege: Priv::S,
             mmu_idx: MMU_S,
             sie_bit: false,
@@ -265,9 +370,12 @@ impl Cpu {
             time_skip: 0,
             res_valid: false,
             res_addr: 0,
-            ram,
-            ram_base,
-            ram_size,
+            res_val: 0,
+            hartid: 0,
+            smp: core::ptr::null(),
+            ram: $ram,
+            ram_base: $ram_base,
+            ram_size: $ram_size,
             ro_size: 0,
             code_pages: core::ptr::null(),
             smc_page: None,
@@ -276,8 +384,71 @@ impl Cpu {
             native_job_dst: None,
             halt: None,
             stats: Stats::new(),
-            inst: Instrument::new(ram_size),
-            tlb: [[[TlbEntry { tag: 0, addend: 0 }; TLB_SIZE]; ACC_N]; MMU_N],
+            inst: Instrument::new($ram_size),
+        }
+    };
+}
+
+impl Cpu {
+    /// # Safety
+    /// `ram` must point to `ram_size` writable bytes that outlive the `Cpu`
+    /// and are not accessed through other references while it runs.
+    pub unsafe fn new(ram: *mut u8, ram_base: u32, ram_size: u32, entry: u32, dtb: u32) -> Self {
+        let mut c = Self::fresh(ram, ram_base, ram_size, entry);
+        c.boot_regs(dtb);
+        c
+    }
+
+    /// `new`, written straight into `place` and returned from there. The
+    /// struct is ~20 KB (mostly TLB): it is written field by field and the
+    /// TLB entry by entry, so no frame or temporary of that size is needed
+    /// whatever the inliner does (the RP2350's stacks are a few KB).
+    ///
+    /// # Safety
+    /// As `new`; `place` must be valid for writes and not in use.
+    pub unsafe fn init<'a>(place: *mut Cpu, ram: *mut u8, ram_base: u32, ram_size: u32, entry: u32, dtb: u32) -> &'a mut Cpu {
+        macro_rules! put {
+            ($($(#[$a:meta])* $f:ident: $v:expr,)*) => {
+                $(
+                    $(#[$a])*
+                    // SAFETY: a field of `place` (per the contract).
+                    unsafe { core::ptr::addr_of_mut!((*place).$f).write($v) };
+                )*
+            };
+        }
+        cpu_fields!(put, ram, ram_base, ram_size, entry);
+        // SAFETY: as above.
+        let tlb = unsafe { core::ptr::addr_of_mut!((*place).tlb).cast::<TlbEntry>() };
+        for i in 0..MMU_N * ACC_N * TLB_SIZE {
+            // SAFETY: inside the TLB array.
+            unsafe { tlb.add(i).write(TlbEntry { tag: 0, addend: 0 }) };
+        }
+        // SAFETY: every field is written.
+        let c = unsafe { &mut *place };
+        c.boot_regs(dtb);
+        c
+    }
+
+    #[inline(always)]
+    fn fresh(ram: *mut u8, ram_base: u32, ram_size: u32, entry: u32) -> Self {
+        macro_rules! lit {
+            ($($(#[$a:meta])* $f:ident: $v:expr,)*) => {
+                Cpu { $($(#[$a])* $f: $v,)* tlb: [[[TlbEntry { tag: 0, addend: 0 }; TLB_SIZE]; ACC_N]; MMU_N] }
+            };
+        }
+        cpu_fields!(lit, ram, ram_base, ram_size, entry)
+    }
+
+    /// A native buffer call wrote guest RAM (`take_native_write` has it).
+    #[inline(always)]
+    pub fn has_native_write(&self) -> bool {
+        #[cfg(feature = "pv-buffers")]
+        {
+            self.native_write.is_some()
+        }
+        #[cfg(not(feature = "pv-buffers"))]
+        {
+            false
         }
     }
 
@@ -315,7 +486,7 @@ impl Cpu {
         if self.time() >= self.stimecmp {
             p |= MIP_STIP;
         }
-        if bus.external_irq() {
+        if bus.external_irq_hart(self.hartid) {
             p |= MIP_SEIP;
         }
         p
@@ -387,6 +558,9 @@ impl Cpu {
     #[inline]
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn check_irq<B: Bus>(&mut self, bus: &B) -> bool {
+        if !self.smp.is_null() {
+            self.smp_poll();
+        }
         let p = self.sip_value(bus) & self.sie;
         // for translated code that sets SIE (rvjit)
         self.jit.irq_pending = p;
@@ -402,6 +576,68 @@ impl Cpu {
         };
         self.trap(CAUSE_IRQ | irq, 0);
         true
+    }
+
+    /// Multi-hart: take IPIs and remote fences sent to this hart, and keep
+    /// its time with the other harts'.
+    #[inline(never)]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn smp_poll(&mut self) {
+        use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+        // SAFETY: non-null `smp` points to the machine's shared block.
+        let smp = unsafe { &*self.smp };
+        let h = self.hartid as usize;
+        if smp.ipi[h].load(Relaxed) != 0 && smp.ipi[h].swap(0, AcqRel) != 0 {
+            self.sip |= MIP_SSIP;
+        }
+        if smp.fence[h].load(Relaxed) != 0 {
+            let f = smp.fence[h].swap(0, AcqRel);
+            if f & FENCE_VMA != 0 {
+                self.tlb_flush_all();
+            }
+        }
+        self.smp_sync_time(smp);
+    }
+
+    /// `time = max` over the harts; publish this hart's.
+    #[inline(always)]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn smp_sync_time(&mut self, smp: &Smp) {
+        let h = self.hartid as usize;
+        let mut t = self.time();
+        for o in 0..smp.nharts as usize {
+            if o != h {
+                let ot = smp.time_of(o);
+                if ot > t {
+                    self.time_skip += ot - t;
+                    t = ot;
+                }
+            }
+        }
+        smp.publish_time(h, t);
+    }
+
+    /// Start this (secondary) hart as SBI HSM hart_start asked: S-mode,
+    /// translation off, a0 = hartid, a1 = the opaque argument.
+    pub fn hsm_start(&mut self, pc: u32, arg: u32) {
+        self.pc = pc;
+        self.x = [0; 32];
+        self.x[10] = self.hartid;
+        self.x[11] = arg;
+        self.privilege = Priv::S;
+        self.sie_bit = false;
+        self.spie = false;
+        self.spp = false;
+        self.sum = false;
+        self.mxr = false;
+        self.sie = 0;
+        self.sip = 0;
+        self.satp = 0;
+        self.stimecmp = u64::MAX;
+        self.res_valid = false;
+        self.halt = None;
+        self.update_mmu_idx();
+        self.tlb_flush_all();
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
@@ -765,7 +1001,25 @@ impl Cpu {
                         let v = self.mem_load(bus, a, 4).map_err(|e| (e, a))?;
                         self.res_valid = true;
                         self.res_addr = a;
+                        self.res_val = v;
                         Some(v)
+                    }
+                    0x03 if !self.smp.is_null() => {
+                        let r = if self.res_valid && self.res_addr == a {
+                            let h = self.amo_ptr(a).map_err(|e| (e, a))?;
+                            bus.atomic_begin();
+                            // SAFETY: as for the AMOs below.
+                            let ok = unsafe { core::ptr::read_volatile(h as *const u32) } == self.res_val;
+                            if ok {
+                                unsafe { core::ptr::write_volatile(h as *mut u32, b) };
+                            }
+                            bus.atomic_end();
+                            u32::from(!ok)
+                        } else {
+                            1
+                        };
+                        self.res_valid = false;
+                        Some(r)
                     }
                     0x03 => {
                         let r = if self.res_valid && self.res_addr == a {
@@ -780,9 +1034,13 @@ impl Cpu {
                     _ => {
                         let h = self.amo_ptr(a).map_err(|e| (e, a))?;
                         self.inst.store(self.host_off(h), 4);
+                        let smp = !self.smp.is_null();
+                        if smp {
+                            bus.atomic_begin();
+                        }
                         // SAFETY: amo_ptr returned a pointer into guest RAM,
                         // 4-byte aligned within one page.
-                        let old = unsafe { core::ptr::read_unaligned(h as *const u32) };
+                        let old = unsafe { core::ptr::read_volatile(h as *const u32) };
                         let nv = match f5 {
                             0x00 => old.wrapping_add(b),
                             0x01 => b,
@@ -793,9 +1051,17 @@ impl Cpu {
                             0x14 => (old as i32).max(b as i32) as u32,
                             0x18 => old.min(b),
                             0x1C => old.max(b),
-                            _ => return illegal,
+                            _ => {
+                                if smp {
+                                    bus.atomic_end();
+                                }
+                                return illegal;
+                            }
                         };
-                        unsafe { core::ptr::write_unaligned(h as *mut u32, nv) };
+                        unsafe { core::ptr::write_volatile(h as *mut u32, nv) };
+                        if smp {
+                            bus.atomic_end();
+                        }
                         Some(old)
                     }
                 }

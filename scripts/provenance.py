@@ -42,7 +42,7 @@ def source_state():
 def snapshot():
     sources = source_state()
     guests = {str(p.relative_to(ROOT)): digest(p)
-              for folder in ('out', 'out-disk')
+              for folder in ('out', 'out-disk', 'out-disk/smp')
               for p in (ROOT / 'guest' / folder).glob('*')
               if p.is_file() and p.name != 'build.json'}
     versions = {name: output(*command) for name, command in {

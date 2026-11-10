@@ -34,6 +34,9 @@ CONFIG_VIRTIO_NET=y
 # CONFIG_WLAN is not set
 # memory: the guest has 8 MiB less 64 KiB (the native engine) in all
 CONFIG_BASE_SMALL=y
+# compaction: moves pages to rebuild the contiguous blocks that multi-page
+# kernel allocations need, so a fragmented heap doesn't invoke the OOM killer
+CONFIG_COMPACTION=y
 # 1 KiB instead of 256 KiB (RFC 6056 port perturbation; one host)
 CONFIG_INET_TABLE_PERTURB_ORDER=8
 # overlayfs wants xattrs on its tmpfs upper layer
@@ -67,6 +70,14 @@ CONFIG_SPI=y
 CONFIG_SPI_MASTER=y
 CONFIG_RVEMU_SPI=y
 CONFIG_SPI_SPIDEV=y
+# the SD card on SPI1 (/dev/mmcblk0), FAT on it
+CONFIG_MMC=y
+CONFIG_MMC_BLOCK=y
+CONFIG_MMC_SPI=y
+CONFIG_VFAT_FS=y
+CONFIG_NLS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
 CONFIG_PWM=y
 CONFIG_RVEMU_PWM=y
 CONFIG_IIO=y
