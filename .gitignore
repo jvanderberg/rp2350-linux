@@ -21,3 +21,5 @@ __pycache__/
 /rvemu/rvemu
 
 /.cache/
+# a local checkout of playit-cloud/playit-agent (tunnel), not part of the project
+/rvemu-rs/playit-agent/
