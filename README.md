@@ -144,21 +144,26 @@ The board has no SFTP server, so the Mac's `scp` needs `-O`.
 ## Claude Code
 
 `claude-remote` runs Claude Code on another machine (one with `claude`
-installed, such as the Mac) while every file it reads, edits, searches and
-every shell command it runs happens on the board. The board opens two ssh
-sessions to that machine: one carries `claude-guest-mcp`, a small static
-MCP tool server on the board, to a Unix socket there; the other runs
-`claude` with that socket as its only tool server and its own file and
-shell tools switched off. Nothing is installed on the other machine beyond
-`claude` and `socat` or `python3`.
+installed, such as the Mac) and hands it the board's files and shell as
+tools. The board opens two ssh sessions to that machine: one carries
+`claude-guest-mcp`, a small static MCP tool server on the board, to a Unix
+socket there; the other runs `claude` with that socket as its tool server.
+Nothing is installed on the other machine beyond `claude` and `socat` or
+`python3`.
+
+Claude keeps its own tools on the other machine, in a scratch directory
+(`~/.claude-remote/NAME`), and is told to do heavy work there (downloads,
+unpacking, cross-compiling, searching big trees) and to copy results to the
+board with `scp` run on the board. Big jobs on the board itself can stall
+it for minutes: it has 8 MiB of RAM and a slow SD card.
 
 ```
-claude-remote [-d DIR] [-i KEY] [--claude CMD] [--keep-native] user@host [-- claude args]
+claude-remote [-d DIR] [-i KEY] [--claude CMD] [--device-only] user@host [-- claude args]
 ```
 
-`-d` is the directory Claude works in (default: the current one).
-`--keep-native` leaves Claude's own tools on, so it can also work on files
-on the remote machine. Arguments after `--` go to `claude`.
+`-d` is the board directory Claude works on (default: the current one).
+`--device-only` switches Claude's own tools off, so it can only work
+through the board. Arguments after `--` go to `claude`.
 
 For a session without password prompts, give the board a key and put its
 public half in the other machine's `~/.ssh/authorized_keys`; the key lives
@@ -171,7 +176,7 @@ in `/root/.ssh`, on flash:
 ```
 
 Commands Claude runs on the board get BusyBox sh and the board's tools,
-including `cc`; it is told to keep them small.
+including `cc` and `scp`; it is told to keep them small.
 
 ## C compiler
 

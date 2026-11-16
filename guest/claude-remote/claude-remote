@@ -1,15 +1,15 @@
 #!/bin/sh
-# claude-remote: run Claude Code on another machine while it works on files HERE,
-# with every file read, edit and shell command carried over ssh. Nothing to install on
-# the remote beyond claude and socat (or python3). Written for the rp2350 Linux guest:
-# BusyBox ash, Dropbear dbclient and claude-guest-mcp (a 60 KB static binary).
+# claude-remote: run Claude Code on another machine and give it this device's files
+# and shell as MCP tools, carried over ssh. Nothing to install on the remote beyond
+# claude and socat (or python3). Written for the rp2350 Linux guest: BusyBox ash,
+# Dropbear dbclient and claude-guest-mcp (a 60 KB static binary).
 #
-#   claude-remote [-d DIR] [-i KEY] [--claude CMD] [--keep-native] user@host [-- claude args]
+#   claude-remote [-d DIR] [-i KEY] [--claude CMD] [--device-only] user@host [-- claude args]
 #
 # Session 1 (no tty) runs the MCP tool server here and pipes it to a unix socket on the
 # remote. Session 2 (tty) runs claude there, configured to use that socket as an MCP server.
-# Claude's own Read/Edit/Bash tools are disabled so it uses the device's tools, unless
-# --keep-native is given. Without a key the password is asked once and reused.
+# Claude keeps its own tools on the remote (in ~/.claude-remote/NAME there) for heavy
+# work; --device-only switches them off. Without a key the password is asked once and reused.
 
 set -u
 
@@ -17,7 +17,7 @@ DIR=$PWD
 KEY=
 CLAUDE=claude
 REMOTE=
-KEEP=
+DEVICE_ONLY=
 SERVER=${CLAUDE_GUEST_MCP:-}
 
 while [ $# -gt 0 ]; do
@@ -25,7 +25,8 @@ while [ $# -gt 0 ]; do
     -d) DIR=$2; shift 2 ;;
     -i) KEY=$2; shift 2 ;;
     --claude) CLAUDE=$2; shift 2 ;;
-    --keep-native) KEEP=1; shift ;;
+    --device-only) DEVICE_ONLY=1; shift ;;
+    --keep-native) shift ;;   # the default now; kept so old command lines work
     --) shift; break ;;
     -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option $1" >&2; exit 2 ;;
@@ -80,10 +81,14 @@ while fds:
 
 MCP_JSON="{\"mcpServers\":{\"device\":{\"command\":\"sh\",\"args\":[\"-c\",\"exec socat STDIO UNIX-CONNECT:'$SOCK' 2>/dev/null || exec python3 -c 'import socket,sys,os,select;c=socket.socket(socket.AF_UNIX);c.connect(sys.argv[1]);fds=[c.fileno(),0]\\nwhile 1:\\n r,_,_=select.select(fds,[],[])\\n if c.fileno() in r:\\n  d=c.recv(65536)\\n  if not d: break\\n  os.write(1,d)\\n if 0 in r:\\n  d=os.read(0,65536)\\n  if not d: break\\n  c.sendall(d)' '$SOCK'\"]}}}"
 
-PROMPT="The project files live on a separate device (an RP2350 running Linux) and are reachable ONLY through the mcp__device__* tools. Use them for every file read, edit, search and shell command. Shell commands run on that device under BusyBox sh with a small toolset and 8 MiB of RAM: keep them short and avoid heavy jobs. Paths are relative to the project root $DIR."
-
-NATIVE=
-[ -z "$KEEP" ] && NATIVE="--disallowedTools Read,Edit,Write,MultiEdit,NotebookEdit,Bash,Glob,Grep,LS"
+DEVICE="The project files live on a separate device (an RP2350 running Linux), reachable through the mcp__device__* tools; paths there are relative to the project root $DIR. Its shell is BusyBox sh with a small toolset, 8 MiB of RAM and a slow SD card: a big job there (unpacking archives, large builds, searching big trees, long loops) can freeze the device for minutes."
+if [ -n "$DEVICE_ONLY" ]; then
+  PROMPT="$DEVICE The mcp__device__* tools are your only tools: keep every command short and light."
+  NATIVE="--disallowedTools Read,Edit,Write,MultiEdit,NotebookEdit,Bash,Glob,Grep,LS"
+else
+  PROMPT="$DEVICE You are running on a different, much faster machine, $REMOTE, and your own tools (Read, Edit, Write, Bash, Glob, Grep, ...) work there, in a scratch directory; the device's paths do not exist on it. Use the device tools for the project's files and for running and testing things on the device. Do heavy work on $REMOTE with your own tools: downloading, unpacking, cross-compiling, building, searching large trees. Move results to the device by running scp on the device (mcp__device__bash): scp $REMOTE:/absolute/path/on/this/machine destination; the device can log in to $REMOTE the same way this session did."
+  NATIVE=
+fi
 
 RUN_CMD="WORK=\"\$HOME/.claude-remote/$NAME\"; mkdir -p \"\$WORK\"; cd \"\$WORK\"
 i=0; until [ -S '$SOCK' ]; do i=\$((i+1)); [ \$i -ge 300 ] && { echo 'claude-remote: bridge never came up' >&2; exit 1; }; sleep 0.1; done

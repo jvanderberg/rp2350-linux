@@ -87,7 +87,7 @@ fn handle(ctx: &tools::Ctx, req: &Value, out: &mut Vec<u8>) {
             r.extend_from_slice(b",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"claude-guest-mcp\",\"version\":\"0.2\"},\"instructions\":");
             json::write_str(
                 &alloc::format!(
-                    "The project files live on this device at {}. Use these tools for all file and shell operations; the files are not reachable any other way.",
+                    "The project files live on this device at {}; these tools read, edit and run them there. The device is small (8 MiB of RAM, a slow SD card): keep shell commands light.",
                     ctx.root
                 ),
                 &mut r,
