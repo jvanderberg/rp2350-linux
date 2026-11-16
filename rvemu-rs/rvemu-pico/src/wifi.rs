@@ -410,17 +410,35 @@ async fn run(pwr: Pwr, spi: PioSpi, creds: Option<Creds>) {
             rprintln!("[wifi] no network configured (scripts/pico-wifi.sh)");
             return;
         };
+        // Join, and join again when the link stays down: the chip
+        // reassociates by itself after most losses, but not all (a deauth it
+        // didn't recover from once left the board off the network for good).
+        // Failed joins back off, so an absent network costs one attempt
+        // every few minutes.
+        let mut wait_s = JOIN_RETRY_MIN_S;
         loop {
             match control.join(c.ssid, cyw43::JoinOptions::new(c.pass)).await {
                 Ok(()) => {
                     rprintln!("[wifi] joined {:?}", c.ssid);
-                    return;
+                    wait_s = JOIN_RETRY_MIN_S;
                 }
                 Err(e) => {
-                    rprintln!("[wifi] join {:?} failed: {:?}; retrying", c.ssid, e);
-                    embassy_time::Timer::after_secs(3).await;
+                    rprintln!("[wifi] join {:?} failed: {:?}; again in {} s", c.ssid, e, wait_s);
+                    embassy_time::Timer::after_secs(wait_s.into()).await;
+                    wait_s = (wait_s * 2).min(JOIN_RETRY_MAX_S);
+                    continue;
                 }
             }
+            // LINK_UP follows the driver's link state (`poll`, on this core);
+            // the chip gets LINK_DOWN_REJOIN_S to recover by itself
+            let mut down_s = 0;
+            while down_s < LINK_DOWN_REJOIN_S {
+                embassy_time::Timer::after_secs(1).await;
+                down_s = if LINK_UP.load(Ordering::Relaxed) { 0 } else { down_s + 1 };
+            }
+            REJOINS.fetch_add(1, Ordering::Relaxed);
+            rprintln!("[wifi] link down for {} s; joining again", LINK_DOWN_REJOIN_S);
+            control.leave().await;
         }
     };
     embassy_futures::join::join(runner.run(), control_task).await;
@@ -466,6 +484,15 @@ pub static RADIO: AtomicU32 = AtomicU32::new(RADIO_STARTING);
 /// The MAC, bytes 0-3 and 4-5, little-endian.
 pub static MAC: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 pub static LINK_UP: AtomicBool = AtomicBool::new(false);
+/// Seconds the link may be down (after a join) before the firmware leaves
+/// and joins again: room for the chip's own reassociation (a roam, the
+/// access point restarting its radio).
+const LINK_DOWN_REJOIN_S: u32 = 30;
+/// A failed join is tried again after this, doubling up to the max.
+const JOIN_RETRY_MIN_S: u32 = 5;
+const JOIN_RETRY_MAX_S: u32 = 300;
+/// Joins after the first, for diagnostics.
+pub static REJOINS: AtomicU32 = AtomicU32::new(0);
 
 /// core1's radio service: drives the driver, moves frames between it and
 /// the rings, publishes the MAC and the link state.
