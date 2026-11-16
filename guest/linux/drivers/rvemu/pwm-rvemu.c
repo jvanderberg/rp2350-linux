@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * PWM controller of the rvemu machine (rvemu-rs/rvcore/src/periph.rs). PWM
  * channel N drives GPIO N: the emulator routes the pin to the RP2350 PWM
@@ -121,3 +121,5 @@ static struct platform_driver rvemu_pwm_driver = {
 	},
 };
 builtin_platform_driver(rvemu_pwm_driver);
+
+MODULE_LICENSE("GPL");

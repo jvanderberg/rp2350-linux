@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * ADC of the rvemu machine (rvemu-rs/rvcore/src/periph.rs): the RP2350B's
  * 12-bit SAR ADC. Reading register 4*N converts channel N and returns the
@@ -111,3 +111,5 @@ static struct platform_driver rvemu_adc_driver = {
 	},
 };
 builtin_platform_driver(rvemu_adc_driver);
+
+MODULE_LICENSE("GPL");

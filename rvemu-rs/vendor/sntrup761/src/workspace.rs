@@ -1,3 +1,6 @@
+// Added for rp2350-linux (see ../PROVENANCE).
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Josh Vanderberg
 //! Reusable scalar scratch storage, added by rvemu. Arithmetic is unchanged.
 use crate::P;
 use zeroize::{Zeroize, ZeroizeOnDrop};

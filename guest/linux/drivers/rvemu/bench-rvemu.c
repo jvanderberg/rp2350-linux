@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /* /dev/rvemu-bench: benchmark points for the rvemu machine's firmware (SBI
  * extension 0x0a000002), which records cycle counts at each point and
  * prints them on its console on RVEMU_BENCH_REPORT (rvemu-ssh.h). No

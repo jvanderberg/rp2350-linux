@@ -462,3 +462,20 @@ in step with wall time, while `pio_clock_hz` reports 150 MHz. A program
 therefore behaves as on the board, but more slowly. `irq` and `wait irq`
 on neighbouring blocks (`prev`/`next`) aren't simulated. See
 [rvemu-rs/README.md](../../../../rvemu-rs/README.md).
+
+## License
+
+libpio is MIT (`src/LICENSE`). Three parts come from Raspberry Pi's
+pico-sdk and pico-examples and are BSD-3-Clause
+(`src/LICENSE-BSD-3-Clause`), each marked in its file:
+
+- `src/examples/ws2812.pio`: pico-examples' WS2812 program and its init
+  function.
+- `src/pio.h`: `enum pio_src_dest` (the SDK's values) and the `pio_encode_*`
+  instruction encoders.
+- `src/pioasm-main.c`: the header pioasm writes, in the SDK pioasm's c-sdk
+  format.
+
+The tests' `test/corpus.pio` also holds five pico-examples programs.
+`rvemu-pio.h` is the kernel driver's uapi header (`GPL-2.0-only WITH
+Linux-syscall-note`); `pio.c` includes it and nothing of it is installed.

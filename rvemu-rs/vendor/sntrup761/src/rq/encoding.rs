@@ -1,3 +1,5 @@
+// Modified for rp2350-linux: see ../../PROVENANCE for what changed.
+// sntrup761 0.4.0, MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).
 use crate::rq::modq;
 use crate::{PUBLIC_KEY_SIZE, ROUNDED_ENCODE_SIZE};
 

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Josh Vanderberg
+ * The instruction encoders below are BSD-3-Clause (SPDX-Snippet). */
 /* libpio: the RP2350's PIO1 and PIO2 from Linux programs on rp2350-linux.
  *
  * The functions are the pico-sdk's hardware_pio ones (pio_add_program,
@@ -314,6 +317,38 @@ int pio_sm_dma_read(PIO pio, uint sm, void *data, size_t bytes, uint size);
 
 /* ------------------------------------------------------------ instructions */
 
+/* From here to SPDX-SnippetEnd follows the pico-sdk's
+ * hardware/pio_instructions.h (https://github.com/raspberrypi/pico-sdk):
+ * enum pio_src_dest is the SDK's, its values the SDK's own flag bits
+ * (_PIO_INVALID_*_SRC/DEST, PICO_PIO_VERSION 0) written out; the
+ * pio_encode_* functions are the SDK's names and signatures, and
+ * pio_encode_sideset, pio_encode_sideset_opt and pio_encode_nop the same
+ * expressions.
+ *
+ * SPDX-SnippetBegin
+ * SPDX-SnippetCopyrightText: Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
+ * following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following
+ *    disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following
+ *    disclaimer in the documentation and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products
+ *    derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 enum pio_src_dest {
     pio_pins = 0u,
     pio_x = 1u,
@@ -370,6 +405,7 @@ static inline uint pio_encode_irq_wait(bool relative, uint irq) { return _pio_en
 static inline uint pio_encode_irq_clear(bool relative, uint irq) { return _pio_encode(6, 2, (relative ? 0x10 : 0) | irq); }
 static inline uint pio_encode_set(enum pio_src_dest dest, uint value) { return _pio_encode(7, dest, value); }
 static inline uint pio_encode_nop(void) { return pio_encode_mov(pio_y, pio_y); }
+/* SPDX-SnippetEnd */
 
 /* ------------------------------------------------------------ the assembler */
 

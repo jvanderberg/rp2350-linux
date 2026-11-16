@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * I2C controller of the rvemu machine (rvemu-rs/rvcore/src/periph.rs), on one
  * of the RP2350's I2C blocks. The emulator runs a whole transfer while the
@@ -122,3 +122,5 @@ static struct platform_driver rvemu_i2c_driver = {
 	},
 };
 builtin_platform_driver(rvemu_i2c_driver);
+
+MODULE_LICENSE("GPL");

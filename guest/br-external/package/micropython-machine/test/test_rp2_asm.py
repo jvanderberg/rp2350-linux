@@ -75,6 +75,14 @@ SINGLE = [
 
 # whole programs (labels, jmps, wrap, side-set): rp2 body, pioasm body
 PROGRAMS = [
+    # The WS2812 program: pico-examples' pio/ws2812/ws2812.pio, and in rp2's
+    # syntax MicroPython's examples/rp2/pio_ws2812.py, with T1-T3 written out.
+    # SPDX-SnippetBegin
+    # SPDX-SnippetCopyrightText: Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+    # SPDX-SnippetCopyrightText: Copyright (c) 2013-2021 Damien P. George
+    # SPDX-License-Identifier: BSD-3-Clause AND MIT
+    # The license texts: guest/br-external/package/libpio/src/LICENSE-BSD-3-Clause
+    # and ../LICENSE-micropython
     (
         "sideset_init=rp2.PIO.OUT_LOW",
         """
@@ -98,6 +106,7 @@ do_zero:
 .wrap
 """,
     ),
+    # SPDX-SnippetEnd
     (
         "",
         """

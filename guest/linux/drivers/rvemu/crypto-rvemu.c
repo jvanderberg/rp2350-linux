@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /* /dev/rvemu-crypto: the rvemu machine's native buffer engine, one operation
  * per ioctl (rvemu-crypto.h). Keys and random seeds come from the caller.
  * Operations share the engine's kernel bounce buffers, one at a time; a

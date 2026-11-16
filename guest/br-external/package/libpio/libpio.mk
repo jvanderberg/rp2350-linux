@@ -7,7 +7,12 @@
 LIBPIO_VERSION = 1.0
 LIBPIO_SITE = $(BR2_EXTERNAL_RVEMU_PATH)/package/libpio/src
 LIBPIO_SITE_METHOD = local
-LIBPIO_LICENSE = MIT
+# examples/ws2812.pio, the instruction encoders in pio.h and pioasm's header
+# format are from the pico-sdk and pico-examples (BSD-3-Clause, marked in
+# each file). rvemu-pio.h, which pio.c includes, is the kernel's uapi header
+# (GPL-2.0-only WITH Linux-syscall-note): included, not installed.
+LIBPIO_LICENSE = MIT, BSD-3-Clause
+LIBPIO_LICENSE_FILES = LICENSE LICENSE-BSD-3-Clause
 LIBPIO_INSTALL_STAGING = YES
 LIBPIO_HEADERS = $(BR2_EXTERNAL_RVEMU_PATH)/../linux/drivers/rvemu
 

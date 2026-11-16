@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Josh Vanderberg
 //! Wi-Fi for the guest: the RM2 module's CYW43439 (stock Pico 2 W wiring:
 //! WL_ON GP23, data/IRQ GP24, CS GP25, clock GP29) run by the `cyw43` driver,
 //! its Ethernet frames passed to and from the guest's virtio-net device.
@@ -11,6 +13,13 @@
 //! All of this runs on core1 (`core1.rs`), from SRAM. Frames reach the
 //! guest's virtio-net on core0 through two `FrameRing`s (`NET_RX`, `NET_TX`);
 //! the MAC and link state are published in `RADIO`, `MAC` and `LINK_UP`.
+//!
+//! `PioSpi` (between the SPDX-Snippet lines) is ported from embassy's
+//! `cyw43-pio` (cyw43-pio/src/lib.rs, https://github.com/embassy-rs/embassy):
+//! its low-speed PIO program with its comments, and the `write`/`read`
+//! transactions. Copyright (c) Embassy project contributors, MIT OR
+//! Apache-2.0, used here under MIT: ../LICENSE-cyw43-pio. The rest of the
+//! file is this project's (MIT).
 
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
@@ -88,6 +97,9 @@ fn wr(a: usize, v: u32) {
     unsafe { write_volatile(a as *mut u32, v) }
 }
 
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: Copyright (c) Embassy project contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 pub struct PioSpi {
     cs: GpioPin<Gpio25, FunctionSioOutput, PullDown>,
     /// Owned so nothing else claims SM0; driven through its registers.
@@ -289,6 +301,8 @@ impl SpiBusCyw43 for PioSpi {
         .await
     }
 }
+
+// SPDX-SnippetEnd
 
 trait InfallibleOutput {
     fn set_low_infallible(&mut self);

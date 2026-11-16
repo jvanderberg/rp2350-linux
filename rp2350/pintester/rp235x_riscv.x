@@ -1,3 +1,8 @@
+/* From rp-hal's rp235x-hal-examples/rp235x_riscv.x (https://github.com/rp-rs/rp-hal),
+ * unmodified. License text: rp2350/LICENSE-rp-hal.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2024 The rp-rs Developers
+ * SPDX-License-Identifier: MIT OR Apache-2.0
+ */
 MEMORY {
     /*
      * The RP2350 has either external or internal flash.

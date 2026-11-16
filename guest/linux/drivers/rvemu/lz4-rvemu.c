@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * squashfs's LZ4 blocks decoded by the rvemu machine's native engine (SBI
  * extension RVEMU_NATIVE_EXT, operation 0: a raw LZ4 block), on guest
@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <asm/sbi.h>
 #include "rvemu-native.h"
 #include "rvemu-lz4.h"
@@ -40,3 +41,5 @@ static int __init rl_init(void)
 }
 /* before the root filesystem is mounted (after every initcall) */
 device_initcall(rl_init);
+
+MODULE_LICENSE("GPL");

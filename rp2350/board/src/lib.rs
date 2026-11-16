@@ -8,6 +8,22 @@
 //!   enter QPI, program M1 timing/format.
 //! - Hazard3 counters, and TIMER0.DBGPAUSE, which otherwise stops the timer
 //!   whenever a debugger halts a core.
+//!
+//! LICENSE UNRESOLVED. The PSRAM code here (the CMD_ and KGD_ constants,
+//! the csr_* and direct_mode_* helpers, psram_read_id, psram_qmi_setup,
+//! psram_init's timing arithmetic and detect_size) follows FanPico's
+//! src/psram.c (https://github.com/tjko/fanpico) closely, through
+//! ../psramtest: the same functions, names, constants and steps.
+//!   Copyright (C) 2025 Timo Kokkonen <tjko@iki.fi>
+//!   License: GPL-3.0-or-later
+//! If it is a derived work, those parts are GPL-3.0-or-later, not MIT. This
+//! is open for the owner to settle (see CONTRIBUTING.md); until then this
+//! file carries no SPDX line of its own.
+//!
+//! `vreg_set_voltage` is a port of the pico-sdk's (src/rp2_common/hardware_vreg,
+//! https://github.com/raspberrypi/pico-sdk), Copyright (c) 2020 Raspberry Pi
+//! (Trading) Ltd., BSD-3-Clause; the license text is
+//! rp2350/LICENSE-BSD-3-Clause.
 #![no_std]
 
 use core::arch::asm;
@@ -206,6 +222,9 @@ fn flash_slow_timing() {
     }
 }
 
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+// SPDX-License-Identifier: BSD-3-Clause
 /// Port of the Pico SDK's vreg_set_voltage for RP2350 (POWMAN).
 #[cfg(feature = "overclock")]
 fn vreg_set_voltage(vsel: u32) {
@@ -216,6 +235,7 @@ fn vreg_set_voltage(vsel: u32) {
     wr(VREG, PASSWORD | cur | vsel << VREG_VSEL_LSB);
     while rd(VREG) & VREG_UPDATE_IN_PROGRESS != 0 {}
 }
+// SPDX-SnippetEnd
 
 /// Bring up the clocks (see the crate docs) and return the clock manager.
 #[cfg(not(feature = "overclock"))]

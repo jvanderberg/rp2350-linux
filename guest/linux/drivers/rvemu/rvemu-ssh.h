@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /* /dev/rvemu-ssh (ssh-rvemu.c): SSH packets, and /dev/rvemu-bench
  * (bench-rvemu.c): benchmark points. Fixed-width RV32 ABI. */
 #ifndef RVEMU_SSH_H

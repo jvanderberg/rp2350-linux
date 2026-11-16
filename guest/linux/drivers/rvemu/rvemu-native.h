@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Kernel-internal: one operation of the rvemu machine's native buffer engine
  * (SBI extension RVEMU_NATIVE_EXT), shared by crypto-rvemu.c and
  * ssh-rvemu.c. */

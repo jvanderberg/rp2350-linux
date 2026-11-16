@@ -8,6 +8,7 @@ PINS_EXAMPLES_VERSION = 1.0
 PINS_EXAMPLES_SITE = $(BR2_EXTERNAL_RVEMU_PATH)/package/pins-examples/src
 PINS_EXAMPLES_SITE_METHOD = local
 PINS_EXAMPLES_LICENSE = MIT
+PINS_EXAMPLES_LICENSE_FILES = LICENSE
 PINS_EXAMPLES_PROGS = gpio-blink gpio-edge i2c-scan spi-xfer adc-read
 
 # the image carries the sources (to compile on the board) and the programs

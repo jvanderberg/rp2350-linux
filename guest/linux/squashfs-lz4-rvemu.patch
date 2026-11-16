@@ -1,3 +1,7 @@
+SPDX-License-Identifier: GPL-2.0-only
+A change to a file of the Linux kernel, under the kernel's license (see
+COPYING). Applied by guest/build.sh (patch_stock).
+
 --- a/fs/squashfs/lz4_wrapper.c	2026-11-15 16:11:53.427197055 -0600
 +++ b/fs/squashfs/lz4_wrapper.c	2026-11-15 16:11:53.547715869 -0600
 @@ -15,6 +15,16 @@

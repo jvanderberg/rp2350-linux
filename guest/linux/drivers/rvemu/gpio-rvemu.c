@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * GPIO controller of the rvemu machine (rvemu-rs/rvcore/src/periph.rs), which
  * the emulator maps onto the RP2350's bank 0 pads.
@@ -289,3 +289,5 @@ static struct platform_driver rvemu_gpio_driver = {
 	},
 };
 builtin_platform_driver(rvemu_gpio_driver);
+
+MODULE_LICENSE("GPL");

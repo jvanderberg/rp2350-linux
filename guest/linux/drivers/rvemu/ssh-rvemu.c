@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /* /dev/rvemu-ssh: one SSH chacha20-poly1305@openssh.com packet per ioctl
  * (rvemu-ssh.h), sealed or opened by the rvemu machine's native engine.
  * Packets go through the engine's kernel bounce buffers (rvemu-native.h),
