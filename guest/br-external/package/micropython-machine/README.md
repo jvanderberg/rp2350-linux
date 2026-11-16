@@ -219,3 +219,10 @@ A small C module, for `rp2.py`:
 | `_rvmem.mmap(fd, length, offset=0)` | `mmap` a device file read-write and shared; returns the address |
 | `_rvmem.munmap(address, length)` | unmap it |
 | `_rvmem.read32(address)`, `_rvmem.write32(address, value)` | one aligned 32-bit load or store (`ValueError` if unaligned) |
+
+## License
+
+MIT (`LICENSE`). The assembler in `rp2.py` (`PIOASMEmit`, `asm_pio`,
+`asm_pio_encode`) is MicroPython's, from its rp2 port, (c) 2020-2021
+Damien P. George, also MIT (`LICENSE-micropython`). It is marked in the
+file.

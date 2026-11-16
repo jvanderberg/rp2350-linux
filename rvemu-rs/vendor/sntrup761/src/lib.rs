@@ -1,3 +1,5 @@
+// Modified for rp2350-linux: see ../PROVENANCE for what changed.
+// sntrup761 0.4.0, MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).
 //! # sntrup761
 //!
 //! This crate provides a pure-Rust implementation of the [Streamlined NTRU Prime 761](https://ntruprime.cr.yp.to/) post-quantum key encapsulation mechanism (KEM).

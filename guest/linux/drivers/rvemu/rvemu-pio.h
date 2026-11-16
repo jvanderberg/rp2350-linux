@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /* /dev/pio1, /dev/pio2 (pio-rvemu.c): the RP2350's PIO1 and PIO2.
  *
  * One process at a time has a block (a second open gets EBUSY); it starts

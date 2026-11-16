@@ -114,6 +114,8 @@ picotool load --ser SERIAL -v -x -t elf target/riscv32imac-unknown-none-elf/rele
 `debugprobe-v2.3.1-backup.uf2` is the firmware that board had before
 (Raspberry Pi's debugprobe 2.3.1, read back with picotool); put it back with
 `picotool load --ser SERIAL -v -x debugprobe-v2.3.1-backup.uf2`.
+It is Raspberry Pi's code and others' (MIT, BSD-3-Clause, Apache-2.0), not
+this project's: see `pintester/debugprobe-v2.3.1-backup.NOTICE.txt`.
 
 ### Wiring
 

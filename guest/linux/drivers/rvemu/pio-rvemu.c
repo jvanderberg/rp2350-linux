@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * /dev/pio1 and /dev/pio2: the rvemu machine's PIO blocks, the RP2350's
  * PIO1 and PIO2 themselves (rvemu-rs/rvcore/src/periph.rs). A program maps

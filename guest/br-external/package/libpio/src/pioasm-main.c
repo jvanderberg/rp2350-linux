@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Josh Vanderberg
+ * emit() is BSD-3-Clause (SPDX-Snippet). */
 /* pioasm: a .pio file to a C header for libpio, as the pico-sdk's pioasm
  * does it (its c-sdk output, with each program's `% c-sdk { %}` text).
  *
@@ -33,6 +36,17 @@ static char *slurp(FILE *f)
     return b;
 }
 
+/* The header emit() writes is the pico-sdk pioasm's c-sdk output
+ * (tools/pioasm/c_sdk_output.cpp, https://github.com/raspberrypi/pico-sdk):
+ * the banner, the instruction listing, the pio_program and the
+ * _get_default_config function in its words and layout. The code is
+ * libpio's, but the output text is the SDK's, so this carries its notice.
+ * The license text: LICENSE-BSD-3-Clause.
+ *
+ * SPDX-SnippetBegin
+ * SPDX-SnippetCopyrightText: Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
 static void emit(FILE *o, const pioasm_file_t *f, int force_version)
 {
     fprintf(o, "// -------------------------------------------------- //\n"
@@ -105,6 +119,7 @@ static void emit(FILE *o, const pioasm_file_t *f, int force_version)
             fwrite(f->sdk_text + f->sdk_start[k], 1, f->sdk_len[k], o), fprintf(o, "\n");
     }
 }
+/* SPDX-SnippetEnd */
 
 
 int main(int argc, char **argv)

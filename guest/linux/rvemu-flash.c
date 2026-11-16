@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * rvemu NOR flash ("rvemu,flash"): the board's /home flash region as an MTD
  * device, for jffs2. The device (rvcore/src/nor.rs) copies between flash

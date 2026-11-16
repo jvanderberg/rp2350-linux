@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /* /dev/rvemu-crypto (crypto-rvemu.c): the rvemu machine's native buffer
  * engine. Fixed-width RV32 ABI; addresses are the caller's. */
 #ifndef RVEMU_CRYPTO_H

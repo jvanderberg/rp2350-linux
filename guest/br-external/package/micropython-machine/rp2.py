@@ -28,6 +28,11 @@
 #
 # The assembler (PIOASMEmit, asm_pio, asm_pio_encode) is the rp2 port's
 # rp2.py: MIT license; Copyright (c) 2020-2021 Damien P. George.
+# Changed here: PIOASMEmit's defaults are numbers, not PIO constants, and
+# mov to pindirs is RP2350's destination 3. The license text: LICENSE-micropython.
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Josh Vanderberg (the rest of this file)
 
 from micropython import const
 import _rvmem
@@ -35,6 +40,9 @@ import fcntl
 import struct
 import uctypes
 
+# SPDX-SnippetBegin
+# SPDX-SnippetCopyrightText: Copyright (c) 2020-2021 Damien P. George
+# SPDX-License-Identifier: MIT
 _PROG_DATA = const(0)
 _PROG_OFFSET_PIO0 = const(1)
 _PROG_OFFSET_PIO1 = const(2)
@@ -328,6 +336,7 @@ def asm_pio_encode(instr, sideset_count, sideset_opt=False):
     if len(emit.prog[_PROG_DATA]) != 1:
         raise PIOASMError("expecting exactly 1 instruction")
     return emit.prog[_PROG_DATA][0]
+# SPDX-SnippetEnd
 
 
 # ------------------------------------------------------------------ the blocks

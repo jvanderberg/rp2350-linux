@@ -1,3 +1,5 @@
+// Modified for rp2350-linux: see ../PROVENANCE for what changed.
+// sntrup761 0.4.0, MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).
 pub mod encoding;
 pub mod modq;
 pub(crate) mod montgomery;

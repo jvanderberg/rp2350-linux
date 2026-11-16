@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * SPI controller of the rvemu machine (rvemu-rs/rvcore/src/periph.rs), one per
  * RP2350 SPI block, with one chip select. Writing GO runs one transfer, start
@@ -134,3 +134,5 @@ static struct platform_driver rvemu_spi_driver = {
 	},
 };
 builtin_platform_driver(rvemu_spi_driver);
+
+MODULE_LICENSE("GPL");

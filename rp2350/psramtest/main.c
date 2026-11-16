@@ -3,6 +3,16 @@
  * QMI setup follows PicoMite/FanPico psram.c (Timo Kokkonen, GPL-3.0):
  * exit QPI, read ID, reset, enter QPI, then program M1 timing/rfmt/wfmt.
  *
+ * LICENSE UNRESOLVED. The PSRAM code here (the CMD_ and KGD_ constants,
+ * csr_*, psram_read_id, psram_qmi_setup, detect_size and main's timing
+ * arithmetic) follows FanPico's src/psram.c (https://github.com/tjko/fanpico)
+ * closely: the same functions, names, constants and steps.
+ *   Copyright (C) 2025 Timo Kokkonen <tjko@iki.fi>
+ *   License: GPL-3.0-or-later
+ * If it is a derived work, those parts are GPL-3.0-or-later, not MIT. This
+ * is open for the owner to settle (see CONTRIBUTING.md); until then this
+ * file carries no SPDX line of its own.
+ *
  * Output goes to RTT (probe-rs run picks it up). Results are also left in
  * the global `result` so they can be read back over SWD if RTT fails.
  */

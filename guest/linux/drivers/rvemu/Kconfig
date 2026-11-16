@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-2.0-only
 # Devices of the rvemu machine: the RP2350's pins as the emulator presents
 # them (rvemu-rs/rvcore/src/periph.rs), and the firmware's native engine
 # (rvemu-rs/rvaccel). guest/build.sh copies this directory into the kernel

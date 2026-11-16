@@ -1,3 +1,7 @@
+SPDX-License-Identifier: GPL-2.0-only
+A change to a file of the Linux kernel, under the kernel's license (see
+COPYING). Applied by guest/build.sh (patch_stock).
+
 --- a/arch/riscv/kernel/vmlinux.lds.S	2026-11-15 16:08:21.391369841 -0600
 +++ b/arch/riscv/kernel/vmlinux.lds.S	2026-11-15 16:08:34.928412862 -0600
 @@ -13,6 +13,13 @@

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Kernel-internal: one raw LZ4 block decoded by the rvemu machine's native
  * engine (lz4-rvemu.c), for squashfs. */
 #ifndef RVEMU_LZ4_H

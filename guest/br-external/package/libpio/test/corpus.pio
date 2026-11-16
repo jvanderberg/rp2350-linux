@@ -1,3 +1,12 @@
+; The assembler test corpus. ws2812, uart_tx, uart_rx, spi_cpha0 and
+; squarewave are pico-examples' programs (https://github.com/raspberrypi/pico-examples,
+; pio/ws2812, pio/uart_tx, pio/uart_rx, pio/spi, pio/squarewave), without
+; their comments; the license text is ../src/LICENSE-BSD-3-Clause.
+; everything and everything2 are libpio's (MIT).
+;
+; SPDX-SnippetBegin
+; SPDX-SnippetCopyrightText: Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+; SPDX-License-Identifier: BSD-3-Clause
 .define public T1 2
 .define public T2 5
 .define public T3 3
@@ -49,6 +58,8 @@ again:
     set pins, 1 [1]
     set pins, 0
     jmp again
+
+; SPDX-SnippetEnd
 
 .program everything
 .side_set 2 opt pindirs

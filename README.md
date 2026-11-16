@@ -434,3 +434,19 @@ passphrase. `pico-shell.sh` writes only the regions whose contents changed
 
 See the [development and verification guide](docs/development.md) for host
 checks, guest builds, QEMU, explicit board checks, CI and saved test results.
+
+## License
+
+The project's own code is MIT ([LICENSE](LICENSE)), with these exceptions:
+
+- **`guest/linux/`** is GPL-2.0-only, as Linux is: the rvemu drivers, the
+  kernel patches and `rvemu-flash.c`. The uapi headers that user space
+  includes (`rvemu-pio.h`, `rvemu-crypto.h`, `rvemu-ssh.h`) are
+  `GPL-2.0-only WITH Linux-syscall-note`, so MIT programs such as libpio can
+  include them. See [guest/linux/COPYING](guest/linux/COPYING).
+- **Code, data and firmware from other projects** keep their own licenses.
+  Each file says where it came from, with its copyright and an SPDX line, and
+  the license texts are next to it. The CYW43439 firmware blobs are under
+  the Permissive Binary License ([rvemu-rs/rvemu-pico/firmware](rvemu-rs/rvemu-pico/firmware/README.md)).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add third-party code.
