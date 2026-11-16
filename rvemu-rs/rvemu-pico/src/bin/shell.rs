@@ -26,9 +26,8 @@
 
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use panic_rtt_target as _;
 use rp2350_board as board;
 use rp235x_hal as hal;
 use rtt_target::{ChannelMode, rprintln, rtt_init_print};
@@ -905,6 +904,35 @@ fn core0_stack() -> (usize, usize) {
     (&raw const _estack as usize, &raw const _sstack as usize)
 }
 
+/// The system clock, for the panic handler's wait (0 until `main` sets it).
+static PANIC_SYS_HZ: AtomicU32 = AtomicU32::new(0);
+/// How long a panic stays on RTT before the board reboots.
+const PANIC_REBOOT_S: u64 = 3;
+
+/// A panic on either core: the message on RTT, then a reboot (Linux starts
+/// again) instead of a board that hangs until it is unplugged. The message
+/// is written without blocking, so it never waits for a debugger that isn't
+/// there (panic-rtt-target blocks when the buffer is full); one attached
+/// sees it during the wait.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write as _;
+    // no interrupts on this core from here (mstatus.MIE)
+    // SAFETY: clears one bit of this hart's own status register.
+    unsafe { core::arch::asm!("csrci mstatus, 8") };
+    rtt_target::with_terminal_channel(|term| {
+        term.set_mode(ChannelMode::NoBlockTrim);
+        let _ = writeln!(term.write(0), "{}", info);
+        let _ = writeln!(term.write(0), "rebooting in {} s", PANIC_REBOOT_S);
+    });
+    let hz = u64::from(PANIC_SYS_HZ.load(Ordering::Relaxed));
+    if hz != 0 {
+        let t0 = core1::now();
+        while core1::now() - t0 < hz * PANIC_REBOOT_S {}
+    }
+    hal::reboot::reboot(hal::reboot::RebootKind::Normal, hal::reboot::RebootArch::Riscv)
+}
+
 /// Every `STATUS_S` seconds: how deep both stacks have been, on RTT.
 struct Status {
     next: u64,
@@ -1010,6 +1038,7 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     use hal::Clock as _;
     let sys_hz = clocks.system_clock.freq().to_Hz();
     flash::set_sys_hz(sys_hz);
+    PANIC_SYS_HZ.store(sys_hz, Ordering::Relaxed);
     rprintln!("\n=== rvemu-pico shell: Hazard3 @ {} MHz{} ===", sys_hz / 1_000_000, board::CLOCK_NOTE);
 
     let psram = match board::psram_init(pins.gpio0, sys_hz) {

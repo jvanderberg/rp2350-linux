@@ -86,6 +86,9 @@ the console port open. Running it again reboots the board.
 The console is the board's USB serial port. A terminal opened after boot
 shows the end of the boot log. `eth0` joins the Wi-Fi network stored with
 `scripts/pico-wifi.sh` and takes its address by DHCP, in the background.
+When the Wi-Fi link drops or stops passing traffic, the board joins the
+network again by itself within about a minute; `S41wifi-keepalive` sends
+an ARP request to the gateway every 20 s so a stalled link is noticed.
 There is no syslog or cron: `dmesg` has the kernel log.
 
 **Example:**

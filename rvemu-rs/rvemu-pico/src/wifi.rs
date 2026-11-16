@@ -410,17 +410,50 @@ async fn run(pwr: Pwr, spi: PioSpi, creds: Option<Creds>) {
             rprintln!("[wifi] no network configured (scripts/pico-wifi.sh)");
             return;
         };
+        // Join, and join again when the link stays down: the chip
+        // reassociates by itself after most losses, but not all (a deauth it
+        // didn't recover from once left the board off the network for good).
+        // Failed joins back off, so an absent network costs one attempt
+        // every few minutes.
+        let mut wait_s = JOIN_RETRY_MIN_S;
         loop {
             match control.join(c.ssid, cyw43::JoinOptions::new(c.pass)).await {
                 Ok(()) => {
                     rprintln!("[wifi] joined {:?}", c.ssid);
-                    return;
+                    wait_s = JOIN_RETRY_MIN_S;
+                    REJOINING.store(false, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    rprintln!("[wifi] join {:?} failed: {:?}; retrying", c.ssid, e);
-                    embassy_time::Timer::after_secs(3).await;
+                    rprintln!("[wifi] join {:?} failed: {:?}; again in {} s", c.ssid, e, wait_s);
+                    embassy_time::Timer::after_secs(wait_s.into()).await;
+                    wait_s = (wait_s * 2).min(JOIN_RETRY_MAX_S);
+                    continue;
                 }
             }
+            // LINK_UP follows the driver's link state (`poll`, on this core);
+            // the chip gets LINK_DOWN_REJOIN_S to recover by itself. A link
+            // that is up but passes no traffic (STALLED, from `poll`) is
+            // rejoined at once: the chip never reports that one itself.
+            STALLED.store(false, Ordering::Relaxed);
+            let mut down_s = 0;
+            while down_s < LINK_DOWN_REJOIN_S {
+                embassy_time::Timer::after_secs(1).await;
+                if STALLED.swap(false, Ordering::Relaxed) {
+                    break;
+                }
+                down_s = if LINK_UP.load(Ordering::Relaxed) { 0 } else { down_s + 1 };
+            }
+            REJOINS.fetch_add(1, Ordering::Relaxed);
+            if down_s < LINK_DOWN_REJOIN_S {
+                rprintln!("[wifi] link up but nothing received for {} s; joining again", TRAFFIC_STALL_S);
+            } else {
+                rprintln!("[wifi] link down for {} s; joining again", LINK_DOWN_REJOIN_S);
+            }
+            // the driver keeps reporting the link up through `leave` (it
+            // changes the link state on the chip's events only): the guest
+            // sees it down from here until the join succeeds
+            REJOINING.store(true, Ordering::Relaxed);
+            control.leave().await;
         }
     };
     embassy_futures::join::join(runner.run(), control_task).await;
@@ -466,6 +499,26 @@ pub static RADIO: AtomicU32 = AtomicU32::new(RADIO_STARTING);
 /// The MAC, bytes 0-3 and 4-5, little-endian.
 pub static MAC: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 pub static LINK_UP: AtomicBool = AtomicBool::new(false);
+/// Seconds the link may be down (after a join) before the firmware leaves
+/// and joins again: room for the chip's own reassociation (a roam, the
+/// access point restarting its radio).
+const LINK_DOWN_REJOIN_S: u32 = 30;
+/// A failed join is tried again after this, doubling up to the max.
+const JOIN_RETRY_MIN_S: u32 = 5;
+const JOIN_RETRY_MAX_S: u32 = 300;
+/// Seconds the guest may go on sending while no unicast frame comes back
+/// before the link counts as stalled. After a deauth the chip sometimes
+/// reports the link up while nothing passes either way; only traffic shows
+/// it. The guest's arping of the gateway every 20 s (S41wifi-keepalive)
+/// gets a unicast reply on a working link, so this never fires there.
+const TRAFFIC_STALL_S: u32 = 30;
+/// Set by `poll` when the link stalls; the control task rejoins.
+static STALLED: AtomicBool = AtomicBool::new(false);
+/// Set by the control task from `leave` until the next join succeeds;
+/// `LINK_UP` is false meanwhile.
+static REJOINING: AtomicBool = AtomicBool::new(false);
+/// Joins after the first, for diagnostics.
+pub static REJOINS: AtomicU32 = AtomicU32::new(0);
 
 /// core1's radio service: drives the driver, moves frames between it and
 /// the rings, publishes the MAC and the link state.
@@ -475,6 +528,10 @@ pub struct RadioService<F> {
     /// When bring-up started, and how long it may take.
     t0: u64,
     bring_up_cycles: u64,
+    /// When the guest first sent since the last unicast frame came in (0:
+    /// nothing unanswered), and how long that may last (`TRAFFIC_STALL_S`).
+    unanswered_since: u64,
+    stall_cycles: u64,
 }
 
 // SAFETY: built on core0 before core1 starts, then used by core1 only.
@@ -484,7 +541,13 @@ impl<F: Future<Output = ()>> RadioService<F> {
     /// `bring_up_ms`: how long the chip may take to come up before the
     /// guest's NIC is reported absent.
     pub fn new(fut: F, sys_hz: u32, bring_up_ms: u32) -> Self {
-        RadioService { fut, t0: 0, bring_up_cycles: u64::from(sys_hz / 1000) * u64::from(bring_up_ms) }
+        RadioService {
+            fut,
+            t0: 0,
+            bring_up_cycles: u64::from(sys_hz / 1000) * u64::from(bring_up_ms),
+            unanswered_since: 0,
+            stall_cycles: u64::from(sys_hz) * u64::from(TRAFFIC_STALL_S),
+        }
     }
 
     fn poll_driver(&mut self) {
@@ -497,7 +560,11 @@ impl<F: Future<Output = ()>> RadioService<F> {
 impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
     fn poll(&mut self) {
         let mut cx = Context::from_waker(core1::waker());
-        // guest -> radio: as many frames as the driver takes
+        // guest -> radio: as many frames as the driver takes. A frame the
+        // guest has queued starts the stall clock, sent or not.
+        if !NET_TX.is_empty() && self.unanswered_since == 0 {
+            self.unanswered_since = core1::now();
+        }
         if let Some(d) = net() {
             while !NET_TX.is_empty() {
                 let Some(tx) = d.transmit(&mut cx) else { break };
@@ -521,8 +588,13 @@ impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
         let mut got = false;
         while NET_RX.has_room() {
             let Some((rx, _tx)) = d.receive(&mut cx) else { break };
+            let answered = &mut self.unanswered_since;
             NET_RX.push_with(|slot| {
                 Some(rx.consume(|b| {
+                    // a unicast frame (to us): the link passes traffic
+                    if b.first().is_some_and(|&a| a & 1 == 0) {
+                        *answered = 0;
+                    }
                     let n = b.len().min(slot.len());
                     slot[..n].copy_from_slice(&b[..n]);
                     n
@@ -539,10 +611,17 @@ impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
             RADIO.store(RADIO_UP, Ordering::Release);
             got = true;
         }
-        let up = d.link_state(&mut cx) == LinkState::Up;
+        let up = d.link_state(&mut cx) == LinkState::Up && !REJOINING.load(Ordering::Relaxed);
         if up != LINK_UP.load(Ordering::Relaxed) {
             LINK_UP.store(up, Ordering::Release);
             got = true;
+        }
+        if !up {
+            // a link that is down is the control task's to handle
+            self.unanswered_since = 0;
+        } else if self.unanswered_since != 0 && core1::now() - self.unanswered_since > self.stall_cycles {
+            self.unanswered_since = 0;
+            STALLED.store(true, Ordering::Relaxed);
         }
         if got {
             core1::notify_core0();
