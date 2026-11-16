@@ -435,7 +435,7 @@ fn make_dts(o: &DtsOpts) -> String {
       riscv,ndev = <31>;
     }};
     serial@f4000000 {{
-      compatible = "ns16550";
+      compatible = "ns16550a";
       reg = <0x{UART_BASE:x} 0x{UART_SIZE:x}>;
       interrupts = <{UART_IRQ}>;
       interrupt-parent = <&plic0>;

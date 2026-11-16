@@ -205,6 +205,10 @@ static void plic_set_level(cpu_t *c, uint32_t irq, bool high)
 
 static struct {
     uint8_t ier, lcr, mcr, dll, dlh, scr;
+    /* FCR bit 0 (FIFOs enabled) is reported back in IIR bits 6-7: the
+     * guest sees a 16550A and loads 16 bytes per transmit interrupt. A byte
+     * written to THR goes out at once, so the FIFO is never full. */
+    uint8_t fcr;
     bool thre_pending;
 } uart;
 
@@ -241,7 +245,7 @@ static int uart_load(cpu_t *c, uint32_t off, int size, uint32_t *v)
         uint8_t iir = uart_iir();
         if (iir == 0x02)
             uart.thre_pending = false;
-        *v = iir;
+        *v = iir | ((uart.fcr & 1) ? 0xC0u : 0u);
         break;
     }
     case 3: *v = uart.lcr; break;
@@ -280,10 +284,11 @@ static int uart_store(cpu_t *c, uint32_t off, int size, uint32_t v)
             uart.ier = b & 0x0F;
         }
         break;
+    case 2: uart.fcr = b & 0xC9; break; /* enable, trigger level; the clears are instant */
     case 3: uart.lcr = b; break;
     case 4: uart.mcr = b; break;
     case 7: uart.scr = b; break;
-    default: break; /* FCR and others ignored */
+    default: break;
     }
     uart_update(c);
     return 0;

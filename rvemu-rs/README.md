@@ -6,7 +6,7 @@ PSRAM and translated code is in SRAM.
 
 | Crate | |
 |---|---|
-| `rvcore/` | `no_std` core: hart state, interpreter, soft TLB and Sv32 walk, built-in SBI, 16550 UART, PLIC, the virtio-mmio devices (`virtio.rs`), the NOR flash device (`nor.rs`), the pin devices (`periph.rs`) and the flash swap backend (`swapdev.rs`). The `instrument` feature adds host-only statistics (unique-code bitmaps, an XIP cache model) and needs `alloc`. `ram-code` puts the hot paths in SRAM on the board. |
+| `rvcore/` | `no_std` core: hart state, interpreter, soft TLB and Sv32 walk, built-in SBI, 16550A UART, PLIC, the virtio-mmio devices (`virtio.rs`), the NOR flash device (`nor.rs`), the pin devices (`periph.rs`) and the flash swap backend (`swapdev.rs`). The `instrument` feature adds host-only statistics (unique-code bitmaps, an XIP cache model) and needs `alloc`. `ram-code` puts the hot paths in SRAM on the board. |
 | `rvjit/` | `no_std` block translator, RV32IMA guest code to RV32 host code |
 | `rvemu/` | Mac host: loads the guest, generates the device tree (needs `dtc`), terminal console, statistics, RP2350 timing model (`-M`), cache-policy simulator (`-S`), and stand-ins for the board's flash (`norfile.rs`), swap flash and pins (`stubpins.rs`) |
 | `rvemu-virt/` | bare-metal build for `qemu-system-riscv32 -M virt`: interpreter, translator or lockstep |
@@ -138,7 +138,7 @@ receive the same generated device tree, including the fixed entropy seed.
 |---|---|---|
 | RAM | 0x00000000 | |
 | PLIC | 0xF0000000 | |
-| UART (16550) | 0xF4000000 | 1 |
+| UART (16550A) | 0xF4000000 | 1 |
 | virtio-blk | 0xF8000000 | 2 |
 | virtio-net | 0xF8000200 | 3 |
 | NOR flash (`rvemu,flash`) | 0xF8000400 | |

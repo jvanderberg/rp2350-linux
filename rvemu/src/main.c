@@ -102,7 +102,7 @@ static char *make_dts(uint32_t ram_base, uint32_t ram_size,
         "      riscv,ndev = <31>;\n"
         "    };\n"
         "    serial@f4000000 {\n"
-        "      compatible = \"ns16550\";\n"
+        "      compatible = \"ns16550a\";\n"
         "      reg = <0x%x 0x%x>;\n"
         "      interrupts = <%d>;\n"
         "      interrupt-parent = <&plic0>;\n"
