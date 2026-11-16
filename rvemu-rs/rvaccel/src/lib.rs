@@ -38,6 +38,17 @@ pub fn run(fid: u32, src: &[u8], dst: &mut [u8], params: &[u8]) -> Result<usize,
     run_inner(fid, src, dst, params, &mut sntrup761::Workspace::new())
 }
 
+/// `LZ4_DECODE` (a raw LZ4 block) on the caller's stack: no workspace. It
+/// handles no secrets, needs no table and a block of `MAX_BUFFER` takes well
+/// under a time slice, so it needs neither the workspace's erasing nor its
+/// pausing.
+pub fn lz4_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, i32> {
+    if src.len() > MAX_BUFFER || dst.len() > MAX_BUFFER {
+        return Err(-3);
+    }
+    lz4_flex::block::decompress_into(src, dst).map_err(|_| -1)
+}
+
 #[inline(never)]
 fn run_inner(
     fid: u32,

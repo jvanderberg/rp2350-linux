@@ -67,6 +67,10 @@ use wifi::{Creds, RadioPins};
 #[path = "../pins.rs"]
 mod pins;
 use pins::{BoardPins, Gp, PinSet};
+#[path = "../sd.rs"]
+mod sd;
+use rvcore::sdcard::SdCard;
+use sd::BoardSd;
 
 #[unsafe(link_section = ".start_block")]
 #[used]
@@ -343,7 +347,7 @@ impl NetLink for RingLink {
 }
 
 struct PicoBus {
-    plat: Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>, BoardPins>,
+    plat: Plat,
     sys_hz: u32,
     /// The last `core1::events()` acted on.
     seen: u32,
@@ -478,7 +482,7 @@ impl PicoBus {
 /// The guest's devices (`Plat`). With two harts the bus methods are in SRAM
 /// and take `BusGuard` before anything in flash runs; these are their parts
 /// in flash.
-type Plat = Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>, BoardPins>;
+type Plat = Platform<RingConsole, MemDisk, RingLink, BoardNor, &'static mut FlashSwap<SwapFlash>, BoardPins, SdCard<BoardSd>>;
 
 #[inline(never)]
 fn update_irqs(p: &mut Plat) {
@@ -503,6 +507,13 @@ fn plat_mmio_store(p: &mut Plat, pa: u32, size: u32, val: u32) -> Result<(), u32
 #[inline(never)]
 fn plat_take_dma_write(p: &mut Plat) -> Option<(u32, u32)> {
     p.take_dma_write()
+}
+
+/// The SD card going in or out (a look about once a second; bringing a
+/// new card up can take a few hundred milliseconds).
+#[inline(never)]
+fn idle_media(p: &mut Plat) {
+    p.poll_media();
 }
 
 /// One dirty swap sector erased, if there is one; whether it was.
@@ -717,8 +728,13 @@ impl PicoBus {
         let wait = (ticks.saturating_mul(hz) / u64::from(TIMEBASE_HZ)).min(hz / 10);
         let t0 = board::mcycle64();
         // Erase one dirty swap sector (about 45 ms) unless the guest wakes
-        // within 2 ms. Erasing stalls everything, so idle time is the place.
-        let erased = wait >= hz / 500 && idle_erase(&mut self.plat);
+        // within 2 ms. Erasing stalls everything, so idle time is the place;
+        // so is looking for the SD card.
+        let stalled = wait >= hz / 500 && {
+            idle_media(&mut self.plat);
+            idle_erase(&mut self.plat);
+            true
+        };
         while board::mcycle64() - t0 < wait {
             if core1::events() != self.seen {
                 self.poll();
@@ -735,8 +751,9 @@ impl PicoBus {
         if cpu.stimecmp == u64::MAX {
             return; // no timer armed: keep waiting for input
         }
-        // an erase can outlast the wait: keep guest time with wall time
-        let ticks = if erased {
+        // an erase or a new SD card can outlast the wait: keep guest time
+        // with wall time
+        let ticks = if stalled {
             ticks.max((board::mcycle64() - t0) * u64::from(TIMEBASE_HZ) / hz)
         } else {
             ticks
@@ -768,9 +785,11 @@ impl PicoBus {
         let hz = u64::from(self.sys_hz);
         let ticks = deadline - now;
         let wait = (ticks.saturating_mul(hz) / u64::from(TIMEBASE_HZ)).min(hz / 10);
-        let erased = wait >= hz / 500 && !hart1_active && {
+        let stalled = wait >= hz / 500 && !hart1_active && {
             let _g = BusGuard::new();
-            idle_erase(&mut self.plat)
+            idle_media(&mut self.plat);
+            idle_erase(&mut self.plat);
+            true
         };
         let mut t0 = board::mcycle64();
         // the pins every 10 us: each look holds the device lock, and with it
@@ -805,7 +824,7 @@ impl PicoBus {
         if deadline == u64::MAX {
             return; // no timer armed: keep waiting for input
         }
-        let ticks = if erased {
+        let ticks = if stalled {
             ticks.max((board::mcycle64() - t0) * u64::from(TIMEBASE_HZ) / hz)
         } else {
             ticks
@@ -1064,17 +1083,9 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         pins.gpio46.into_floating_disabled().into_dyn_pin(),
         pins.gpio47.into_floating_disabled().into_dyn_pin(),
     ];
-    let set = PinSet {
-        gp,
-        i2c0,
-        i2c1,
-        spi,
-        spi_cs: pins.gpio17.reconfigure(),
-        spi1,
-        spi1_cs: pins.gpio9.reconfigure(),
-        adc_pins,
-    };
-    let board_pins = BoardPins::new(set, pac.PWM, pac.ADC, &mut pac.RESETS, sys_hz, peri_hz);
+    let set = PinSet { gp, i2c0, i2c1, spi, spi_cs: pins.gpio17.reconfigure(), adc_pins };
+    let sd_bus = BoardSd::new(spi1, pins.gpio9.reconfigure(), peri_hz, sys_hz);
+    let board_pins = BoardPins::new(set, pac.PWM, pac.ADC, (pac.PIO1, pac.PIO2), &mut pac.RESETS, sys_hz, peri_hz);
 
     // SAFETY: initialised once, here, before anything borrows it.
     let usb_bus: &'static UsbBusAllocator<hal::usb::UsbBus> = unsafe {
@@ -1138,6 +1149,10 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         })
     };
     add_devices(bus, board_pins, disk, gmem, ms(RADIO_BRING_UP_MS));
+    let sd_on = dtb_has_node(&h, b"virtio@f8000800");
+    if sd_on {
+        add_sd(bus, sd_bus, gmem);
+    }
 
     // SAFETY: guest RAM is the mapped, writable PSRAM; the header was checked.
     let dtb = unsafe { h.load() };
@@ -1177,15 +1192,39 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         setup_hart1(jit, cpu, &h, dtb, sys_hz);
     }
     rprintln!(
-        "guest RAM {} KiB, {} hart(s), translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}; console on USB",
+        "guest RAM {} KiB, {} hart(s), translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}, SD {}; console on USB",
         h.ram_size >> 10,
         if two_harts { 2 } else { 1 },
         if two_harts { CODE_WORDS - HART1_WORDS } else { CODE_WORDS } * 4 / 1024,
         STORE_WORDS * 4 / 1024,
         disk_kib,
-        if swap_on { "on" } else { "off" }
+        if swap_on { "on" } else { "off" },
+        if sd_on { "on" } else { "off" }
     );
     (jit, cpu, bus, sys_hz)
+}
+
+/// Whether the guest's DTB has the node `name`.
+fn dtb_has_node(h: &BlobHeader, name: &[u8]) -> bool {
+    // SAFETY: as in `dtb_has_swap`.
+    let dtb = unsafe { core::slice::from_raw_parts((BLOB_ADDR + h.dtb_off as usize) as *const u8, h.dtb_len as usize) };
+    dtb.windows(name.len()).any(|w| w == name)
+}
+
+/// The SD card's device, with the card brought up now if one is in (so the
+/// guest finds it when it probes), in a frame of its own.
+#[inline(never)]
+fn add_sd(bus: &mut PicoBus, sd_bus: BoardSd, gmem: GuestMem) {
+    let mut card = SdCard::new(sd_bus, rvcore::sdcard::HIGH_HZ);
+    let t0 = board::mcycle64();
+    let present = card.start();
+    rprintln!(
+        "[sd] {} ({} ms), {} kHz",
+        if present { "card in" } else { "no card" },
+        (board::mcycle64() - t0) / u64::from(bus.sys_hz / 1000),
+        card.clock() / 1000
+    );
+    bus.plat.sd = Some(VirtioBlk::new(card, gmem));
 }
 
 /// Whether the guest's DTB has a second CPU.

@@ -32,6 +32,7 @@ Linux rp2350 6.12.116 #29 Sun Nov  8 12:56:58 UTC 2026 riscv32 GNU/Linux
 | [Swap on flash](#swap) | off | `scripts/pico-shell.sh -w` |
 | [SD card](#sd-card) | on | files at `/mnt/sd` |
 | [GPIO, I2C, SPI, PWM, ADC](#gpio-i2c-spi-pwm-adc) | on | `gpioinfo`, `i2cdetect`, MicroPython `machine` |
+| [PIO and DMA](#pio-and-dma) | on | `/dev/pio1`, `/dev/pio2`; `libpio` and `pioasm` in C, MicroPython `rp2` |
 
 The guest also has editors (nano, mg, BusyBox `vi`), languages
 (MicroPython, Lua 5.4, and C through `cc`), and tools (htop, tmux, lrzsz,
@@ -214,6 +215,7 @@ cube.o
 `scripts/pico-shell.sh -w` boots the guest with 1788 KiB of swap on flash
 (`/dev/vdb`). It is enabled at boot and empty at every boot.
 `flashswap-stats` prints the swap device's counters.
+A swap partition on the SD card ([SD card](#sd-card)) is used ahead of it.
 
 **Example:**
 
@@ -229,12 +231,19 @@ Swap:          1788         116        1672
 
 ## SD card
 
-An SD card on SPI1 is `/dev/mmcblk0`. When a card goes in, at boot or
+An SD card on SPI1 is `/dev/vdc`: the firmware drives the card itself
+(SPI mode, up to 43.5 MHz) and gives the guest a virtio disk whose serial is
+`rvemu-sd`. When a card goes in, at boot or
 later, its first partition (or the whole card, if it has no partition
 table) is mounted at `/mnt/sd` as FAT16 or FAT32, with long names. Run
 `umount /mnt/sd`, or shut down, before taking the card out; an unmounted
 card stays unmounted until it comes out. The first `df` after mounting
 takes a while: Linux counts the free space itself.
+
+Any partition on the card with a swap signature is used as swap, ahead of
+the flash swap (priority 10). To make one, give the card a small second
+partition (32 MiB is plenty) and run `mkswap` on it once, for example
+`mkswap /dev/vdc2`; it is enabled whenever the card goes in.
 
 | SD signal | Board |
 |---|---|
@@ -250,13 +259,13 @@ the card can fail to start, or drop off the bus while writing.
 **Example:**
 
 ```
-# grep mmc /proc/partitions
- 179        0   30976000 mmcblk0
- 179        1   30942208 mmcblk0p1
- 179        2      32768 mmcblk0p2
+# grep vdc /proc/partitions
+ 254       32   30976000 vdc
+ 254       33   30942208 vdc1
+ 254       34      32768 vdc2
 # df -h /mnt/sd
 Filesystem                Size      Used Available Use% Mounted on
-/dev/mmcblk0p1           29.5G     78.3M     29.4G   0% /mnt/sd
+/dev/vdc1                29.5G     79.3M     29.4G   0% /mnt/sd
 # echo hello > /mnt/sd/hello.txt; sync
 ```
 
@@ -309,6 +318,62 @@ GP15 set 1, pad reads 1
 GP15 set 0, pad reads 0
 GP15 set 1, pad reads 1
 GP15 set 0, pad reads 0
+```
+
+## PIO and DMA
+
+PIO1 and PIO2 are the guest's (PIO0 drives the Wi-Fi radio). A program
+maps a block's registers and drives them directly, as the pico-sdk does,
+with no system call per register:
+
+| Linux | Board |
+|---|---|
+| `/dev/pio1`, `/dev/pio2` | one block each: 4 state machines, 32 instructions, FIFOs, IRQs; any free GPIO the program claims |
+
+- **Pins.** A program claims each pin it uses (`pio_gpio_init`, or the
+  pins a MicroPython `StateMachine` is given). A claimed pin shows in
+  `gpioinfo` as used by `pio`, and is freed when the program closes the
+  block. A pin already in use is refused (`EBUSY`).
+- **One program per block.** Opening a block is exclusive. Opening and
+  closing it reset it: state machines stopped, instruction memory cleared,
+  pins released.
+- **DMA.** Four DMA channels move words between a buffer the block maps and
+  one of its state machines' FIFOs: one transfer, or endlessly around a
+  ring of up to 4 KiB. The firmware checks every transfer, so a channel can
+  reach only that buffer and that block. A buffer is at most 64 KiB.
+- **Clock.** The PIO clock is the system clock, 348 MHz; the slowest
+  state machine clock is 348 MHz / 65536, about 5.3 kHz.
+- **PIO0.** An `irq prev`/`irq next` instruction still reaches PIO0's IRQ
+  flags (no filter can stop it: `out exec` and `mov exec` make instructions
+  at run time), but the Wi-Fi driver doesn't use them: it takes the radio's
+  interrupt from the data line itself.
+
+The build includes:
+
+- `libpio` (`-lpio`, header `pio.h`): the pico-sdk's `hardware/pio.h` API
+  (`pio_add_program`, `sm_config_*`, `pio_sm_init`, `pio_sm_put_blocking`,
+  ...) on an open block (`PIO pio = pio_open(1);`), plus `pio_assemble()`,
+  which assembles pioasm source at run time, `pio_wait_irq()`, and DMA
+  (`pio_sm_dma_write`, `pio_sm_dma_read`, `pio_dma_start` for rings);
+- `pioasm`, the pico-sdk's assembler: `pioasm ws2812.pio ws2812.pio.h`
+  writes a header for `#include`, with the `% c-sdk` blocks;
+- MicroPython's `rp2` module, as on the Pico: `@rp2.asm_pio`,
+  `rp2.StateMachine` (4-7 are PIO1, 8-11 PIO2, numbered as on the Pico 2;
+  0-3, PIO0, are refused),
+  `rp2.PIO(1)`, and `rp2.DMA` for transfers to and from a state machine;
+- C and Python examples in `/usr/share/examples/pio`: `squarewave`,
+  `pio-fifo`, `pio-dma`, `pio-edges` (edge timestamps by DMA), `ws2812`
+  (with `ws2812.pio`), `pio_blink.py`, `pio_echo.py`, `pio_ring.py`. Build the C ones
+  with `cc -o squarewave squarewave.c -lpio`.
+
+**Example:**
+
+```
+# micropython /usr/share/examples/pio/pio_echo.py
+put/get: 4 of 4 right
+DMA: 256 of 256 right
+# mkdir /tmp/p && cd /tmp/p && cp /usr/share/examples/pio/squarewave.c . &&
+  cc -o squarewave squarewave.c -lpio && ./squarewave 15 100000 5    # 100 kHz on GP15 for 5 s
 ```
 
 ## Flash map (16 MB)

@@ -45,7 +45,9 @@ cargo build --locked -q --release -p rvemu
 cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 # the pin devices only for a kernel with their drivers (the disk guest's)
 IO=0; grep -q '^CONFIG_RVEMU_GPIO=y' "$(dirname "$K")/linux.config" 2>/dev/null && IO=1
-HARTS=$HARTS NET=1 NOR=1 SWAP=$SWAP IO=$IO pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
+# the SD card's disk for a kernel with a block layer (not the initramfs guest's)
+SD=0; grep -q '^CONFIG_VIRTIO_BLK=y' "$(dirname "$K")/linux.config" 2>/dev/null && SD=1
+HARTS=$HARTS NET=1 NOR=1 SWAP=$SWAP IO=$IO SD=$SD pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
 ensure_bootsel "$ELF"
 load_text "$T/text.bin"
 load_blob "$T/blob.bin"

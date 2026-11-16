@@ -1,0 +1,2 @@
+RVMEM_MOD_DIR := $(USERMOD_DIR)
+SRC_USERMOD += $(RVMEM_MOD_DIR)/modrvmem.c

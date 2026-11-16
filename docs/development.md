@@ -21,7 +21,13 @@ scripts/check.sh host
 
 This checks Bash/Python syntax, tests the verification runner's success,
 failure and timeout handling, runs Cargo tests, builds the host Rust crates
-in release mode, and builds the C reference. It needs neither a guest image
+in release mode, and builds the C reference. It also runs libpio's host
+tests (`guest/br-external/package/libpio/test`, with ASan and UBSan): the
+library against a fake `/dev/pio` (pin numbering at either GPIOBASE, the DMA
+error paths), its assembler against pio-parser's output on a corpus and on
+bad input, and the headers `pioasm` writes through the compiler; and
+MicroPython `rp2`'s assembler against libpio's
+(`micropython-machine/test`, in CPython). It needs neither a guest image
 nor a board. The initial Rust build can download dependencies.
 
 ## Build the guests
@@ -84,6 +90,20 @@ The runner's per-command timeout defaults to 1,800 seconds. Override with
 group on timeout or SIGTERM cancellation (including descendants that ignore SIGTERM). Each tier is independent: run `host` as well as `qemu`.
 For an interactive QEMU session or disk guest, see
 [rvemu-rs/README.md](../rvemu-rs/README.md).
+
+## Check in the Mac emulator
+
+```sh
+scripts/check.sh emu
+```
+
+This requires `guest/out-disk` (`cd guest && ./run-build.sh disk`). It boots
+the disk guest on the emulator's simulated board (`rvemu -G`, software PIO)
+and runs `guest/tests/pio`: PIO1, PIO2 and the DMA pool through libpio and
+MicroPython `rp2`, checked with no wiring (a block at GPIOBASE 0, where
+index N is GPIO N, reads back what the other drove, and Linux drives pins
+from SIO for a block to read). The board runs the same files through
+`rp2350/tools/pin-test.py --only pio-self`.
 
 ## Check on the board (flashes and reboots hardware)
 

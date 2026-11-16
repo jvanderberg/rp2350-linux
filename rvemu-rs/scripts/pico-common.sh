@@ -11,7 +11,12 @@ DISK_STAMP=target/pico-linux-disk.sha256
 TEXT_STAMP=target/pico-linux-text.sha256
 LAUNCH=target/pico-last-launch
 
-in_bootsel() { picotool info >/dev/null 2>&1; }
+# a device in BOOTSEL, even one whose flash picotool can't parse (a load cut
+# short leaves one): only "no device" counts as none
+in_bootsel() {
+  local o; o=$(picotool info 2>&1) && return 0
+  case $o in *"No accessible RP-series devices in BOOTSEL mode"*) return 1;; *) return 0;; esac
+}
 wait_bootsel() { for _ in $(seq 1 "$1"); do in_bootsel && return 0; sleep 1; done; return 1; }
 
 # rvemu-pico-shell's console port (USB serial number "rvemu")
@@ -73,24 +78,28 @@ load_text() {
   load_at "$1" "$(printf '0x%x' $((0x11000000 - n)))" "$TEXT_STAMP" "kernel text"
 }
 
-# text_len IMAGE: bytes of the Image that are pure text (from its System.map):
-# _etext - _start, rounded down to a page (that page also holds .init)
+# text_len IMAGE: bytes at the start of the Image that are read-only (from
+# its System.map), kept in flash: the text and, when it follows the text
+# (guest/linux/rodata-in-flash.patch), the read-only data, up to
+# __init_begin; otherwise _etext - _start rounded down to a page (that page
+# also holds .init)
 text_len() {
   local m; m="$(dirname "$1")/System.map"
   python3 -c "import sys
-s=e=0
+sym={}
 for l in open(sys.argv[1]):
     a,_,n=l.split()[:3]
-    if n=='_start': s=int(a,16)
-    if n=='_etext': e=int(a,16)
-print((e-s)//4096*4096)" "$m"
+    sym[n]=int(a,16)
+s,e,r,i=sym['_start'],sym['_etext'],sym.get('__start_rodata',0),sym.get('__init_begin',0)
+print(i-s if s<r<i and (i-s)%4096==0 else (e-s)//4096*4096)" "$m"
 }
 
 # pack_guest IMAGE INITRD RAM_MB BLOB_OUT TEXT_OUT: device tree as the Mac host
 # makes it, then the blob and the kernel text. INITRD "-" means none: root on
 # the disk (pass its image as DISK=). NET=1 adds the network device node,
 # NOR=1 the flash device node (/home in the storage region 0x10100000).
-# IO=1 the pin devices (GPIO, I2C, SPI, PWM, ADC). HARTS=2 two CPUs.
+# IO=1 the pin devices (GPIO, I2C, SPI, PWM, ADC). SD=1 the SD card's
+# virtio disk (the firmware drives the card on SPI1). HARTS=2 two CPUs.
 pack_guest() {
   local dts dtb initrd=$2 src tl; dts=$(mktemp); dtb=$(mktemp)
   tl=$(text_len "$1")
@@ -103,6 +112,8 @@ pack_guest() {
   [ "${SWAP:-0}" = 1 ] && src+=(-W)
   # IO=1: the firmware drives the board's pins (rvemu-pico/src/pins.rs)
   [ "${IO:-0}" = 1 ] && src+=(-G)
+  # SD=1: the SD card on SPI1 (rvemu-pico/src/sd.rs); -D never opens the file
+  [ "${SD:-0}" = 1 ] && src+=(-s /dev/null)
   # HARTS=2: a second CPU (rvemu-pico-shell runs it on core1)
   [ "${HARTS:-1}" = 1 ] || src+=(-c "$HARTS")
   ./target/release/rvemu -D -m "$3" -X "$tl" "${src[@]}" > "$dts"

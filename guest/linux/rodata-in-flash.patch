@@ -1,0 +1,56 @@
+--- a/arch/riscv/kernel/vmlinux.lds.S	2026-11-15 16:08:21.391369841 -0600
++++ b/arch/riscv/kernel/vmlinux.lds.S	2026-11-15 16:08:34.928412862 -0600
+@@ -13,6 +13,13 @@
+ 
+ #include <asm/pgtable.h>
+ #define LOAD_OFFSET KERNEL_LINK_ADDR
++/*
++ * rvemu: the read-only data comes right after the text, so the two are one
++ * read-only block from the start of the image that the firmware maps from
++ * flash (it ends at __init_begin). __ro_after_init data is written during
++ * boot, so it goes with the writable data instead (.data..ro_after_init).
++ */
++#define RO_AFTER_INIT_DATA
+ 
+ #include <asm/vmlinux.lds.h>
+ #include <asm/page.h>
+@@ -48,7 +55,13 @@
+ 		_etext = .;
+ 	}
+ 
+-	. = ALIGN(SECTION_ALIGN);
++	_sdata = .;
++	RO_DATA(L1_CACHE_BYTES)
++	.srodata : {
++		*(.srodata*)
++	}
++
++	. = ALIGN(PAGE_SIZE);
+ 	__init_begin = .;
+ 	__init_text_begin = .;
+ 	.init.text : AT(ADDR(.init.text) - LOAD_OFFSET) ALIGN(SECTION_ALIGN) { \
+@@ -120,15 +133,18 @@
+ 	__init_end = .;
+ 
+ 	/* Start of data section */
+-	_sdata = .;
+-	RO_DATA(SECTION_ALIGN)
+-	.srodata : {
+-		*(.srodata*)
+-	}
+-
+ 	. = ALIGN(SECTION_ALIGN);
+ 	_data = .;
+ 
++	.data..ro_after_init : AT(ADDR(.data..ro_after_init) - LOAD_OFFSET) {
++		. = ALIGN(8);
++		__start_ro_after_init = .;
++		*(.data..ro_after_init)
++		JUMP_TABLE_DATA
++		STATIC_CALL_DATA
++		__end_ro_after_init = .;
++	}
++
+ 	RW_DATA(L1_CACHE_BYTES, PAGE_SIZE, THREAD_ALIGN)
+ 	.sdata : {
+ 		__global_pointer$ = . + 0x800;

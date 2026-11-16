@@ -61,6 +61,8 @@ const PIO_RXF0: usize = PIO0 + 0x020;
 const PIO_IRQ: usize = PIO0 + 0x030;
 const PIO_INPUT_SYNC_BYPASS: usize = PIO0 + 0x038;
 const PIO_SM0_INSTR: usize = PIO0 + 0x0d8;
+/// SIO's input levels of GP0-GP31.
+const SIO_GPIO_IN: usize = 0xd000_0004;
 /// Atomic set / clear register aliases.
 const SET: usize = 0x2000;
 const CLR: usize = 0x3000;
@@ -78,7 +80,7 @@ const PIO_HZ_MAX: u32 = 50_000_000;
 const XFER_TIMEOUT_MS: u32 = 20;
 
 fn rd(a: usize) -> u32 {
-    // SAFETY: PIO0 register.
+    // SAFETY: a PIO0 or SIO register.
     unsafe { read_volatile(a as *const u32) }
 }
 fn wr(a: usize, v: u32) {
@@ -269,11 +271,15 @@ impl SpiBusCyw43 for PioSpi {
         status
     }
 
-    /// The program raises PIO IRQ 0 once the chip pulls the data line high
-    /// after a transfer (its interrupt).
+    /// The chip's interrupt is the data line high while CS is up (the
+    /// program, done with its transfer, has the line as an input and waits
+    /// for it, then raises PIO IRQ 0). The line is read from SIO, not the
+    /// IRQ flag: PIO1 and PIO2 are the guest's, and their `irq prev/next`
+    /// instructions can set or clear PIO0's flags, which would forge or
+    /// lose an event. The flag is still cleared, so it never stays up.
     async fn wait_for_event(&mut self) {
         poll_fn(|_| {
-            if rd(PIO_IRQ) & 1 != 0 {
+            if rd(SIO_GPIO_IN) & 1 << PIN_DIO != 0 {
                 wr(PIO_IRQ, 1);
                 Poll::Ready(())
             } else {

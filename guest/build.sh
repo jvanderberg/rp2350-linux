@@ -88,18 +88,24 @@ disk_kernel() {   # TREE OUT [smp]
   rm -rf drivers/rvemu && cp -r /guest/linux/drivers/rvemu drivers/rvemu
   grep -q 'drivers/rvemu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/rvemu/Kconfig"' drivers/Kconfig
   grep -q 'rvemu/' drivers/Makefile || echo 'obj-y += rvemu/' >> drivers/Makefile
-  # mmc_spi waits for the SD card's tokens and busy in the firmware
-  # (rvemu_spi_skip in drivers/rvemu/spi-rvemu.c). The patch is applied to
-  # the stock file, kept beside it, so a changed patch applies cleanly; the
-  # file is replaced only when the result differs (no needless rebuild).
-  local mmc=drivers/mmc/host/mmc_spi.c
-  if [[ ! -f $mmc.stock ]]; then
-    grep -q CONFIG_RVEMU_SPI $mmc &&
-      curl -fsSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/$mmc?h=v$KVER" -o $mmc
-    cp $mmc $mmc.stock
+  # Patches to files of the tree (guest/linux/*.patch), each applied to the
+  # stock file, kept beside it, so a changed patch applies cleanly; the file
+  # is replaced only when the result differs (no needless rebuild).
+  patch_stock() {   # FILE PATCH
+    [[ -f $1.stock ]] || cp "$1" "$1.stock"
+    patch -s -f -o "$1.new" "$1.stock" < "$2"
+    cmp -s "$1.new" "$1" && rm "$1.new" || mv "$1.new" "$1"
+  }
+  # the read-only data right after the text, so the firmware maps both from
+  # flash (rvemu-rs/scripts/pico-common.sh text_len)
+  patch_stock arch/riscv/kernel/vmlinux.lds.S /guest/linux/rodata-in-flash.patch
+  # squashfs's LZ4 blocks decoded by the native engine (drivers/rvemu/lz4-rvemu.c)
+  patch_stock fs/squashfs/lz4_wrapper.c /guest/linux/squashfs-lz4-rvemu.patch
+  # mmc_spi.c as it was, from trees built when the guest drove the SD card
+  # itself (now the firmware does: the guest has no MMC layer)
+  if [[ -f drivers/mmc/host/mmc_spi.c.stock ]]; then
+    mv drivers/mmc/host/mmc_spi.c.stock drivers/mmc/host/mmc_spi.c
   fi
-  patch -s -f -o $mmc.new $mmc.stock < /guest/linux/mmc_spi-rvemu.patch
-  cmp -s $mmc.new $mmc && rm $mmc.new || mv $mmc.new $mmc
   make ARCH=riscv CROSS_COMPILE=$CROSS tinyconfig
   scripts/kconfig/merge_config.sh -m .config "${frags[@]}"
   make ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig

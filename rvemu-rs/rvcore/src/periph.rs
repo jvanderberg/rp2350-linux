@@ -1,27 +1,45 @@
-//! The board's pins as guest devices: GPIO, two I2C buses, two SPI buses, PWM
-//! and the ADC, in guest MMIO 0xF8001000-0xF8002FFF (only GPIO interrupts:
-//! PLIC 8).
+//! The board's pins as guest devices: GPIO, two I2C buses, two SPI buses,
+//! PWM, the ADC and two PIO blocks, in guest MMIO 0xF8001000-0xF800BFFF.
 //!
 //! | Device | Address | IRQ | Guest driver (guest/linux/drivers/rvemu) |
 //! |---|---|---|---|
 //! | GPIO | 0xF8001000 | 8 | `rvemu,gpio` |
 //! | I2C0, I2C1 | 0xF8001200, 0xF8001400 | | `rvemu,i2c` |
 //! | SPI0 | 0xF8001600 | | `rvemu,spi` + spidev |
-//! | SPI1 | 0xF8001C00 | | `rvemu,spi` + `mmc-spi-slot` (the SD card) |
+//! | SPI1 | 0xF8001C00 | | none: the SD card's, which the host drives (`sdcard.rs`) |
 //! | PWM | 0xF8001800 | | `rvemu,pwm` |
 //! | ADC | 0xF8001A00 | | `rvemu,adc` (IIO) |
+//! | PIO pin functions | 0xF8001E00 | | `rvemu,pio` (both blocks) |
+//! | PIO DMA | 0xF8002000 | 11 | `rvemu,pio-dma` |
+//! | PIO1, PIO2 | 0xF8004000, 0xF8008000 | 9, 10 | `rvemu,pio` |
 //!
 //! The models keep register state; the host's `Pins` does the I/O (the
 //! rp235x-hal drivers on the board, a simulated board on the Mac). Every
 //! operation completes synchronously, inside the guest's register write:
 //! I2C and SPI read their messages from guest RAM and write the replies
 //! there, so neither needs a queue, an interrupt or a guest thread.
+//!
+//! The PIO blocks are the RP2350's PIO1 and PIO2 themselves (PIO0 is the
+//! radio's): each is a 16 KiB window laid out as the chip's, the XOR, SET
+//! and CLR aliases at +0x1000, +0x2000 and +0x3000 included, so the guest
+//! can map it into a program and use the pico-sdk's register structs.
+//! What a PIO block can't do from its own registers is drive a pin: the
+//! pin's function is the firmware's, set through PIOCTL (kernel only), and
+//! only free pins go to a PIO block. CTRL's bits that would start or stop
+//! the radio's state machines (PIO1's PREV_PIO_MASK, PIO2's NEXT_PIO_MASK)
+//! are dropped.
+//!
+//! The PIO DMA device is a small pool of the chip's DMA channels, each
+//! moving data between a buffer in guest RAM and one PIO FIFO, paced by
+//! that FIFO: the guest names the buffer, the state machine and the
+//! transfer, never an address the channel would use, and the firmware
+//! checks the buffer is guest RAM before it starts one.
 
 use crate::cpu::exc;
 use crate::virtio::GuestMem;
 
 pub const IO_BASE: u32 = 0xF800_1000;
-pub const IO_SIZE: u32 = 0x2000;
+pub const IO_SIZE: u32 = 0xB000;
 pub const GPIO_BASE: u32 = 0xF800_1000;
 pub const GPIO_SIZE: u32 = 0x200;
 pub const GPIO_IRQ: u32 = 8;
@@ -33,6 +51,25 @@ pub const PWM_BASE: u32 = 0xF800_1800;
 pub const PWM_SIZE: u32 = 0x100;
 pub const ADC_BASE: u32 = 0xF800_1A00;
 pub const ADC_SIZE: u32 = 0x100;
+pub const PIOCTL_BASE: u32 = 0xF800_1E00;
+pub const PIOCTL_SIZE: u32 = 0x100;
+/// The guest's PIO blocks: the RP2350's PIO1 and PIO2.
+pub const PIO_BASE: [u32; 2] = [0xF800_4000, 0xF800_8000];
+pub const PIO_SIZE: u32 = 0x4000;
+pub const PIO_IRQ: [u32; 2] = [9, 10];
+pub const DMA_BASE: u32 = 0xF800_2000;
+pub const DMA_SIZE: u32 = 0x200;
+pub const DMA_IRQ: u32 = 11;
+/// The guest's DMA channels, at most.
+pub const DMA_CHANNELS: usize = 4;
+/// The longest ring (log2 bytes): guest RAM is only 4 KiB aligned in the
+/// board's address space, and a ring must be aligned to its size there.
+pub const DMA_RING_MAX: u32 = 12;
+/// A PIO block's registers: CTRL to IRQ1_INTS.
+pub const PIO_REGS: u32 = 0x188;
+/// CTRL: NEXTPREV_* reach the neighbour blocks' state machines.
+const PIO_CTRL_PREV_MASK: u32 = 0xF << 16;
+const PIO_CTRL_NEXT_MASK: u32 = 0xF << 20;
 
 /// GPIO lines (the RP2350B's GP0-GP47); PWM channel N is GPIO N.
 pub const NGPIO: u32 = 48;
@@ -174,6 +211,33 @@ pub struct Pwm {
     pub invert: bool,
 }
 
+/// One DMA transfer between guest RAM (`mem`, a host address) and PIO
+/// block `blk`'s state machine `sm`: `count` transfers of 1 << `size_log2`
+/// bytes, from its RX FIFO into `mem` (`from_fifo`) or from `mem` to its TX
+/// FIFO. With `ring_log2`, the memory address wraps within that many
+/// bytes (log2); `endless`: it never ends (with a ring only).
+#[derive(Clone, Copy, Debug)]
+pub struct DmaXfer {
+    pub mem: *mut u8,
+    pub size_log2: u32,
+    pub count: u32,
+    pub from_fifo: bool,
+    pub blk: usize,
+    pub sm: usize,
+    pub ring_log2: u32,
+    pub endless: bool,
+}
+
+/// Where a DMA channel is: still going, stopped on a bus error, transfers
+/// left, and the host address its memory side is at.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DmaState {
+    pub busy: bool,
+    pub error: bool,
+    pub remaining: u32,
+    pub mem: usize,
+}
+
 /// The board behind the devices.
 pub trait Pins {
     /// GPIO lines the guest may use (bit N = GPN).
@@ -204,6 +268,45 @@ pub trait Pins {
     fn pwm_set(&mut self, n: u32, pwm: Pwm) -> Pwm;
     /// Convert ADC channel `ch`: 12 bits, or None on a conversion error.
     fn adc(&mut self, ch: u32) -> Option<u16>;
+    /// PIO blocks the guest has (0, or 2: PIO1 and PIO2).
+    fn pio_blocks(&self) -> u32 {
+        0
+    }
+    /// The PIO blocks' clock (clk_sys), Hz.
+    fn pio_clk_hz(&self) -> u32 {
+        0
+    }
+    /// Read register `reg` (word aligned, below `PIO_REGS`) of PIO block
+    /// `blk` (0 PIO1, 1 PIO2).
+    fn pio_read(&mut self, _blk: usize, _reg: u32) -> u32 {
+        0
+    }
+    /// Write register `reg` through `alias` (0 normal, 1 XOR, 2 SET, 3 CLR).
+    fn pio_write(&mut self, _blk: usize, _alias: u32, _reg: u32, _v: u32) {}
+    /// Give free pin `n` to PIO block `blk`, or (None) back to its GPIO line,
+    /// which `gpio_set` then configures again.
+    fn pio_pin(&mut self, _n: u32, _blk: Option<usize>) {}
+    /// The PIO blocks whose IRQ0 output is up (bit `blk`). Called on every
+    /// device poll: make it cheap.
+    fn pio_irqs(&mut self) -> u32 {
+        0
+    }
+    /// DMA channels the guest has (at most `DMA_CHANNELS`).
+    fn dma_channels(&self) -> u32 {
+        0
+    }
+    /// Start `x` on channel `ch` (stopping what it was doing).
+    fn dma_start(&mut self, _ch: usize, _x: DmaXfer) {}
+    /// Stop channel `ch`; once this returns it no longer touches memory.
+    fn dma_stop(&mut self, _ch: usize) {}
+    fn dma_state(&mut self, _ch: usize) -> DmaState {
+        DmaState::default()
+    }
+    /// Channels that finished since the last call (bit `ch`). Called on the
+    /// device poll while a channel runs.
+    fn dma_done(&mut self) -> u32 {
+        0
+    }
 }
 
 /// No board (the devices are left out of the platform).
@@ -241,6 +344,9 @@ impl Pins for NoPins {
 struct Gpio {
     line: [Line; NGPIO as usize],
     pend: u64,
+    /// Lines whose pin a PIO block has: their configuration waits until the
+    /// pin comes back.
+    taken: u64,
 }
 
 impl Gpio {
@@ -266,7 +372,9 @@ impl Gpio {
     fn set(&mut self, n: usize, l: Line, pins: &mut impl Pins) {
         if pins.gpio_valid() >> n & 1 != 0 && self.line[n] != l {
             self.line[n] = l;
-            pins.gpio_set(n as u32, l);
+            if self.taken >> n & 1 == 0 {
+                pins.gpio_set(n as u32, l);
+            }
         }
     }
 
@@ -416,18 +524,11 @@ impl I2c {
 const SPI_MODE_LSB_FIRST: u32 = 8;
 /// Bytes sent per backend transfer when nothing is received.
 const SPI_CHUNK: usize = 64;
-/// The most bytes one SKIP clocks.
-pub const SPI_SKIP_MAX: u32 = 4096;
-/// SKIP's result when every byte matched.
-pub const SPI_SKIP_NONE: u32 = 0x100;
 
 /// `rvemu,spi`: TX (0x00) and RX (0x04) guest physical buffers (0: zeros
 /// out, nothing in), LEN (0x08), HZ (0x0c), MODE (0x10: Linux SPI_CPHA,
 /// SPI_CPOL, SPI_LSB_FIRST), CS (0x14: 1 drives the pin low) and GO (0x18),
-/// which runs the transfer. SKIP (0x1c): a write of BYTE | MAX << 8 sends
-/// 0xff a byte at a time until a byte other than BYTE comes back, at most
-/// MAX bytes (an SD card's wait for a token, or for busy to end); a read
-/// gives that byte, or `SPI_SKIP_NONE`.
+/// which runs the transfer.
 #[derive(Default)]
 struct Spi {
     tx: u32,
@@ -436,7 +537,6 @@ struct Spi {
     hz: u32,
     mode: u32,
     cs: u32,
-    skip: u32,
 }
 
 impl Spi {
@@ -448,7 +548,6 @@ impl Spi {
             0x0c => self.hz,
             0x10 => self.mode,
             0x14 => self.cs,
-            0x1c => self.skip,
             _ => 0,
         }
     }
@@ -465,22 +564,8 @@ impl Spi {
                 pins.spi_cs(bus, self.cs != 0);
             }
             0x18 => self.go(bus, mem, dirty, pins),
-            0x1c => self.skip = self.skip_until(bus, v as u8, (v >> 8).clamp(1, SPI_SKIP_MAX), pins),
             _ => {}
         }
-    }
-
-    fn skip_until(&self, bus: usize, byte: u8, max: u32, pins: &mut impl Pins) -> u32 {
-        let lsb = self.mode & SPI_MODE_LSB_FIRST != 0;
-        for _ in 0..max {
-            let mut b = [0xFF];
-            pins.spi_transfer(bus, self.hz, (self.mode & 3) as u8, &mut b);
-            let got = if lsb { b[0].reverse_bits() } else { b[0] };
-            if got != byte {
-                return u32::from(got);
-            }
-        }
-        SPI_SKIP_NONE
     }
 
     fn go(&mut self, bus: usize, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
@@ -563,7 +648,7 @@ impl PwmDev {
         }
     }
 
-    fn store(&mut self, off: u32, v: u32, pins: &mut impl Pins) {
+    fn store(&mut self, off: u32, v: u32, taken: u64, pins: &mut impl Pins) {
         match off {
             0x00 => {
                 self.sel = (v as usize).min(self.ch.len() - 1);
@@ -573,7 +658,8 @@ impl PwmDev {
             0x08 => self.staged.duty_ns = v,
             0x0c => {
                 let want = Pwm { enable: v & 1 != 0, invert: v & 2 != 0, ..self.staged };
-                let got = if pins.pwm_valid() >> self.sel & 1 != 0 {
+                // (not on a pin a PIO block has)
+                let got = if pins.pwm_valid() >> self.sel & 1 != 0 && taken >> self.sel & 1 == 0 {
                     pins.pwm_set(self.sel as u32, want)
                 } else {
                     Pwm::default()
@@ -582,6 +668,240 @@ impl PwmDev {
                 self.staged = got;
             }
             _ => {}
+        }
+    }
+}
+
+// ------------------------------------------------------------------ PIO
+
+/// `rvemu,pio`'s pin functions (PIOCTL): SEL (0x00) picks pin N; FUNC (0x04)
+/// is its function: 0 its GPIO line, 1 PIO1, 2 PIO2 (only pins in VALID).
+/// VALID at 0x08/0x0c, the PIO clock (Hz) at 0x10, the number of PIO blocks
+/// at 0x14.
+struct PioCtl {
+    sel: usize,
+    /// Each pin's function, as FUNC.
+    func: [u8; NGPIO as usize],
+}
+
+impl PioCtl {
+    fn valid(pins: &impl Pins) -> u64 {
+        if pins.pio_blocks() == 0 { 0 } else { pins.gpio_valid() }
+    }
+
+    fn load(&self, off: u32, pins: &impl Pins) -> u32 {
+        match off {
+            0x00 => self.sel as u32,
+            0x04 => u32::from(self.func[self.sel]),
+            0x08 => Self::valid(pins) as u32,
+            0x0c => (Self::valid(pins) >> 32) as u32,
+            0x10 => pins.pio_clk_hz(),
+            0x14 => pins.pio_blocks(),
+            _ => 0,
+        }
+    }
+
+    fn store(&mut self, off: u32, v: u32, gpio: &mut Gpio, pwm: &mut PwmDev, pins: &mut impl Pins) {
+        match off {
+            0x00 => self.sel = (v as usize).min(NGPIO as usize - 1),
+            0x04 => {
+                let n = self.sel;
+                if Self::valid(pins) >> n & 1 == 0 || v > pins.pio_blocks() || u32::from(self.func[n]) == v {
+                    return;
+                }
+                self.func[n] = v as u8;
+                if v == 0 {
+                    gpio.taken &= !(1 << n);
+                    pins.pio_pin(n as u32, None);
+                    pins.gpio_set(n as u32, gpio.line[n]);
+                } else {
+                    // PWM lets go of it first (the PIO driver takes the
+                    // line from gpiolib, which PWM channels don't use)
+                    if pwm.ch[n].enable {
+                        pins.pwm_set(n as u32, Pwm::default());
+                        pwm.ch[n] = Pwm::default();
+                        if pwm.sel == n {
+                            pwm.staged = Pwm::default();
+                        }
+                    }
+                    gpio.taken |= 1 << n;
+                    pins.pio_pin(n as u32, Some(v as usize - 1));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A PIO window address: (block, alias, register), None outside the blocks'
+/// registers.
+fn pio_reg(pa: u32) -> Option<(usize, u32, u32)> {
+    let off = pa.wrapping_sub(PIO_BASE[0]);
+    let blk = (off / PIO_SIZE) as usize;
+    let reg = off & 0xFFF & !3;
+    (blk < PIO_BASE.len() && reg < PIO_REGS).then_some((blk, off >> 12 & 3, reg))
+}
+
+/// A store to PIO block `blk`'s `reg`: CTRL loses the bits that reach PIO0.
+fn pio_store_value(blk: usize, reg: u32, v: u32) -> u32 {
+    if reg != 0 {
+        return v;
+    }
+    // PIO1's previous block, and PIO2's next, is PIO0
+    v & !if blk == 0 { PIO_CTRL_PREV_MASK } else { PIO_CTRL_NEXT_MASK }
+}
+
+// ------------------------------------------------------------------ PIO DMA
+
+const DMA_CTRL_FROM_FIFO: u32 = 1 << 2;
+const DMA_CTRL_ENDLESS: u32 = 1 << 3;
+const DMA_STATUS_BUSY: u32 = 1;
+const DMA_STATUS_ERROR: u32 = 2;
+const DMA_STATUS_REJECTED: u32 = 4;
+
+/// `rvemu,pio-dma`: channel N's registers at 0x40 * N: BUF (0x00, guest
+/// physical), COUNT (0x04), CTRL (0x08: bits 0-1 log2 transfer size, 2 from
+/// the RX FIFO into BUF (else BUF to the TX FIFO), 3 endless, 8-11 log2
+/// ring bytes (0 none), 16-17 state machine, 20 block: 0 PIO1, 1 PIO2), GO
+/// (0x0c: 1 starts, 0 stops), STATUS (0x10: 1 busy, 2 bus error, 4 refused
+/// for a bad setup), REMAIN (0x14: transfers left), POS (0x18: bytes past
+/// BUF the memory side is at). Then IRQ (0x100: channels done, write 1 to
+/// clear), IRQ_EN (0x104), NCHAN (0x108).
+#[derive(Default)]
+struct DmaCh {
+    buf: u32,
+    count: u32,
+    ctrl: u32,
+    rejected: bool,
+    /// The host address BUF is at.
+    mem0: usize,
+}
+
+#[derive(Default)]
+struct DmaDev {
+    ch: [DmaCh; DMA_CHANNELS],
+    pend: u32,
+    en: u32,
+    /// Channels started and not stopped.
+    active: u32,
+}
+
+impl DmaDev {
+    fn load(&mut self, off: u32, pins: &mut impl Pins) -> u32 {
+        let n = (off / 0x40) as usize;
+        if off < 0x100 {
+            if n >= pins.dma_channels() as usize {
+                return 0;
+            }
+            let c = &self.ch[n];
+            let mut st = || pins.dma_state(n);
+            return match off % 0x40 {
+                0x00 => c.buf,
+                0x04 => c.count,
+                0x08 => c.ctrl,
+                0x10 => {
+                    let s = st();
+                    u32::from(s.busy) * DMA_STATUS_BUSY
+                        | u32::from(s.error) * DMA_STATUS_ERROR
+                        | u32::from(c.rejected) * DMA_STATUS_REJECTED
+                }
+                0x14 => st().remaining,
+                0x18 => {
+                    let s = st();
+                    if s.mem == 0 { 0 } else { s.mem.wrapping_sub(c.mem0) as u32 }
+                }
+                _ => 0,
+            };
+        }
+        match off {
+            0x100 => self.pend,
+            0x104 => self.en,
+            0x108 => pins.dma_channels(),
+            _ => 0,
+        }
+    }
+
+    fn store(&mut self, off: u32, v: u32, mem: &GuestMem, dirty: &mut Dirty, pins: &mut impl Pins) {
+        let n = (off / 0x40) as usize;
+        if off >= 0x100 {
+            match off {
+                0x100 => self.pend &= !v,
+                0x104 => self.en = v & ((1 << DMA_CHANNELS) - 1),
+                _ => {}
+            }
+            return;
+        }
+        if n >= pins.dma_channels() as usize {
+            return;
+        }
+        match off % 0x40 {
+            0x00 => self.ch[n].buf = v,
+            0x04 => self.ch[n].count = v,
+            0x08 => self.ch[n].ctrl = v,
+            0x0c if v == 0 => {
+                pins.dma_stop(n);
+                self.active &= !(1 << n);
+            }
+            0x0c => {
+                pins.dma_stop(n);
+                self.active &= !(1 << n);
+                self.pend &= !(1 << n);
+                let c = &mut self.ch[n];
+                match Self::check(c, mem) {
+                    Some(x) => {
+                        c.rejected = false;
+                        c.mem0 = x.mem as usize;
+                        if x.from_fifo {
+                            let span = if x.ring_log2 != 0 { 1u64 << x.ring_log2 } else { u64::from(x.count) << x.size_log2 };
+                            dirty.note(u64::from(c.buf), span as usize);
+                        }
+                        pins.dma_start(n, x);
+                        self.active |= 1 << n;
+                    }
+                    None => c.rejected = true,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The transfer channel `c` asks for, if its buffer is guest RAM.
+    fn check(c: &DmaCh, mem: &GuestMem) -> Option<DmaXfer> {
+        let size_log2 = c.ctrl & 3;
+        let ring_log2 = c.ctrl >> 8 & 0xF;
+        let endless = c.ctrl & DMA_CTRL_ENDLESS != 0;
+        if size_log2 > 2 || c.count == 0 || c.count >= 1 << 28 || ring_log2 > DMA_RING_MAX {
+            return None;
+        }
+        if ring_log2 != 0 && ring_log2 < size_log2 || endless && ring_log2 == 0 {
+            return None;
+        }
+        let span = if ring_log2 != 0 { 1u64 << ring_log2 } else { u64::from(c.count) << size_log2 };
+        if span > u64::from(u32::MAX) {
+            return None;
+        }
+        let p = mem.range_mut(u64::from(c.buf), span as usize)?;
+        let align = if ring_log2 != 0 { 1usize << ring_log2 } else { 1 << size_log2 };
+        if p as usize % align != 0 {
+            return None;
+        }
+        Some(DmaXfer {
+            mem: p,
+            size_log2,
+            count: c.count,
+            from_fifo: c.ctrl & DMA_CTRL_FROM_FIFO != 0,
+            blk: (c.ctrl >> 20 & 1) as usize,
+            sm: (c.ctrl >> 16 & 3) as usize,
+            ring_log2,
+            endless,
+        })
+    }
+
+    fn poll(&mut self, pins: &mut impl Pins) {
+        if self.active != 0 {
+            let d = pins.dma_done() & self.active;
+            self.pend |= d;
+            self.active &= !d;
         }
     }
 }
@@ -597,6 +917,10 @@ pub struct Io<P: Pins> {
     i2c: [I2c; 2],
     spi: [Spi; 2],
     pwm: PwmDev,
+    pioctl: PioCtl,
+    /// The PIO blocks' IRQ0 outputs at the last poll (bit `blk`).
+    pio_irq: u32,
+    dma: DmaDev,
 }
 
 impl<P: Pins> Io<P> {
@@ -606,16 +930,30 @@ impl<P: Pins> Io<P> {
             mem,
             dirty: Dirty { r: [(0, 0); 8], n: 0 },
             // the RP2350's pads come out of reset pulled down
-            gpio: Gpio { line: [Line { pull_down: true, ..Line::default() }; NGPIO as usize], pend: 0 },
+            gpio: Gpio { line: [Line { pull_down: true, ..Line::default() }; NGPIO as usize], pend: 0, taken: 0 },
             i2c: [I2c::default(), I2c::default()],
             spi: [(); 2].map(|_| Spi { hz: 1_000_000, ..Spi::default() }),
             pwm: PwmDev { sel: 0, staged: Pwm::default(), ch: [Pwm::default(); NGPIO as usize] },
+            pioctl: PioCtl { sel: 0, func: [0; NGPIO as usize] },
+            pio_irq: 0,
+            dma: DmaDev::default(),
         }
     }
 
     pub fn load(&mut self, pa: u32, size: u32) -> Result<u32, u32> {
+        if pa >= PIO_BASE[0] {
+            // any width: a narrow read gets its part of the register
+            let Some((blk, _, reg)) = pio_reg(pa).filter(|_| pa & (size - 1) == 0) else { return Ok(0) };
+            if blk as u32 >= self.pins.pio_blocks() {
+                return Ok(0);
+            }
+            return Ok(self.pins.pio_read(blk, reg) >> (8 * (pa & 3)));
+        }
         if size != 4 {
             return Err(exc::LOAD_FAULT);
+        }
+        if pa & !0x1FF == DMA_BASE {
+            return Ok(self.dma.load(pa & 0x1FC, &mut self.pins));
         }
         let (dev, off) = (pa & !0x1FF, pa & 0xFF);
         let pins = &mut self.pins;
@@ -627,13 +965,33 @@ impl<P: Pins> Io<P> {
             b if b == SPI_BASE[1] => self.spi[1].load(off),
             PWM_BASE => self.pwm.load(off, pins),
             ADC_BASE if off < 4 * ADC_CHANNELS => pins.adc(off / 4).map_or(1 << 31, u32::from),
+            PIOCTL_BASE => self.pioctl.load(off, pins),
             _ => 0,
         })
     }
 
     pub fn store(&mut self, pa: u32, size: u32, v: u32) -> Result<(), u32> {
+        if pa >= PIO_BASE[0] {
+            // a narrow write is copied across the word, as the chip's bus
+            // does it (8-bit writes to a TX FIFO push the byte four times)
+            let Some((blk, alias, reg)) = pio_reg(pa).filter(|_| pa & (size - 1) == 0) else { return Ok(()) };
+            if blk as u32 >= self.pins.pio_blocks() {
+                return Ok(());
+            }
+            let v = match size {
+                1 => (v & 0xFF) * 0x0101_0101,
+                2 => (v & 0xFFFF) * 0x0001_0001,
+                _ => v,
+            };
+            self.pins.pio_write(blk, alias, reg, pio_store_value(blk, reg, v));
+            return Ok(());
+        }
         if size != 4 {
             return Err(exc::STORE_FAULT);
+        }
+        if pa & !0x1FF == DMA_BASE {
+            self.dma.store(pa & 0x1FC, v, &self.mem, &mut self.dirty, &mut self.pins);
+            return Ok(());
         }
         let (dev, off) = (pa & !0x1FF, pa & 0xFF);
         let (pins, mem, dirty) = (&mut self.pins, &self.mem, &mut self.dirty);
@@ -643,15 +1001,23 @@ impl<P: Pins> Io<P> {
             b if b == I2C_BASE[1] => self.i2c[1].store(1, off, v, mem, dirty, pins),
             b if b == SPI_BASE[0] => self.spi[0].store(0, off, v, mem, dirty, pins),
             b if b == SPI_BASE[1] => self.spi[1].store(1, off, v, mem, dirty, pins),
-            PWM_BASE => self.pwm.store(off, v, pins),
+            PWM_BASE => self.pwm.store(off, v, self.gpio.taken, pins),
+            PIOCTL_BASE => self.pioctl.store(off, v, &mut self.gpio, &mut self.pwm, pins),
             _ => {}
         }
         Ok(())
     }
 
-    /// Pick up GPIO edges.
+    /// Pick up GPIO edges and the PIO blocks' interrupts.
     pub fn poll(&mut self) {
         self.gpio.poll(&mut self.pins);
+        self.pio_irq = self.pins.pio_irqs();
+        self.dma.poll(&mut self.pins);
+    }
+
+    /// The PIO DMA device's interrupt line (PLIC `DMA_IRQ`).
+    pub fn dma_irq_line(&self) -> bool {
+        self.dma.pend & self.dma.en != 0
     }
 
     /// The GPIO controller's interrupt line (PLIC `GPIO_IRQ`).
@@ -659,7 +1025,105 @@ impl<P: Pins> Io<P> {
         self.gpio.pend != 0
     }
 
+    /// PIO block `blk`'s interrupt line (PLIC `PIO_IRQ[blk]`).
+    pub fn pio_irq_line(&self, blk: usize) -> bool {
+        self.pio_irq >> blk & 1 != 0
+    }
+
     pub fn take_dma_write(&mut self) -> Option<(u32, u32)> {
         self.dirty.take()
+    }
+}
+
+#[cfg(test)]
+mod dma_tests {
+    use super::*;
+    extern crate std;
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+    const RAM: u32 = 0x10000;
+    const RO: u32 = 0x2000;
+
+    /// 64 KiB of guest RAM at guest address 0, 4 KiB aligned in host
+    /// space as on the board, the first 8 KiB read-only.
+    struct Ram(*mut u8, Layout);
+    impl Ram {
+        fn new() -> Self {
+            let l = Layout::from_size_align(RAM as usize, 4096).unwrap();
+            // SAFETY: a non-zero size.
+            Ram(unsafe { alloc_zeroed(l) }, l)
+        }
+        fn mem(&self) -> GuestMem {
+            GuestMem { ptr: self.0, base: 0, size: RAM, ro: RO }
+        }
+    }
+    impl Drop for Ram {
+        fn drop(&mut self) {
+            // SAFETY: allocated in new with this layout.
+            unsafe { dealloc(self.0, self.1) }
+        }
+    }
+
+    fn ch(buf: u32, count: u32, ctrl: u32) -> DmaCh {
+        DmaCh { buf, count, ctrl, ..Default::default() }
+    }
+
+    #[test]
+    fn a_plain_transfer_is_accepted() {
+        let r = Ram::new();
+        let x = DmaDev::check(&ch(0x3000, 256, 2 | DMA_CTRL_FROM_FIFO | 1 << 20 | 3 << 16), &r.mem()).unwrap();
+        assert_eq!((x.size_log2, x.count, x.from_fifo, x.blk, x.sm), (2, 256, true, 1, 3));
+        assert_eq!(x.mem, unsafe { r.0.add(0x3000) });
+        assert!(!x.endless && x.ring_log2 == 0);
+    }
+
+    #[test]
+    fn transfers_stay_in_writable_guest_ram() {
+        let r = Ram::new();
+        let m = r.mem();
+        // in the read-only prefix, in either direction
+        assert!(DmaDev::check(&ch(RO - 4, 1, 2), &m).is_none());
+        assert!(DmaDev::check(&ch(0, 1, 2 | DMA_CTRL_FROM_FIFO), &m).is_none());
+        // running off the end of RAM, by one word or by a wrapping count
+        assert!(DmaDev::check(&ch(RAM - 4, 2, 2), &m).is_none());
+        assert!(DmaDev::check(&ch(RAM - 4, 1, 2), &m).is_some());
+        assert!(DmaDev::check(&ch(RO, 0x0FFF_FFFF, 2), &m).is_none());
+        // past RAM altogether, and MMIO addresses
+        assert!(DmaDev::check(&ch(RAM, 1, 0), &m).is_none());
+        assert!(DmaDev::check(&ch(PIO_BASE[0], 1, 2), &m).is_none());
+    }
+
+    #[test]
+    fn bad_setups_are_refused() {
+        let r = Ram::new();
+        let m = r.mem();
+        // transfer size 3, no transfers, COUNT's mode nibble
+        assert!(DmaDev::check(&ch(0x4000, 1, 3), &m).is_none());
+        assert!(DmaDev::check(&ch(0x4000, 0, 2), &m).is_none());
+        assert!(DmaDev::check(&ch(0x4000, 0xF000_0000 | 1, 2), &m).is_none());
+        // misaligned for the transfer size
+        assert!(DmaDev::check(&ch(0x4002, 1, 2), &m).is_none());
+        assert!(DmaDev::check(&ch(0x4001, 1, 1), &m).is_none());
+        assert!(DmaDev::check(&ch(0x4001, 1, 0), &m).is_some());
+        // endless needs a ring
+        assert!(DmaDev::check(&ch(0x4000, 1, 2 | DMA_CTRL_ENDLESS), &m).is_none());
+    }
+
+    #[test]
+    fn rings_are_aligned_and_bounded() {
+        let r = Ram::new();
+        let m = r.mem();
+        let ring = |n: u32| n << 8;
+        // a 4 KiB ring, endless, any count
+        let x = DmaDev::check(&ch(0x4000, 1, 2 | ring(12) | DMA_CTRL_ENDLESS), &m).unwrap();
+        assert!(x.endless && x.ring_log2 == 12);
+        // the ring is what must fit, not count transfers
+        assert!(DmaDev::check(&ch(RAM - 0x100, 1000, 2 | ring(8)), &m).is_some());
+        // larger than 4 KiB, misaligned, or smaller than one transfer
+        assert!(DmaDev::check(&ch(0x4000, 1, 2 | ring(13) | DMA_CTRL_ENDLESS), &m).is_none());
+        assert!(DmaDev::check(&ch(0x4100, 1, 2 | ring(12)), &m).is_none());
+        assert!(DmaDev::check(&ch(0x4000, 1, 2 | ring(1)), &m).is_none());
+        // a ring in the read-only prefix
+        assert!(DmaDev::check(&ch(0x1000, 1, 2 | ring(12) | DMA_CTRL_ENDLESS), &m).is_none());
     }
 }

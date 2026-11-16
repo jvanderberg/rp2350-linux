@@ -338,6 +338,8 @@ unsafe fn in_ram(rom: &Rom, op: Op, offs: u32, page: *const u8) {
     }
     let xip_ctrl = rd(XIP_CTRL);
 
+    // the guest's PIO DMA channels off the XIP bus (guest RAM is PSRAM)
+    let dma = crate::pins::dma_pause();
     // SAFETY: bootrom code (not XIP); the caller's guarantees.
     unsafe {
         (rom.connect)();
@@ -375,4 +377,5 @@ unsafe fn in_ram(rom: &Rom, op: Op, offs: u32, page: *const u8) {
     rd(XIP_CTRL);
     // SAFETY: ordering barrier only.
     unsafe { asm!("fence iorw, iorw") };
+    crate::pins::dma_resume(dma);
 }

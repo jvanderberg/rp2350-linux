@@ -1,0 +1,6 @@
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+# rp235x_riscv.x adds the RP2350 boot blocks, then includes riscv-rt's link.x.
+rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Trp235x_riscv.x"]

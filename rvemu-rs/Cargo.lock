@@ -1263,6 +1263,7 @@ name = "rvemu"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "pio-parser",
  "rvcore",
  "rvjit",
 ]

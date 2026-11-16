@@ -1,0 +1,21 @@
+[package]
+name = "pintester"
+version = "0.1.0"
+edition = "2021"
+description = "Pin test fixture for a second RP2350B board: GPIO, edges, PWM measurement and an I2C target, driven over USB serial"
+
+[dependencies]
+rp2350-board = { path = "../board", default-features = false }
+rp235x-hal = { version = "0.4", features = ["rt", "critical-section-impl", "binary-info"] }
+embedded-hal = "1.0"
+fugit = "0.3"
+usb-device = "0.3"
+usbd-serial = "0.2"
+rtt-target = "0.6"
+panic-rtt-target = "0.2"
+
+[profile.release]
+opt-level = 3
+debug = true
+lto = true
+codegen-units = 1

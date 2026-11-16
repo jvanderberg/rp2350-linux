@@ -21,6 +21,7 @@ mod pv_pages;
 mod pv_buffers;
 /// Native libraries are not represented in the instruction/cache timing model.
 pub const NATIVE_BUFFERS: bool = cfg!(feature = "pv-buffers");
+pub mod sdcard;
 pub mod swapdev;
 pub mod virtio;
 

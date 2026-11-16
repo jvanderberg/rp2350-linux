@@ -2,8 +2,10 @@
 obj-$(CONFIG_RVEMU_GPIO) += gpio-rvemu.o
 obj-$(CONFIG_RVEMU_PWM) += pwm-rvemu.o
 obj-$(CONFIG_RVEMU_ADC) += adc-rvemu.o
+obj-$(CONFIG_RVEMU_PIO) += pio-rvemu.o
 obj-$(CONFIG_RVEMU_I2C) += i2c-rvemu.o
 obj-$(CONFIG_RVEMU_SPI) += spi-rvemu.o
 obj-$(CONFIG_RVEMU_CRYPTO) += crypto-rvemu.o
 obj-$(CONFIG_RVEMU_SSH) += ssh-rvemu.o
 obj-$(CONFIG_RVEMU_BENCH) += bench-rvemu.o
+obj-$(CONFIG_RVEMU_LZ4) += lz4-rvemu.o

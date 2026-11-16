@@ -10,3 +10,7 @@ libc = "0.2"
 
 [features]
 pv-buffers = ["rvcore/pv-buffers"]
+
+[dev-dependencies]
+# piosim's tests assemble their programs (the firmware's assembler)
+pio-parser = "0.3"

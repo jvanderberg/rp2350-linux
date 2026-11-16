@@ -5,3 +5,15 @@
 CONFIG_STATIC=y
 # taskset: run a program on a chosen CPU (the two-CPU kernel, pico-shell.sh -c 2)
 CONFIG_TASKSET=y
+# swapon -p: the SD card's swap goes ahead of the flash swap (S03sd)
+CONFIG_FEATURE_SWAPON_PRI=y
+# tar -z/-J/-j and compressed archives by their magic (the decompressors
+# are built in already, as gunzip, unxz, bunzip2)
+CONFIG_FEATURE_SEAMLESS_GZ=y
+CONFIG_FEATURE_SEAMLESS_XZ=y
+CONFIG_FEATURE_SEAMLESS_BZ2=y
+CONFIG_FEATURE_TAR_AUTODETECT=y
+# cpio -o (creating archives)
+CONFIG_FEATURE_CPIO_O=y
+# no devmem: the kernel has no /dev/mem
+# CONFIG_DEVMEM is not set

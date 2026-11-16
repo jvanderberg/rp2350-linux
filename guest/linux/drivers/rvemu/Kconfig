@@ -37,8 +37,16 @@ config RVEMU_SPI
 	bool "rvemu SPI controller"
 	depends on SPI_MASTER && OF
 	help
-	  The rvemu machine's SPI controllers, one per RP2350 SPI block
-	  (SPI1 carries the SD card), driven synchronously by the emulator.
+	  The rvemu machine's SPI controller (the RP2350's SPI0), driven
+	  synchronously by the emulator. SPI1 carries the SD card, which the
+	  firmware drives itself (a virtio disk).
+
+config RVEMU_PIO
+	bool "rvemu PIO blocks"
+	depends on GPIOLIB && OF
+	help
+	  /dev/pio1 and /dev/pio2: the RP2350's PIO1 and PIO2, mapped into
+	  the program that opens one, with pins taken from gpiolib.
 
 config RVEMU_CRYPTO
 	bool "rvemu native crypto engine"
@@ -63,3 +71,10 @@ config RVEMU_BENCH
 	  /dev/rvemu-bench: points at which the firmware records its cycle
 	  counters (SBI extension 0x0a000002), and the report it prints on
 	  its console.
+
+config RVEMU_LZ4
+	bool "rvemu native LZ4 for squashfs"
+	depends on RISCV_SBI
+	help
+	  squashfs's LZ4 blocks decoded by the native engine on physical
+	  memory, with no vmalloc'd buffers (squashfs-lz4-rvemu.patch).

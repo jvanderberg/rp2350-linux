@@ -1,0 +1,7 @@
+config BR2_PACKAGE_LIBPIO
+	bool "libpio"
+	help
+	  The RP2350's PIO1 and PIO2 for programs: libpio (the pico-sdk's
+	  hardware_pio functions over /dev/pio1 and /dev/pio2, with a run
+	  time assembler), pioasm (a .pio file to a C header), and
+	  examples in /usr/share/examples/pio.

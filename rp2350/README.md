@@ -56,6 +56,7 @@ The flash map is in the [top-level README](../README.md#flash-map-16-mb).
 | `boot-wait.py START [--log FILE]` | wait for `login:` on the console and print the seconds since START (`pico-shell.sh` writes it to `rvemu-rs/target/pico-last-launch`) |
 | `pack-guest.py IMAGE INITRD DTB RAM_MB TEXT_LEN BLOB TEXT` | split an Image into the flash text and the guest blob |
 | `board-cmd.py [--port P] [--timeout S] COMMAND...` | run a command in the board's shell over the USB console (logs in as root if needed), print its output, exit with its status |
+| `pin-test.py [--host ADDR] [--only NAME,...]` | test the Linux board's GPIO, edges, pull-up, PWM, I2C, SPI, MicroPython `machine`, and PIO and DMA from C and MicroPython `rp2`, against a second board running `pintester/` (wiring in the script) |
 | `serial-chat.py PORT EXPECT [SEND EXPECT]...` | script a serial console: wait for a pattern, send a line, repeat |
 | `run-riscv.sh ELF [TIMEOUT] [STOP_REGEX]` | flash a Hazard3 ELF with probe-rs and stream RTT; `ATTACH=1` attaches to a running program instead |
 | `rtt.py CB_ADDR` | RTT reader over OpenOCD's Tcl port |
@@ -66,6 +67,23 @@ The flash map is in the [top-level README](../README.md#flash-map-16-mb).
 The echoed command line keeps the quotes, so only real output matches the
 markers, and the random tag rules out stale ones. The port takes one program
 at a time, so close `screen` first.
+
+## pintester/ (RISC-V, Rust, rp235x-hal)
+
+A pin test fixture for a second RP2350B board: GPIO levels, pulses, PWM
+measurement and an I2C target (I2C1, GP14/GP15, address 0x42, a 256-byte
+register file), driven over USB serial (`/dev/cu.usbmodempintest1`) by
+`tools/pin-test.py`. Opening that port at 1200 baud, or its `bootsel`
+command, reboots it into BOOTSEL.
+
+```sh
+cd pintester && cargo build --release
+picotool load --ser SERIAL -v -x -t elf target/riscv32imac-unknown-none-elf/release/pintester
+```
+
+`debugprobe-v2.3.1-backup.uf2` is the firmware that board had before
+(Raspberry Pi's debugprobe 2.3.1, read back with picotool); put it back with
+`picotool load --ser SERIAL -v -x debugprobe-v2.3.1-backup.uf2`.
 
 ## psramtest/ (Arm, C, Pico SDK)
 

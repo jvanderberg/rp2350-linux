@@ -21,19 +21,28 @@ pub const VIRTIO_NET_IRQ: u32 = 3;
 /// Swap device registers (a second, writable block device).
 pub const VIRTIO_SWAP_BASE: u32 = 0xF800_0600;
 pub const VIRTIO_SWAP_IRQ: u32 = 5;
+/// SD card registers (a writable block device with removable media).
+pub const VIRTIO_SD_BASE: u32 = 0xF800_0800;
+pub const VIRTIO_SD_IRQ: u32 = 6;
 
 const MAGIC: u32 = 0x7472_6976; // "virt"
 const DEVICE_NET: u32 = 1;
 const DEVICE_BLK: u32 = 2;
 const VENDOR: u32 = 0x554D_4552; // "REMU"
 /// Queue sizes. Linux stops a network transmit queue while fewer than
-/// MAX_SKB_FRAGS + 2 (19) descriptors are free, so that one needs 32; the
-/// others stay small (every posted receive buffer is guest RAM held).
-const BLK_QUEUE: u32 = 16;
+/// MAX_SKB_FRAGS + 2 (19) descriptors are free, so that one needs 32. A
+/// block request's whole chain must fit too (`SEG_MAX`). The receive queue
+/// stays small (every posted receive buffer is guest RAM held).
+const BLK_QUEUE: u32 = 32;
 const NET_RX_QUEUE: u32 = 16;
 const NET_TX_QUEUE: u32 = 32;
 /// Longest descriptor chain followed (the largest queue).
 const CHAIN_MAX: usize = 32;
+/// The most data segments a block request may have: the chain less its
+/// header and status descriptors. Without indirect descriptors a request's
+/// chain must fit in the queue, or the driver can never post it.
+pub const SEG_MAX: u32 = BLK_QUEUE - 2;
+const _: () = assert!(SEG_MAX as usize + 2 <= CHAIN_MAX);
 const NQUEUES: usize = 2;
 
 /// VIRTIO_F_VERSION_1 is feature bit 32: bit 0 of the high word.
@@ -42,6 +51,7 @@ const F_HI_VERSION_1: u32 = 1;
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 
+const BLK_F_SEG_MAX: u32 = 1 << 2;
 const BLK_F_RO: u32 = 1 << 5;
 const BLK_F_BLK_SIZE: u32 = 1 << 6;
 const BLK_T_IN: u32 = 0;
@@ -81,6 +91,41 @@ pub trait Disk {
     fn write(&mut self, _sector: u64, _buf: &[u8]) -> bool {
         false
     }
+    /// The most data segments (descriptors) one request may carry, offered
+    /// to the driver as `seg_max` (VIRTIO_BLK_F_SEG_MAX). Above 1, the
+    /// driver merges adjacent pages into one request, and the backend gets
+    /// them all at once in `read_segs` / `write_segs`.
+    fn segments(&self) -> u32 {
+        1
+    }
+    /// One request's data segments, in order, from `sector` on: each a
+    /// multiple of 512 bytes.
+    fn read_segs(&mut self, sector: u64, segs: &mut [&mut [u8]]) -> bool {
+        let mut s = sector;
+        for b in segs.iter_mut() {
+            if !self.read(s, b) {
+                return false;
+            }
+            s += b.len() as u64 / 512;
+        }
+        true
+    }
+    fn write_segs(&mut self, sector: u64, segs: &[&[u8]]) -> bool {
+        let mut s = sector;
+        for b in segs {
+            if !self.write(s, b) {
+                return false;
+            }
+            s += b.len() as u64 / 512;
+        }
+        true
+    }
+    /// Removable media: look for a change (called while the guest idles).
+    /// True when `sectors` changed, which the device reports to the driver
+    /// as a configuration change.
+    fn poll(&mut self) -> bool {
+        false
+    }
 }
 
 impl<D: Disk + ?Sized> Disk for &mut D {
@@ -101,6 +146,18 @@ impl<D: Disk + ?Sized> Disk for &mut D {
     }
     fn write(&mut self, sector: u64, buf: &[u8]) -> bool {
         (**self).write(sector, buf)
+    }
+    fn poll(&mut self) -> bool {
+        (**self).poll()
+    }
+    fn segments(&self) -> u32 {
+        (**self).segments()
+    }
+    fn read_segs(&mut self, sector: u64, segs: &mut [&mut [u8]]) -> bool {
+        (**self).read_segs(sector, segs)
+    }
+    fn write_segs(&mut self, sector: u64, segs: &[&[u8]]) -> bool {
+        (**self).write_segs(sector, segs)
     }
 }
 
@@ -134,6 +191,10 @@ impl MemDisk {
 impl Disk for MemDisk {
     fn sectors(&self) -> u64 {
         (self.len / 512) as u64
+    }
+    /// A copy whatever the size: fewer, larger requests cost the guest less.
+    fn segments(&self) -> u32 {
+        SEG_MAX
     }
     fn read(&mut self, sector: u64, buf: &mut [u8]) -> bool {
         let Some(off) = usize::try_from(sector).ok().and_then(|s| s.checked_mul(512)) else { return false };
@@ -250,7 +311,10 @@ struct Desc {
 }
 
 const NO_DESC: Desc = Desc { addr: 0, len: 0, flags: 0 };
-const DIRTY_MAX: usize = 8;
+/// Separate ranges kept: a block request's segments are scattered pages,
+/// and merging them would have the translator drop the code of every page
+/// in between.
+const DIRTY_MAX: usize = SEG_MAX as usize + 1;
 
 /// What a register store asks of the device.
 enum Kick {
@@ -484,7 +548,8 @@ impl<D: Disk> VirtioBlk<D> {
     pub fn new(disk: D, mem: GuestMem) -> Self {
         let ro = if disk.read_only() { BLK_F_RO } else { 0 };
         let bs = if disk.block_size() != 512 { BLK_F_BLK_SIZE } else { 0 };
-        VirtioBlk { disk, t: Transport::new(mem, DEVICE_BLK, &[BLK_QUEUE], ro | bs) }
+        let seg = if disk.segments() > 1 { BLK_F_SEG_MAX } else { 0 };
+        VirtioBlk { disk, t: Transport::new(mem, DEVICE_BLK, &[BLK_QUEUE], ro | bs | seg) }
     }
 
     pub fn irq_line(&self) -> bool {
@@ -495,12 +560,27 @@ impl<D: Disk> VirtioBlk<D> {
         self.t.take_dma_write()
     }
 
+    /// Removable media: let the backend look for a change, and tell the
+    /// driver about one (config-change interrupt). True if the interrupt
+    /// line may have changed.
+    pub fn poll_media(&mut self) -> bool {
+        if !self.disk.poll() {
+            return false;
+        }
+        self.t.config_generation = self.t.config_generation.wrapping_add(1);
+        if self.t.driver_ok() {
+            self.t.int_status |= 2;
+        }
+        true
+    }
+
     pub fn load(&mut self, off: u32, size: u32) -> Result<u32, u32> {
         if off >= 0x100 {
             // virtio_blk_config: u64 capacity, size_max, seg_max, geometry,
             // blk_size; the rest isn't offered
             let mut cfg = [0u8; 24];
             cfg[..8].copy_from_slice(&self.disk.sectors().to_le_bytes());
+            cfg[12..16].copy_from_slice(&self.disk.segments().clamp(1, SEG_MAX).to_le_bytes());
             cfg[20..].copy_from_slice(&self.disk.block_size().to_le_bytes());
             return Ok(config_read(&cfg, off - 0x100, size));
         }
@@ -542,45 +622,50 @@ impl<D: Disk> VirtioBlk<D> {
         let mut written = 0u32;
         let status = match kind {
             BLK_T_IN => {
-                let mut s = sector;
-                let mut ok = true;
-                for d in data {
-                    if d.flags & DESC_F_WRITE == 0 {
-                        ok = false;
+                let mut segs: [&mut [u8]; CHAIN_MAX] = core::array::from_fn(|_| &mut [][..]);
+                // the guest writes the chain: buffers that overlap would be
+                // aliased `&mut` slices, so such a request is refused
+                let mut ok = data.len() <= CHAIN_MAX && !overlapping(data);
+                let mut built = 0;
+                for (d, seg) in data.iter().zip(segs.iter_mut()) {
+                    if !ok {
                         break;
                     }
-                    let Some(p) = mem.range_mut(d.addr, d.len as usize) else {
+                    let p = mem.range_mut(d.addr, d.len as usize).filter(|_| d.flags & DESC_F_WRITE != 0 && d.len % 512 == 0);
+                    let Some(p) = p else {
                         ok = false;
                         break;
                     };
-                    // SAFETY: `range_mut` checked the bounds; guest RAM is ours.
-                    let buf = unsafe { core::slice::from_raw_parts_mut(p, d.len as usize) };
-                    if !self.disk.read(s, buf) {
-                        ok = false;
-                        break;
+                    // SAFETY: `range_mut` checked the bounds; guest RAM is
+                    // ours, and `overlapping` checked the buffers are apart.
+                    *seg = unsafe { core::slice::from_raw_parts_mut(p, d.len as usize) };
+                    built += 1;
+                }
+                if ok {
+                    ok = self.disk.read_segs(sector, &mut segs[..data.len()]);
+                    // a failed read may still have written some of them
+                    // (the SD card's data lands before its CRC is checked)
+                    for d in &data[..built] {
+                        self.t.note_dirty(d.addr, d.len as usize);
                     }
-                    self.t.note_dirty(d.addr, d.len as usize);
-                    written += d.len;
-                    s += d.len as u64 / 512;
+                    if ok {
+                        written += data.iter().map(|d| d.len).sum::<u32>();
+                    }
                 }
                 if ok { BLK_S_OK } else { BLK_S_IOERR }
             }
             BLK_T_OUT => {
-                let mut s = sector;
-                let mut ok = !self.disk.read_only();
-                for d in data {
-                    if !ok {
-                        break;
-                    }
-                    let Some(p) = mem.range(d.addr, d.len as usize) else {
+                let mut segs: [&[u8]; CHAIN_MAX] = [&[]; CHAIN_MAX];
+                let mut ok = !self.disk.read_only() && data.len() <= CHAIN_MAX;
+                for (d, seg) in data.iter().zip(segs.iter_mut()) {
+                    let Some(p) = mem.range(d.addr, d.len as usize).filter(|_| d.len % 512 == 0) else {
                         ok = false;
                         break;
                     };
                     // SAFETY: `range` checked the bounds.
-                    let buf = unsafe { core::slice::from_raw_parts(p, d.len as usize) };
-                    ok = self.disk.write(s, buf);
-                    s += d.len as u64 / 512;
+                    *seg = unsafe { core::slice::from_raw_parts(p, d.len as usize) };
                 }
+                ok = ok && self.disk.write_segs(sector, &segs[..data.len()]);
                 if ok { BLK_S_OK } else { BLK_S_IOERR }
             }
             BLK_T_FLUSH => BLK_S_OK,
@@ -601,6 +686,14 @@ impl<D: Disk> VirtioBlk<D> {
         self.t.dma_write(chain[n - 1].addr, &[status]);
         written + 1
     }
+}
+
+/// True when two of the descriptors' buffers share a byte.
+fn overlapping(d: &[Desc]) -> bool {
+    d.iter().enumerate().any(|(i, a)| {
+        let end = |x: &Desc| x.addr.saturating_add(u64::from(x.len));
+        d[i + 1..].iter().any(|b| a.addr < end(b) && b.addr < end(a))
+    })
 }
 
 // ------------------------------------------------------------------ network device
@@ -718,5 +811,124 @@ impl<L: NetLink> VirtioNet<L> {
             // a frame that didn't fit is dropped, as a real NIC would
             self.t.push_used(0, head, if src.is_empty() { written } else { 0 });
         }
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn d(addr: u64, len: u32) -> Desc {
+        Desc { addr, len, flags: DESC_F_WRITE }
+    }
+
+    #[test]
+    fn overlapping_buffers_are_found() {
+        assert!(!overlapping(&[d(0x1000, 512), d(0x1200, 512), d(0x2000, 1024)]));
+        assert!(overlapping(&[d(0x1000, 512), d(0x2000, 512), d(0x1000, 512)]));
+        assert!(overlapping(&[d(0x1000, 1024), d(0x1200, 512)]));
+        assert!(overlapping(&[d(0x1200, 512), d(0x1000, 1024)]));
+        // no wrap past the top of the address space
+        assert!(overlapping(&[d(u64::MAX - 100, 512), d(u64::MAX - 10, 512)]));
+        assert!(!overlapping(&[d(u64::MAX - 100, 512), d(0, 512)]));
+    }
+
+    // ---- whole requests, through the queue as the driver sets it up
+
+    extern crate std;
+    use std::{vec, vec::Vec};
+
+    /// A card that fills what it is given with 0xA5, failing if told to
+    /// (as the SD card can, after its data has landed).
+    struct Card {
+        fail: bool,
+        reads: usize,
+    }
+    impl Disk for Card {
+        fn sectors(&self) -> u64 {
+            1024
+        }
+        fn segments(&self) -> u32 {
+            8
+        }
+        fn read(&mut self, _sector: u64, buf: &mut [u8]) -> bool {
+            self.reads += 1;
+            buf.fill(0xA5);
+            !self.fail
+        }
+    }
+
+    const DESC: u64 = 0x1000;
+    const AVAIL: u64 = 0x2000;
+    const USED: u64 = 0x3000;
+    const HDR: u64 = 0x4000;
+    const STATUS: u64 = 0x4100;
+
+    /// One BLK_T_IN request with these data buffers through a fresh device:
+    /// (status byte, bytes the device reported, the dirty ranges, guest RAM,
+    /// the card's read calls).
+    fn read_request(fail: bool, data: &[(u64, u32)]) -> (u8, u32, Vec<(u32, u32)>, Vec<u8>, usize) {
+        let mut ram = vec![0u8; 0x10000];
+        let mem = GuestMem { ptr: ram.as_mut_ptr(), base: 0, size: ram.len() as u32, ro: 0 };
+        let mut blk = VirtioBlk::new(Card { fail, reads: 0 }, mem);
+        let w32 = |ram: &mut Vec<u8>, a: u64, v: u32| ram[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
+        let w16 = |ram: &mut Vec<u8>, a: u64, v: u16| ram[a as usize..a as usize + 2].copy_from_slice(&v.to_le_bytes());
+        let mut chain = vec![(HDR, 16u32, 0u16)];
+        chain.extend(data.iter().map(|&(a, l)| (a, l, DESC_F_WRITE)));
+        chain.push((STATUS, 1, DESC_F_WRITE));
+        for (i, &(addr, len, flags)) in chain.iter().enumerate() {
+            let e = DESC + 16 * i as u64;
+            ram[e as usize..e as usize + 8].copy_from_slice(&addr.to_le_bytes());
+            w32(&mut ram, e + 8, len);
+            let last = i == chain.len() - 1;
+            w16(&mut ram, e + 12, flags | if last { 0 } else { DESC_F_NEXT });
+            w16(&mut ram, e + 14, i as u16 + 1);
+        }
+        w32(&mut ram, HDR, BLK_T_IN); // type; sector 0
+        ram[STATUS as usize] = 0xFF;
+        w16(&mut ram, AVAIL + 2, 1); // idx 1, ring[0] = head 0
+        for (off, v) in [(0x030, 0), (0x038, 16), (0x080, DESC as u32), (0x090, AVAIL as u32), (0x0a0, USED as u32), (0x044, 1), (0x070, 0xF)] {
+            blk.store(off, 4, v).unwrap();
+        }
+        blk.store(0x050, 4, 0).unwrap();
+        let mut dirty = Vec::new();
+        while let Some(r) = blk.take_dma_write() {
+            dirty.push(r);
+        }
+        let used_len = u32::from_le_bytes(ram[USED as usize + 8..USED as usize + 12].try_into().unwrap());
+        let reads = blk.disk.reads;
+        (ram[STATUS as usize], used_len, dirty, ram, reads)
+    }
+
+    fn covered(dirty: &[(u32, u32)], a: u64, len: u32) -> bool {
+        dirty.iter().any(|&(lo, hi)| u64::from(lo) <= a && a + u64::from(len) <= u64::from(hi))
+    }
+
+    #[test]
+    fn a_read_lands_and_is_reported() {
+        let (st, n, dirty, ram, _) = read_request(false, &[(0x5000, 512), (0x8000, 1024)]);
+        assert_eq!(st, BLK_S_OK);
+        assert_eq!(n, 512 + 1024 + 1);
+        assert!(ram[0x5000..0x5200].iter().chain(&ram[0x8000..0x8400]).all(|&b| b == 0xA5));
+        assert!(covered(&dirty, 0x5000, 512) && covered(&dirty, 0x8000, 1024));
+    }
+
+    #[test]
+    fn a_failed_read_still_reports_what_it_wrote() {
+        // the translator must drop code in those pages even though the
+        // request failed (the review's finding: they went unreported)
+        let (st, n, dirty, ram, _) = read_request(true, &[(0x5000, 512)]);
+        assert_eq!(st, BLK_S_IOERR);
+        assert_eq!(n, 1);
+        assert_eq!(ram[0x5000], 0xA5);
+        assert!(covered(&dirty, 0x5000, 512), "dirty ranges {dirty:x?}");
+    }
+
+    #[test]
+    fn overlapping_read_buffers_are_refused_unread() {
+        let (st, _, _, ram, reads) = read_request(false, &[(0x5000, 1024), (0x5200, 512)]);
+        assert_eq!(st, BLK_S_IOERR);
+        assert_eq!(reads, 0);
+        assert_eq!(ram[0x5000], 0);
     }
 }
