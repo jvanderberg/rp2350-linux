@@ -616,13 +616,15 @@ static const char *label(asm_t *a, int *pub)
     return NULL;
 }
 
-static void add_define(prog_t *g, const char *name, int value)
+static void add_define(asm_t *a, prog_t *g, const char *name, int value)
 {
     pio_asm_program_t *p = g->p;
-    if (p->ndefines < PIO_ASM_MAX_DEFINES) {
-        snprintf(p->defines[p->ndefines].name, sizeof(p->defines[0].name), "%s", name);
-        p->defines[p->ndefines++].value = value;
+    if (p->ndefines >= PIO_ASM_MAX_DEFINES) {
+        fail(a, "more than %d public symbols in program '%s'", PIO_ASM_MAX_DEFINES, p->name);
+        return;
     }
+    snprintf(p->defines[p->ndefines].name, sizeof(p->defines[0].name), "%s", name);
+    p->defines[p->ndefines++].value = value;
 }
 
 /* .define [public] NAME EXPR */
@@ -638,7 +640,7 @@ static void define(asm_t *a, prog_t *g)
     if (a->failed)
         return;
     if (add_sym(a, n->s, v, pub, 0) && pub && g)
-        add_define(g, n->s, v);
+        add_define(a, g, n->s, v);
 }
 
 static void directive(asm_t *a, prog_t *g, tok_t *d)
@@ -786,7 +788,7 @@ static void program(asm_t *a, prog_t *g, int from, int to)
             if (add_sym(a, l, n, pub, 1) && pub) {
                 char nm[40];
                 snprintf(nm, sizeof(nm), "offset_%s", l);
-                add_define(g, nm, n);
+                add_define(a, g, nm, n);
             }
         }
         tok_t *t = peek(a);
@@ -936,6 +938,7 @@ pioasm_file_t *pioasm_parse(const char *source, char *err, size_t errlen)
         }
     }
     /* file-wide defines, and where each .program starts */
+    int stray = -1; /* a line before the first .program that isn't a .define */
     for (int i = 0; i < a->nlines && !a->failed; i++) {
         line_t *ln = &a->lines[i];
         a->ln = ln;
@@ -951,7 +954,15 @@ pioasm_file_t *pioasm_parse(const char *source, char *err, size_t errlen)
         } else if (!nprog && is_id(&ln->tok[0], ".define")) {
             a->pos = 1;
             define(a, NULL);
+        } else if (!nprog && stray < 0) {
+            stray = i;
         }
+    }
+    /* with programs in the file, nothing but defines may come first (it
+     * would belong to no program); without, the file is the program */
+    if (nprog && stray >= 0 && !a->failed) {
+        a->ln = &a->lines[stray];
+        fail(a, "outside a .program");
     }
     a->nglobal = a->nsyms;
     if (a->failed)
@@ -996,7 +1007,7 @@ pioasm_file_t *pioasm_parse(const char *source, char *err, size_t errlen)
         /* the file's public defines are in each program's header too */
         for (int i = 0; i < a->nglobal; i++)
             if (a->syms[i].pub)
-                add_define(&g, a->syms[i].name, a->syms[i].value);
+                add_define(a, &g, a->syms[i].name, a->syms[i].value);
         program(a, &g, from, to);
         /* its c-sdk text */
         f->sdk_start[k] = sdk_used;
@@ -1061,7 +1072,7 @@ int pio_assemble(const char *source, const char *name, pio_asm_program_t *out, c
             break;
     if (k == f->count) {
         if (err && errlen)
-            snprintf(err, errlen, "no program '%s'", name);
+            snprintf(err, errlen, name ? "no program '%s'" : "no program%s", name ? name : "");
         pioasm_free(f);
         return -1;
     }

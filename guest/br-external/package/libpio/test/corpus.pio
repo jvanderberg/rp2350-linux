@@ -1,0 +1,100 @@
+.define public T1 2
+.define public T2 5
+.define public T3 3
+
+.program ws2812
+.side_set 1
+.wrap_target
+bitloop:
+    out x, 1       side 0 [T3 - 1]
+    jmp !x do_zero side 1 [T1 - 1]
+do_one:
+    jmp  bitloop   side 1 [T2 - 1]
+do_zero:
+    nop            side 0 [T2 - 1]
+.wrap
+
+.program uart_tx
+.side_set 1 opt
+    pull       side 1 [7]
+    set x, 7   side 0 [7]
+bitloop:
+    out pins, 1
+    jmp x-- bitloop   [6]
+
+.program uart_rx
+start:
+    wait 0 pin 0
+    set x, 7    [10]
+bitloop:
+    in pins, 1
+    jmp x-- bitloop [6]
+    jmp pin good_stop
+    irq 4 rel
+    wait 1 pin 0
+    jmp start
+good_stop:
+    push
+
+.program spi_cpha0
+.side_set 1
+.wrap_target
+    out pins, 1 side 0 [1]
+    in pins, 1  side 1 [1]
+.wrap
+
+.program squarewave
+    set pindirs, 1
+again:
+    set pins, 1 [1]
+    set pins, 0
+    jmp again
+
+.program everything
+.side_set 2 opt pindirs
+    jmp loop
+    jmp !x, loop side 1
+    jmp x-- loop
+    jmp !y loop
+    jmp y-- loop [1]
+    jmp x!=y loop
+    jmp pin loop
+    jmp !osre loop
+loop:
+    wait 0 gpio 31
+    wait 1 pin 3
+    wait 1 irq 2
+    wait 0 irq 7 rel
+    in x, 32
+    in y, 1
+    in null, 5
+    in isr, 8
+    in osr, 16
+    out pindirs, 4
+    out pc, 5
+    out isr, 3
+    out exec, 16
+    out null, 32
+
+.program everything2
+.side_set 2 opt pindirs
+    push
+    push iffull
+    push noblock
+    push iffull noblock
+    pull block
+    pull ifempty
+    pull noblock
+    mov x, y
+    mov y, ~x
+    mov pins, ::isr
+    mov exec, osr
+    mov pc, status
+    mov isr, null
+    mov osr, !pins
+    irq set 3
+    irq wait 1 rel
+    irq clear 7
+    irq nowait 0
+    set x, 31
+    set y, 0 side 3 [1]

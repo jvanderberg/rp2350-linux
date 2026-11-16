@@ -21,6 +21,8 @@ use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, Priv, TIMEBASE_HZ};
 use stubpins::StubPins;
 
 mod norfile;
+#[cfg(test)]
+mod pio_corpus;
 mod piosim;
 mod sdsim;
 mod sim;

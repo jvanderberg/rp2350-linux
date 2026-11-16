@@ -1,0 +1,24 @@
+; pioasm header corner cases (make test compiles the header it writes)
+.define public BASE 3
+
+.program int_divider
+.clock_div 2
+    nop
+
+.program frac_divider
+.clock_div 2.5
+.fifo tx
+.in 8 left auto
+.out 16 right
+.set 2
+    nop
+
+.program defines
+.define public WIDTH 5
+.side_set 1 opt
+public start:
+    set pins, BASE side 1
+    jmp start
+% c-sdk {
+static inline int defines_extra(void) { return 1; }
+%}

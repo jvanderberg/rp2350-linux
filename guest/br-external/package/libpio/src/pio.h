@@ -79,9 +79,17 @@ typedef pio_hw_t *PIO;
 #define hw_xor_alias(a) ((volatile uint32_t *)((uintptr_t)(a) + 0x1000))
 #define hw_set_alias(a) ((volatile uint32_t *)((uintptr_t)(a) + 0x2000))
 #define hw_clear_alias(a) ((volatile uint32_t *)((uintptr_t)(a) + 0x3000))
+#ifndef LIBPIO_PLAIN_REGISTERS
 static inline void hw_set_bits(volatile uint32_t *a, uint32_t m) { *hw_set_alias(a) = m; }
 static inline void hw_clear_bits(volatile uint32_t *a, uint32_t m) { *hw_clear_alias(a) = m; }
 static inline void hw_xor_bits(volatile uint32_t *a, uint32_t m) { *hw_xor_alias(a) = m; }
+#else
+/* libpio's host tests (test/): registers in plain memory, which has no
+ * aliases, so the same changes made directly */
+static inline void hw_set_bits(volatile uint32_t *a, uint32_t m) { *a |= m; }
+static inline void hw_clear_bits(volatile uint32_t *a, uint32_t m) { *a &= ~m; }
+static inline void hw_xor_bits(volatile uint32_t *a, uint32_t m) { *a ^= m; }
+#endif
 static inline void hw_write_masked(volatile uint32_t *a, uint32_t v, uint32_t m)
 {
     hw_xor_bits(a, (*a ^ v) & m);
