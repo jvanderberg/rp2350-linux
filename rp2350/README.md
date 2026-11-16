@@ -155,12 +155,14 @@ $ rp2350/tools/pin-test.py [--host ADDR] [--only NAME,...]
 | `i2c` | `i2cdetect` finds 0x42; `i2cset`/`i2cget` bytes and words; `i2ctransfer` with a repeated start; an absent address fails; MicroPython `I2C` |
 | `spi` | SPI0 loopback in modes 0-3, at 100 kHz to 50 MHz, 1 to 4096 bytes; MicroPython `SPI` at 10 MHz |
 | `micropython` | `Pin` output, `Pin.irq` catching 20 edges at 20 ms, `PWM` at 2 kHz 25% |
+| `pio-self` | `guest/tests/pio` on the board, with no wiring of its own (it uses free pins GP15, GP20, GP21, GP31, GP33): libpio and MicroPython `rp2` at GPIOBASE 0 and 16, read back by the other block or driven from Linux, `WAIT GPIO`'s index, outputs reset between programs, the driver's refusals, and DMA (echo, a stop ending a wait, starts racing stops). The same files run in the Mac emulator by `scripts/check.sh emu`. |
 | `pio` | builds the PIO examples on the board (tcc and `pioasm`); `squarewave` on GP13 at 1 kHz, 100 kHz and 1 MHz, within 1% and 50 ± 3% duty; `ws2812` sends 240 bits for 10 LEDs; `pio-edges` catches all of 200 edges at 1 ms and of 2000 at 20 µs and at 5 µs on GP14, with the right mean spacing; `pio-fifo`; `pio-dma` (echo and ring); MicroPython `pio_blink.py` at 23.7 Hz, `pio_echo.py`, `pio_ring.py` |
 
 Pull-downs aren't tested: on the RP2350 a line that has been high stays
 near 2 V against the internal pull-down (erratum RP2350-E9).
 
-On the board, the whole run passed 44 of 44, and the PIO section alone
+On the board, the whole run passed 44 of 44 before `pio-self` was added,
+and the PIO section alone
 (`--only pio`, 16 checks with the three common ones) passed 16 of 16
 three more times in a row. The PIO section measured:
 

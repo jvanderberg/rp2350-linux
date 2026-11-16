@@ -124,9 +124,13 @@ pico-sdk example builds with only the changes listed under
   [top-level README](../../../../README.md#gpio-i2c-spi-pwm-adc).
 - **GPIOBASE.** Pins are GPIO numbers. A block reaches 32 consecutive
   GPIOs: 0-31 (GPIOBASE 0) or 16-47 (GPIOBASE 16). `pio_sm_set_config` and
-  `pio_sm_init` pick the base a configuration's pins need. They fail with
-  `EINVAL` when the pins don't fit in one window, or when the block would
-  have to change base while one of its state machines is running.
+  `pio_sm_init` pick the base a configuration's pins need, and write each
+  pin as its index from that base (GP33 is index 17 at GPIOBASE 16). They
+  fail with `EINVAL` when the pins don't fit in one window, or when the
+  block would have to change base while another of its state machines is
+  running or has pins set for the current base (they would point at other
+  GPIOs). The pin setters (`pio_sm_set_out_pins` and the rest) and the
+  64-bit pin masks take GPIO numbers too.
 
 ## Programs
 
@@ -331,7 +335,7 @@ case-insensitive.
 | Instruction | Forms |
 |---|---|
 | `jmp` | `jmp TARGET`, `jmp !x`, `x--`, `!y`, `y--`, `x!=y`, `pin`, `!osre`, `TARGET` |
-| `wait` | `wait 0/1 gpio N`, `pin N`, `irq N [rel]`, `irq prev N`, `irq next N`, `jmppin [+ N]`. With no polarity, 1. `gpio` is 0-31 of the block's GPIO window. |
+| `wait` | `wait 0/1 gpio N`, `pin N`, `irq N [rel]`, `irq prev N`, `irq next N`, `jmppin [+ N]`. With no polarity, 1. `gpio N` is an index 0-31 from the block's GPIOBASE, not a GPIO number: at GPIOBASE 16, `wait 1 gpio 15` waits for GP31 (checked on the board by `guest/tests/pio`). `pin N` counts from the state machine's IN base, which the C configuration sets by GPIO number, so prefer it in a program meant for any pins. |
 | `in` | `in pins/x/y/null/isr/osr, 1-32` |
 | `out` | `out pins/x/y/null/pindirs/pc/isr/exec, 1-32` |
 | `push`, `pull` | `[iffull]` / `[ifempty]`, `[block]` (the default) / `[noblock]` |
@@ -372,10 +376,16 @@ binary numbers, symbols and labels, `( )`, unary `-`, `~` (NOT) and `::`
 (bit reverse), and `* /`, `+ -`, `<< >>`, `&`, `^`, `|`, from tightest to
 loosest. Comments are `;`, `//` and `/* */`.
 
+**Programs in a file.** Each `.program NAME` starts one. Before the first,
+only `.define`s (the file's own) and comments may come; anything else
+there is an error, as it belongs to no program. A file with no `.program`
+at all is one program, named `program` (handy for `pio_assemble` on a
+snippet).
+
 **Limits.** A program has at most 32 instructions. A file has at most 64
-programs and 128 symbols. Names are cut to 31 characters. A program keeps
-16 public defines (labels included); any more are left out without an
-error. An expression nests at most 64 deep.
+programs and 128 symbols. Names are cut to 31 characters. A program has at
+most 16 public defines (labels included); more are an error. An expression
+nests at most 64 deep.
 
 ## Differences from the pico-sdk
 
@@ -423,6 +433,20 @@ checks them against a second board:
 - `pio-edges` caught every edge at 1 ms, 20 µs and 5 µs spacing. The
   GPIO character device's edge events need about 2 ms between edges.
 - `pio-dma` echoed at about 18M words a second and kept its ring.
+
+## Tests
+
+- `make -C guest/br-external/package/libpio/test test`, on the Mac or
+  Linux (part of `scripts/check.sh host`): the library, unchanged, against
+  a fake `/dev/pio` (pin numbers at either GPIOBASE, the base rules, DMA
+  error paths, program loading), the assembler against pio-parser's output
+  for `test/corpus.pio` and on bad input, and the header `pioasm` writes
+  for each example and `test/headers.pio` through the compiler. Built with
+  ASan and UBSan.
+- `guest/tests/pio`, on a real block with no wiring: `scripts/check.sh
+  emu` in the Mac emulator, `rp2350/tools/pin-test.py --only pio-self` on
+  the board. One block, at GPIOBASE 0, reads back what the other drove,
+  and Linux drives pins from SIO for a block to read.
 
 ## On the Mac
 

@@ -84,11 +84,15 @@ A Pico program that uses state machines 0-3 needs them renumbered to 4-7.
   C program, the other block) makes the StateMachine fail with `OSError`
   (`EBUSY`). The board's own pins, such as the SD card's and the radio's,
   fail with `EINVAL`.
-- **GPIO base.** Pins can be 0-47. One state machine's pins must all be in
+- **GPIO base.** Pins are GPIO numbers 0-47, and `rp2` writes each as its
+  index from the block's base. One state machine's pins must all be in
   0-31 or all in 16-47 (`ValueError` otherwise). The block's four machines
-  share the base, so it can't change while another of them is running
-  (`ValueError`). `PIO.gpio_base()` reads it, and `PIO.gpio_base(16)` sets
-  it.
+  share the base, so it can't change while another of them is running or
+  has pins set for the current base (`ValueError`); a machine with no pins
+  leaves it alone. `PIO.gpio_base()` reads it, and `PIO.gpio_base(16)`
+  sets it. In the assembler, `wait(1, gpio, N)` takes an index from the
+  base, not a GPIO number (at base 16, `N` 15 is GP31); `wait(1, pin, N)`
+  counts from `in_base`.
 
 ### Differences from the rp2 port
 
@@ -112,10 +116,10 @@ A Pico program that uses state machines 0-3 needs them renumbered to 4-7.
   348 MHz. Anything else raises `ValueError`. `freq=-1`, the default,
   runs at full speed.
 - **The assembler is the port's own**, which knows the RP2040's
-  instructions. The RP2350's additions (`mov pindirs`, `wait jmppin`,
-  `irq prev`/`next`, `mov rxfifo[...]`) aren't in it. Emit them with
-  `word()`, or use C and [libpio](../libpio/README.md), whose assembler
-  has them.
+  instructions, plus the RP2350's `mov(pindirs, src)`. The other RP2350
+  additions (`wait jmppin`, `irq prev`/`next`, `mov rxfifo[...]`) aren't in
+  it. Emit them with `word()`, or use C and [libpio](../libpio/README.md),
+  whose assembler has them.
 - **DMA** moves data only between a buffer and a state machine, through
   a buffer the kernel gave the program (below).
 - **Not here:** `rp2.Flash`, `rp2.bootsel_button`, `rp2.country`, and
@@ -174,6 +178,11 @@ tx.close()
 
 In `/usr/share/examples/pio`. On the board,
 `rp2350/tools/pin-test.py` runs all three against a second board.
+
+`test/test_rp2_asm.py` checks the assembler against libpio's, in CPython
+on the host (`scripts/check.sh host`), and `guest/tests/pio/rp2_selftest.py`
+checks `rp2` on a real block (`scripts/check.sh emu`, and
+`pin-test.py --only pio-self` on the board).
 
 | Example | Run | Does |
 |---|---|---|
