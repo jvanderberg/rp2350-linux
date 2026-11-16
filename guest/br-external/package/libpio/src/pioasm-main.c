@@ -94,8 +94,12 @@ static void emit(FILE *o, const pioasm_file_t *f, int force_version)
             static const char *t[] = { "STATUS_TX_LESSTHAN", "STATUS_RX_LESSTHAN", "STATUS_IRQ_SET" };
             fprintf(o, "    sm_config_set_mov_status(&c, %s, %d);\n", t[p->mov_status_type], p->mov_status_n);
         }
-        if (p->has & 32)
-            fprintf(o, "    sm_config_set_clkdiv(&c, %gf);\n", (double)p->clock_div);
+        if (p->has & 32) {
+            /* a float literal: 2 must be 2.0f, not 2f */
+            char v[32];
+            snprintf(v, sizeof(v), "%.9g", (double)p->clock_div);
+            fprintf(o, "    sm_config_set_clkdiv(&c, %s%sf);\n", v, strpbrk(v, ".e") ? "" : ".0");
+        }
         fprintf(o, "    return c;\n}\n\n");
         if (f->sdk_len[k])
             fwrite(f->sdk_text + f->sdk_start[k], 1, f->sdk_len[k], o), fprintf(o, "\n");

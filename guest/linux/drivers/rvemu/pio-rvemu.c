@@ -243,6 +243,8 @@ static void rp_dma_stop(unsigned int ch)
 	writel(BIT(ch), rp_dma->regs + DMA_IRQ);
 	rp_dma->owner[ch] = NULL;
 	spin_unlock_irqrestore(&rp_dma->lock, flags);
+	/* a DMA_WAIT on it is over */
+	wake_up_interruptible(&rp_dma->wq);
 }
 
 /* Every channel of p's, stopped and given back. */
@@ -359,9 +361,10 @@ static int rp_dma_start(struct rvemu_pio *p, struct rvemu_pio_dma *d)
 	return 0;
 }
 
-static bool rp_dma_idle(unsigned int ch)
+/* done, or no longer p's (stopped, or given back on release) */
+static bool rp_dma_over(struct rvemu_pio *p, unsigned int ch)
 {
-	return !(readl(rp_dma->regs + DMA_CH(ch) + DMA_STATUS) & DMA_ST_BUSY);
+	return !rp_dma_owns(p, ch) || !(readl(rp_dma->regs + DMA_CH(ch) + DMA_STATUS) & DMA_ST_BUSY);
 }
 
 static long rp_dma_ioctl(struct rvemu_pio *p, unsigned int cmd, unsigned long arg)
@@ -384,7 +387,7 @@ static long rp_dma_ioctl(struct rvemu_pio *p, unsigned int cmd, unsigned long ar
 		break;
 	case RVEMU_PIO_DMA_WAIT:
 		t = d.timeout_ms ? msecs_to_jiffies(d.timeout_ms) : MAX_SCHEDULE_TIMEOUT;
-		t = wait_event_interruptible_timeout(rp_dma->wq, rp_dma_idle(d.channel), t);
+		t = wait_event_interruptible_timeout(rp_dma->wq, rp_dma_over(p, d.channel), t);
 		if (t < 0)
 			return t;
 		rp_dma_status(d.channel, &d);
@@ -392,7 +395,16 @@ static long rp_dma_ioctl(struct rvemu_pio *p, unsigned int cmd, unsigned long ar
 			ret = -ETIMEDOUT;
 		break;
 	case RVEMU_PIO_DMA_STOP:
-		rp_dma_stop(d.channel);
+		/*
+		 * Under p->lock, as START is: two threads (or a dup of the fd)
+		 * mustn't interleave a stop with a restart of the channel, which
+		 * could leave it running unowned, so that release wouldn't stop
+		 * it before freeing the buffer it writes.
+		 */
+		mutex_lock(&p->lock);
+		if (rp_dma_owns(p, d.channel))
+			rp_dma_stop(d.channel);
+		mutex_unlock(&p->lock);
 		return 0;
 	}
 	if (ret && ret != -ETIMEDOUT)

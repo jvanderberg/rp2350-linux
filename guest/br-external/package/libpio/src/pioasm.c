@@ -48,6 +48,8 @@ typedef struct {
     /* the line being parsed */
     line_t *ln;
     int pos;
+    /* how deep primary() is: (, -, ~ and :: nest, and a line is untrusted */
+    int depth;
 } asm_t;
 
 static void fail(asm_t *a, const char *fmt, ...)
@@ -206,8 +208,27 @@ static sym_t *add_sym(asm_t *a, const char *name, int value, int pub, int label)
 }
 
 static double expr(asm_t *a);
+static double primary_(asm_t *a);
+
+#define MAX_DEPTH 64
 
 static double primary(asm_t *a)
+{
+    double v;
+
+    if (a->failed)
+        return 0;
+    if (a->depth >= MAX_DEPTH) {
+        fail(a, "expression nested too deeply");
+        return 0;
+    }
+    a->depth++;
+    v = primary_(a);
+    a->depth--;
+    return v;
+}
+
+static double primary_(asm_t *a)
 {
     tok_t *t = next(a);
 

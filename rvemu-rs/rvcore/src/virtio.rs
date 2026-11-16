@@ -623,22 +623,33 @@ impl<D: Disk> VirtioBlk<D> {
         let status = match kind {
             BLK_T_IN => {
                 let mut segs: [&mut [u8]; CHAIN_MAX] = core::array::from_fn(|_| &mut [][..]);
-                let mut ok = data.len() <= CHAIN_MAX;
+                // the guest writes the chain: buffers that overlap would be
+                // aliased `&mut` slices, so such a request is refused
+                let mut ok = data.len() <= CHAIN_MAX && !overlapping(data);
+                let mut built = 0;
                 for (d, seg) in data.iter().zip(segs.iter_mut()) {
+                    if !ok {
+                        break;
+                    }
                     let p = mem.range_mut(d.addr, d.len as usize).filter(|_| d.flags & DESC_F_WRITE != 0 && d.len % 512 == 0);
                     let Some(p) = p else {
                         ok = false;
                         break;
                     };
                     // SAFETY: `range_mut` checked the bounds; guest RAM is
-                    // ours, and a chain's buffers don't overlap.
+                    // ours, and `overlapping` checked the buffers are apart.
                     *seg = unsafe { core::slice::from_raw_parts_mut(p, d.len as usize) };
+                    built += 1;
                 }
-                ok = ok && self.disk.read_segs(sector, &mut segs[..data.len()]);
                 if ok {
-                    for d in data {
+                    ok = self.disk.read_segs(sector, &mut segs[..data.len()]);
+                    // a failed read may still have written some of them
+                    // (the SD card's data lands before its CRC is checked)
+                    for d in &data[..built] {
                         self.t.note_dirty(d.addr, d.len as usize);
-                        written += d.len;
+                    }
+                    if ok {
+                        written += data.iter().map(|d| d.len).sum::<u32>();
                     }
                 }
                 if ok { BLK_S_OK } else { BLK_S_IOERR }
@@ -675,6 +686,14 @@ impl<D: Disk> VirtioBlk<D> {
         self.t.dma_write(chain[n - 1].addr, &[status]);
         written + 1
     }
+}
+
+/// True when two of the descriptors' buffers share a byte.
+fn overlapping(d: &[Desc]) -> bool {
+    d.iter().enumerate().any(|(i, a)| {
+        let end = |x: &Desc| x.addr.saturating_add(u64::from(x.len));
+        d[i + 1..].iter().any(|b| a.addr < end(b) && b.addr < end(a))
+    })
 }
 
 // ------------------------------------------------------------------ network device
@@ -792,5 +811,25 @@ impl<L: NetLink> VirtioNet<L> {
             // a frame that didn't fit is dropped, as a real NIC would
             self.t.push_used(0, head, if src.is_empty() { written } else { 0 });
         }
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn d(addr: u64, len: u32) -> Desc {
+        Desc { addr, len, flags: DESC_F_WRITE }
+    }
+
+    #[test]
+    fn overlapping_buffers_are_found() {
+        assert!(!overlapping(&[d(0x1000, 512), d(0x1200, 512), d(0x2000, 1024)]));
+        assert!(overlapping(&[d(0x1000, 512), d(0x2000, 512), d(0x1000, 512)]));
+        assert!(overlapping(&[d(0x1000, 1024), d(0x1200, 512)]));
+        assert!(overlapping(&[d(0x1200, 512), d(0x1000, 1024)]));
+        // no wrap past the top of the address space
+        assert!(overlapping(&[d(u64::MAX - 100, 512), d(u64::MAX - 10, 512)]));
+        assert!(!overlapping(&[d(u64::MAX - 100, 512), d(0, 512)]));
     }
 }

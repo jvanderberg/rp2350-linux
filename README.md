@@ -343,8 +343,10 @@ with no system call per register:
   reach only that buffer and that block. A buffer is at most 64 KiB.
 - **Clock.** The PIO clock is the system clock, 348 MHz; the slowest
   state machine clock is 348 MHz / 65536, about 5.3 kHz.
-- **Limits.** An `irq prev`/`irq next` instruction reaches PIO0 and can
-  disturb Wi-Fi. The firmware can't filter those instructions.
+- **PIO0.** An `irq prev`/`irq next` instruction still reaches PIO0's IRQ
+  flags (no filter can stop it: `out exec` and `mov exec` make instructions
+  at run time), but the Wi-Fi driver doesn't use them: it takes the radio's
+  interrupt from the data line itself.
 
 The build includes:
 
