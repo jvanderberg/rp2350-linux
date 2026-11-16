@@ -171,6 +171,46 @@ restart)
 esac
 S
 chmod 755 "$T/etc/init.d/S03sd"
+# Wi-Fi keepalive: an ARP request to the gateway every 20 s. On a working
+# link the reply (unicast) comes back; the firmware rejoins the network when
+# the guest sends and nothing unicast comes back for 30 s (wifi.rs,
+# TRAFFIC_STALL_S), which catches a link the radio reports up but that
+# passes nothing. ARP, not ping: every IPv4 gateway answers it.
+cat > "$T/etc/init.d/S41wifi-keepalive" <<'S'
+#!/bin/sh
+PID=/var/run/wifi-keepalive.pid
+gateway() {
+  while read -r i d g _; do
+    [ "$i" = eth0 ] && [ "$d" = 00000000 ] || continue
+    g=$((0x$g))
+    echo "$((g & 255)).$((g >> 8 & 255)).$((g >> 16 & 255)).$((g >> 24 & 255))"
+    return
+  done < /proc/net/route
+}
+follow() {
+  while :; do
+    sleep 20
+    gw=$(gateway)
+    [ -n "$gw" ] && arping -q -f -c 1 -w 2 -I eth0 "$gw"
+  done
+}
+case "$1" in
+start)
+  [ -f $PID ] && kill -0 "$(cat $PID)" 2>/dev/null && exit 0
+  follow </dev/null >/dev/null 2>&1 &
+  echo $! > $PID
+  ;;
+stop)
+  [ -f $PID ] && kill "$(cat $PID)" 2>/dev/null
+  rm -f $PID
+  ;;
+restart)
+  "$0" stop
+  "$0" start
+  ;;
+esac
+S
+chmod 755 "$T/etc/init.d/S41wifi-keepalive"
 # the flash swap device's counters and flash timings (its last page)
 cat > "$T/usr/bin/flashswap-stats" <<'S'
 #!/bin/sh

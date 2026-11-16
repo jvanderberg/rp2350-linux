@@ -532,8 +532,19 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   frames). A frame the guest sends while core1 is two behind is dropped. The
   guest gets the radio's MAC, and its link state follows the join.
 - **Credentials.** `scripts/pico-wifi.sh SSID` asks for the passphrase and
-  writes it to the 4 KB at 0x103FF000. The firmware joins in the background
-  and retries every 3 s. `--forget` erases the network.
+  writes it to the 4 KB at 0x103FF000. The firmware joins in the background;
+  a failed join is tried again after 5 s, doubling up to 300 s. `--forget`
+  erases the network.
+- **Rejoining.** The firmware leaves and joins again when the link has been
+  down for 30 s, or when it is up but stalled: the guest has sent for 30 s
+  and no unicast frame came back (after a deauth the chip can report the
+  link up while nothing passes). The disk guest's `S41wifi-keepalive` sends
+  an ARP request to the gateway every 20 s, whose unicast reply keeps a
+  working link from looking stalled. The guest sees each rejoin as its
+  carrier going down and up.
+- **Panics.** `rvemu-pico-shell` prints a panic on RTT without blocking,
+  waits 3 s and reboots, so the board comes back instead of hanging until
+  it is unplugged.
 
 ### core1 (`rvemu-pico/src/core1.rs`)
 
