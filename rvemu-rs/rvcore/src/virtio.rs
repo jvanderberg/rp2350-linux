@@ -832,4 +832,103 @@ mod chain_tests {
         assert!(overlapping(&[d(u64::MAX - 100, 512), d(u64::MAX - 10, 512)]));
         assert!(!overlapping(&[d(u64::MAX - 100, 512), d(0, 512)]));
     }
+
+    // ---- whole requests, through the queue as the driver sets it up
+
+    extern crate std;
+    use std::{vec, vec::Vec};
+
+    /// A card that fills what it is given with 0xA5, failing if told to
+    /// (as the SD card can, after its data has landed).
+    struct Card {
+        fail: bool,
+        reads: usize,
+    }
+    impl Disk for Card {
+        fn sectors(&self) -> u64 {
+            1024
+        }
+        fn segments(&self) -> u32 {
+            8
+        }
+        fn read(&mut self, _sector: u64, buf: &mut [u8]) -> bool {
+            self.reads += 1;
+            buf.fill(0xA5);
+            !self.fail
+        }
+    }
+
+    const DESC: u64 = 0x1000;
+    const AVAIL: u64 = 0x2000;
+    const USED: u64 = 0x3000;
+    const HDR: u64 = 0x4000;
+    const STATUS: u64 = 0x4100;
+
+    /// One BLK_T_IN request with these data buffers through a fresh device:
+    /// (status byte, bytes the device reported, the dirty ranges, guest RAM,
+    /// the card's read calls).
+    fn read_request(fail: bool, data: &[(u64, u32)]) -> (u8, u32, Vec<(u32, u32)>, Vec<u8>, usize) {
+        let mut ram = vec![0u8; 0x10000];
+        let mem = GuestMem { ptr: ram.as_mut_ptr(), base: 0, size: ram.len() as u32, ro: 0 };
+        let mut blk = VirtioBlk::new(Card { fail, reads: 0 }, mem);
+        let w32 = |ram: &mut Vec<u8>, a: u64, v: u32| ram[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
+        let w16 = |ram: &mut Vec<u8>, a: u64, v: u16| ram[a as usize..a as usize + 2].copy_from_slice(&v.to_le_bytes());
+        let mut chain = vec![(HDR, 16u32, 0u16)];
+        chain.extend(data.iter().map(|&(a, l)| (a, l, DESC_F_WRITE)));
+        chain.push((STATUS, 1, DESC_F_WRITE));
+        for (i, &(addr, len, flags)) in chain.iter().enumerate() {
+            let e = DESC + 16 * i as u64;
+            ram[e as usize..e as usize + 8].copy_from_slice(&addr.to_le_bytes());
+            w32(&mut ram, e + 8, len);
+            let last = i == chain.len() - 1;
+            w16(&mut ram, e + 12, flags | if last { 0 } else { DESC_F_NEXT });
+            w16(&mut ram, e + 14, i as u16 + 1);
+        }
+        w32(&mut ram, HDR, BLK_T_IN); // type; sector 0
+        ram[STATUS as usize] = 0xFF;
+        w16(&mut ram, AVAIL + 2, 1); // idx 1, ring[0] = head 0
+        for (off, v) in [(0x030, 0), (0x038, 16), (0x080, DESC as u32), (0x090, AVAIL as u32), (0x0a0, USED as u32), (0x044, 1), (0x070, 0xF)] {
+            blk.store(off, 4, v).unwrap();
+        }
+        blk.store(0x050, 4, 0).unwrap();
+        let mut dirty = Vec::new();
+        while let Some(r) = blk.take_dma_write() {
+            dirty.push(r);
+        }
+        let used_len = u32::from_le_bytes(ram[USED as usize + 8..USED as usize + 12].try_into().unwrap());
+        let reads = blk.disk.reads;
+        (ram[STATUS as usize], used_len, dirty, ram, reads)
+    }
+
+    fn covered(dirty: &[(u32, u32)], a: u64, len: u32) -> bool {
+        dirty.iter().any(|&(lo, hi)| u64::from(lo) <= a && a + u64::from(len) <= u64::from(hi))
+    }
+
+    #[test]
+    fn a_read_lands_and_is_reported() {
+        let (st, n, dirty, ram, _) = read_request(false, &[(0x5000, 512), (0x8000, 1024)]);
+        assert_eq!(st, BLK_S_OK);
+        assert_eq!(n, 512 + 1024 + 1);
+        assert!(ram[0x5000..0x5200].iter().chain(&ram[0x8000..0x8400]).all(|&b| b == 0xA5));
+        assert!(covered(&dirty, 0x5000, 512) && covered(&dirty, 0x8000, 1024));
+    }
+
+    #[test]
+    fn a_failed_read_still_reports_what_it_wrote() {
+        // the translator must drop code in those pages even though the
+        // request failed (the review's finding: they went unreported)
+        let (st, n, dirty, ram, _) = read_request(true, &[(0x5000, 512)]);
+        assert_eq!(st, BLK_S_IOERR);
+        assert_eq!(n, 1);
+        assert_eq!(ram[0x5000], 0xA5);
+        assert!(covered(&dirty, 0x5000, 512), "dirty ranges {dirty:x?}");
+    }
+
+    #[test]
+    fn overlapping_read_buffers_are_refused_unread() {
+        let (st, _, _, ram, reads) = read_request(false, &[(0x5000, 1024), (0x5200, 512)]);
+        assert_eq!(st, BLK_S_IOERR);
+        assert_eq!(reads, 0);
+        assert_eq!(ram[0x5000], 0);
+    }
 }

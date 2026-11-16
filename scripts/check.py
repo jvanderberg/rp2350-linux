@@ -34,6 +34,10 @@ def preflight(tier):
         require_tool(name, 'See docs/development.md.')
     if tier == 'host':
         return
+    if tier == 'emu':
+        for name in ('Image', 'rootfs.squashfs'):
+            require_file(ROOT / 'guest/out-disk' / name, 'Run: (cd guest && ./run-build.sh disk)')
+        return
     require_tool('dtc', 'Install device-tree-compiler (Linux) or dtc (Homebrew).')
     require_tool('rustup', 'Install Rust with rustup.')
     targets = subprocess.check_output(['rustup', 'target', 'list', '--installed'], cwd=ROOT, text=True)
@@ -85,7 +89,7 @@ def signal_group(pgid, sig):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('tier', choices=['host', 'qemu', 'board'])
+    parser.add_argument('tier', choices=['host', 'emu', 'qemu', 'board'])
     parser.add_argument('--artifacts', type=Path, help='New directory for logs and result.json')
     parser.add_argument('--timeout', type=int, default=1800, help='Per-command timeout in seconds (default: 1800)')
     args = parser.parse_args()
@@ -173,6 +177,15 @@ def main():
             run('cargo-test', ['cargo', 'test', '--locked'], RS)
             run('cargo-build', ['cargo', 'build', '--release', '--locked'], RS)
             run('c-build', ['make', '-C', 'rvemu'])
+            # libpio against a fake /dev/pio, its assembler against
+            # pio-parser, and rp2's assembler against libpio's
+            run('libpio-host', ['make', '-C', 'guest/br-external/package/libpio/test', 'test'])
+            run('rp2-asm', [sys.executable, '-m', 'unittest', 'discover', '-s',
+                            'guest/br-external/package/micropython-machine/test'])
+        elif args.tier == 'emu':
+            # the disk guest on the Mac emulator's simulated board
+            run('rvemu-build', ['cargo', 'build', '--release', '--locked', '-p', 'rvemu'], RS)
+            run('emu-pio', [sys.executable, 'guest/tests/pio/emu-test.py'])
         elif args.tier == 'qemu':
             run('compare', ['bash', 'scripts/compare.sh'], RS)
             for mode in ('interp', 'jit', 'lockstep'):

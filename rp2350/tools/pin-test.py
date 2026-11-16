@@ -346,8 +346,28 @@ def t_pio(t, b):
     check("MicroPython rp2 endless DMA ring", "after 0.5 s: True" in out and "15 of 16" in out, out.replace("\n", "; "))
 
 
+def t_pio_self(t, b):
+    """guest/tests/pio: PIO1, PIO2 and DMA through libpio and rp2, with no
+    wiring (a block reads back what the other drove, or what Linux drove
+    from SIO); the same files the Mac emulator runs (emu-test.py)."""
+    d = os.path.join(HERE, "../../guest/tests/pio")
+    for name in ("run.sh", "pio-selftest.c", "rp2_selftest.py"):
+        with open(os.path.join(d, name)) as f:
+            rc, out = b.run(f"mkdir -p /tmp/pio-tests && cat > /tmp/pio-tests/{name}", stdin=f.read())
+        if rc:
+            check(f"copy {name} to the board", False, out)
+            return
+    rc, out = b.run("sh /tmp/pio-tests/run.sh 2>&1", timeout=900)
+    for line in out.splitlines():
+        if line.startswith(("PASS ", "FAIL ")):
+            name, _, detail = line[5:].partition(": ")
+            check(name, line.startswith("PASS"), detail)
+    check("pio-tests (guest/tests/pio/run.sh)", rc == 0 and out.rstrip().endswith("pio-tests: PASS"),
+          "" if rc == 0 else out.splitlines()[-1] if out else "no output")
+
+
 TESTS = {"gpio": t_gpio, "pull": t_pull, "edges": t_edges, "pwm": t_pwm, "i2c": t_i2c, "spi": t_spi, "micropython": t_mpy,
-         "pio": t_pio}
+         "pio": t_pio, "pio-self": t_pio_self}
 
 
 def board_address():

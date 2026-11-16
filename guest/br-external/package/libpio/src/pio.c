@@ -25,6 +25,7 @@ struct block {
     uint32_t clk_hz;
     uint32_t used;      /* instruction memory */
     uint8_t claimed_sm; /* pio_sm_claim */
+    uint8_t pinned;     /* state machines whose pins are set for this GPIOBASE */
     void *dma;          /* the DMA buffer, mapped */
     size_t dma_size;
 };
@@ -69,6 +70,7 @@ PIO pio_open(int n)
     b->clk_hz = info.clk_hz;
     b->used = 0;
     b->claimed_sm = 0;
+    b->pinned = 0;
     last_clk_hz = info.clk_hz;
     return b->pio;
 fail:
@@ -396,6 +398,13 @@ void sm_config_set_mov_status(pio_sm_config *c, enum pio_mov_status_type sel, ui
 
 /* ------------------------------------------------------------ state machines */
 
+/* GPIO n as a state machine's pin index: from the block's GPIOBASE (0 or
+ * 16, which pio_sm_set_config picks for the config's pins) */
+static uint rel(PIO pio, uint n)
+{
+    return (n - (pio->gpiobase & 16)) & 31;
+}
+
 /* The GPIOBASE `c`'s pins need (bit 0: 0 works, bit 1: 16 works). */
 static int bases_for(const pio_sm_config *c)
 {
@@ -422,18 +431,34 @@ int pio_sm_set_config(PIO pio, uint sm, const pio_sm_config *c)
         errno = EINVAL;
         return -1;
     }
+    struct block *b = blk(pio);
     if (!(ok >> (base ? 1 : 0) & 1)) {
-        /* the other base: only while nothing runs on this one */
-        if (pio->ctrl & 0xf) {
+        /* the other base: only while nothing runs on this one and no other
+         * machine has pins set for it (they would point elsewhere) */
+        if (pio->ctrl & 0xf || (b && b->pinned & ~(1u << sm))) {
             errno = EINVAL;
             return -1;
         }
         pio->gpiobase = base ? 0 : 16;
     }
+    if (b && c->pins_set)
+        b->pinned |= 1u << sm;
+    /* the pins are GPIO numbers; the machine counts from GPIOBASE */
+    uint32_t pinctrl = c->pinctrl, execctrl = c->execctrl;
+    if (c->pins_set & 1)
+        pinctrl = (pinctrl & ~0x1fu) | rel(pio, c->out_base);
+    if (c->pins_set & 2)
+        pinctrl = (pinctrl & ~(0x1fu << 5)) | rel(pio, c->set_base) << 5;
+    if (c->pins_set & 4)
+        pinctrl = (pinctrl & ~(0x1fu << 15)) | rel(pio, c->in_base) << 15;
+    if (c->pins_set & 8)
+        pinctrl = (pinctrl & ~(0x1fu << 10)) | rel(pio, c->sideset_base) << 10;
+    if (c->pins_set & 16)
+        execctrl = (execctrl & ~(0x1fu << 24)) | rel(pio, c->jmp_pin) << 24;
     pio->sm[sm].clkdiv = c->clkdiv;
-    pio->sm[sm].execctrl = c->execctrl;
+    pio->sm[sm].execctrl = execctrl;
     pio->sm[sm].shiftctrl = c->shiftctrl;
-    pio->sm[sm].pinctrl = c->pinctrl;
+    pio->sm[sm].pinctrl = pinctrl;
     return 0;
 }
 
@@ -512,27 +537,27 @@ void pio_sm_set_wrap(PIO pio, uint sm, uint target, uint wrap)
 
 void pio_sm_set_out_pins(PIO pio, uint sm, uint base, uint count)
 {
-    hw_write_masked(&pio->sm[sm].pinctrl, (base & 31) | (count & 0x3f) << 20, 0x1fu | 0x3fu << 20);
+    hw_write_masked(&pio->sm[sm].pinctrl, rel(pio, base) | (count & 0x3f) << 20, 0x1fu | 0x3fu << 20);
 }
 
 void pio_sm_set_set_pins(PIO pio, uint sm, uint base, uint count)
 {
-    hw_write_masked(&pio->sm[sm].pinctrl, (base & 31) << 5 | (count & 7) << 26, 0x1fu << 5 | 7u << 26);
+    hw_write_masked(&pio->sm[sm].pinctrl, rel(pio, base) << 5 | (count & 7) << 26, 0x1fu << 5 | 7u << 26);
 }
 
 void pio_sm_set_in_pins(PIO pio, uint sm, uint base)
 {
-    hw_write_masked(&pio->sm[sm].pinctrl, (base & 31) << 15, 0x1fu << 15);
+    hw_write_masked(&pio->sm[sm].pinctrl, rel(pio, base) << 15, 0x1fu << 15);
 }
 
 void pio_sm_set_sideset_pins(PIO pio, uint sm, uint base)
 {
-    hw_write_masked(&pio->sm[sm].pinctrl, (base & 31) << 10, 0x1fu << 10);
+    hw_write_masked(&pio->sm[sm].pinctrl, rel(pio, base) << 10, 0x1fu << 10);
 }
 
 void pio_sm_set_jmp_pin(PIO pio, uint sm, uint pin)
 {
-    hw_write_masked(&pio->sm[sm].execctrl, (pin & 31) << 24, 0x1fu << 24);
+    hw_write_masked(&pio->sm[sm].execctrl, rel(pio, pin) << 24, 0x1fu << 24);
 }
 
 void pio_sm_set_clkdiv_int_frac8(PIO pio, uint sm, uint32_t div_int, uint8_t div_frac8)
@@ -882,7 +907,12 @@ static int dma_copy(PIO pio, uint sm, void *data, size_t bytes, uint size, bool 
         pio_dma_config c = { sm, from_sm, size, 0, (uint32_t)(n / size), 0, false };
         if (!from_sm)
             memcpy(b->dma, p, n);
-        if ((ch = pio_dma_start(pio, ch, &c)) < 0 || pio_dma_wait(pio, ch, 0) < 0) {
+        /* keep the channel number when a restart fails: it is still ours
+         * to stop */
+        int k = pio_dma_start(pio, ch, &c);
+        if (k >= 0)
+            ch = k;
+        if (k < 0 || pio_dma_wait(pio, ch, 0) < 0) {
             ret = -1;
             break;
         }

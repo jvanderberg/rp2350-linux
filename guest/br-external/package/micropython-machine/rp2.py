@@ -197,6 +197,8 @@ class PIOASMEmit:
     def mov(self, dest, src):
         if dest == 8:
             dest = 4  # exec
+        elif dest == 4:
+            dest = 3  # pindirs: RP2350's mov destination 3 (4 is exec)
         return self.word(0xA000 | dest << 5 | src)
 
     def irq(self, mod, index=None):
@@ -383,6 +385,7 @@ class _Block:
         self.handlers = {}  # IRQ flag -> (handler, object)
         self.dma = None  # (address, size) of the DMA buffer
         self.dma_used = []  # [offset, size] regions
+        self.pinned = 0  # state machines whose pins are set for GPIOBASE
 
     def rd(self, r):
         return _rvmem.read32(self.base + r)
@@ -641,13 +644,21 @@ class StateMachine:
         in_base, out_base, set_base = _pin(in_base), _pin(out_base), _pin(set_base)
         jmp_pin, sideset_base = _pin(jmp_pin), _pin(sideset_base)
         used = [p for p in (in_base, out_base, set_base, jmp_pin, sideset_base) if p is not None]
-        base = 16 if used and max(used) >= 32 else 0
-        if used and base and min(used) < 16:
-            raise ValueError("pins must be in 0-31 or 16-47")
-        if b.rd(_GPIOBASE) & 16 != base:
-            if b.rd(_CTRL) & 0xF & ~(1 << sm):
-                raise ValueError("the block's other state machines use GPIO base %d" % (b.rd(_GPIOBASE) & 16))
-            b.wr(_GPIOBASE, base)
+        # GPIOBASE: 16 for pins above 31, else 0; a machine without pins
+        # leaves it as it is
+        base = b.rd(_GPIOBASE) & 16
+        if used:
+            want = 16 if max(used) >= 32 else 0
+            if want and min(used) < 16:
+                raise ValueError("pins must be in 0-31 or 16-47")
+            if want != base:
+                # not under another machine that runs, or has pins set for
+                # this base (they would point elsewhere)
+                if (b.rd(_CTRL) & 0xF | b.pinned) & ~(1 << sm):
+                    raise ValueError("the block's other state machines use GPIO base %d" % base)
+                b.wr(_GPIOBASE, want)
+                base = want
+            b.pinned |= 1 << sm
         pinctrl = 0
         if out_base is not None:
             pinctrl |= (out_base - base) & 31 | len(outs or (0,)) << 20
