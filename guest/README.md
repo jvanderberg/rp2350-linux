@@ -148,31 +148,44 @@ links on the guest: `cc hello.c && ./a.out`, `tcc -run hello.c`, `cc -c`,
 
 ## Pins
 
-The disk guest has the board's GPIO, I2C, SPI, PWM and ADC. The pin map,
+The disk guest has the board's GPIO, I2C, SPI, PWM, ADC, and PIO1/PIO2 with
+DMA. The pin map,
 the tools and examples are in the top-level README; the devices are in
 `../rvemu-rs/README.md`.
 
 - **Drivers:** `linux/drivers/rvemu/` holds the machine's own drivers,
   which `build.sh` copies into the kernel tree (`drivers/rvemu`):
   `gpio-rvemu.c` (gpiochip with an irqchip, bias, edge events),
-  `i2c-rvemu.c`, `spi-rvemu.c`, `pwm-rvemu.c` and `adc-rvemu.c` (IIO).
+  `i2c-rvemu.c`, `spi-rvemu.c`, `pwm-rvemu.c`, `adc-rvemu.c` (IIO) and
+  `pio-rvemu.c` (`/dev/pio1`, `/dev/pio2`: the block's registers and a DMA
+  buffer by `mmap`, pins claimed through gpiolib, `poll` on the block's
+  IRQ0, DMA by ioctl; its uapi header is `rvemu-pio.h`).
   Each one is off unless its `CONFIG_RVEMU_*` symbol is set, and binds to an
   `rvemu,*` node in the guest's device tree (`pico-shell.sh` adds the
   nodes when the kernel has the drivers).
 - **Kernel options** (`linux-disk.fragment`): `GPIO_CDEV` (v2 only),
   `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO` without buffers or triggers;
-  `MMC_SPI`, `MMC_BLOCK` and `VFAT_FS` for the SD card on SPI1, which
-  `S03sd` mounts at `/mnt/sd`.
+  `VFAT_FS` for the SD card, which the firmware drives and gives the guest
+  as a virtio disk (serial `rvemu-sd`); `S03sd` mounts its first partition
+  at `/mnt/sd` and swaps on any partition with a swap signature.
 - **Packages** (`buildroot-disk.defconfig`): libgpiod 2 tools (`gpiodetect`,
   `gpioinfo`, `gpioget`, `gpioset`, `gpiomon`, ...), i2c-tools,
-  `spidev_test`, and two of this repository's (`br-external/package/`):
+  `spidev_test`, and three of this repository's (`br-external/package/`):
   - `micropython-machine`: `machine.py` (compiled to
     `/usr/lib/micropython/machine.mpy`), which extends MicroPython's
     built-in `machine` with `Pin`, `I2C`, `SPI`, `PWM` and `ADC` over
     `/dev/gpiochip0`, `/dev/i2c-N`, `/dev/spidev0.0`, PWM sysfs and IIO,
     and a small C module (`cmod/fcntl`) that MicroPython is built with, for
     `fcntl.ioctl`. `Pin.irq(handler)` runs the handler in a thread of its
-    own for each edge.
+    own for each edge. `rp2.py` (`/usr/lib/micropython/rp2.mpy`) is the
+    rp2 port's `rp2` module on `/dev/pio1` and `/dev/pio2`: the port's own
+    assembler, `PIO`, `StateMachine` and `DMA`. It reaches the registers
+    through `cmod/rvmem` (`_rvmem`: `mmap` and 32-bit loads and stores),
+    since the unix port's `machine.mem32` goes through `/dev/mem`.
+  - `libpio`: `libpio.so`, `pio.h` (the pico-sdk's PIO API, a run-time
+    assembler and DMA) and `pioasm`, with examples in
+    `/usr/share/examples/pio`. The assembler takes the pico-sdk pioasm's
+    syntax, RP2350 instructions included.
   - `pins-examples`: `gpio-blink`, `gpio-edge`, `i2c-scan`, `spi-xfer` and
     `adc-read`, built and as source in `/usr/share/examples/pins`. On the
     board, build one with `cc -o gpio-blink gpio-blink.c`. The directory's
@@ -193,7 +206,7 @@ Of note in `linux-disk.fragment`:
 | `CONFIG_INET_TABLE_PERTURB_ORDER=8` | a 1 KiB RFC 6056 port perturbation table |
 | `CONFIG_VIRTIO_NET`, `CONFIG_NET`, `UNIX`, `INET`, `PACKET` | Ethernet over virtio; tmux needs AF_UNIX |
 | `EPOLL`, `EVENTFD`, `TIMERFD`, `SIGNALFD`, `INOTIFY_USER`, `SYSVIPC`, `FILE_LOCKING` | what the packages expect |
-| `GPIO_CDEV`, `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO`, `RVEMU_GPIO` & co. | the board's pins |
+| `GPIO_CDEV`, `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO`, `RVEMU_GPIO` & co., `RVEMU_PIO` | the board's pins and PIO |
 | `RVEMU_CRYPTO`, `RVEMU_SSH`, `RVEMU_BENCH` | the native crypto devices |
 | no `VT`, `INPUT`, `SERIO`, `HID_SUPPORT` | the board has only the serial console |
 

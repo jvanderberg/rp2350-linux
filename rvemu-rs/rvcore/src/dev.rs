@@ -1,15 +1,16 @@
 //! Platform devices: 16550-style UART, a single-context SiFive PLIC (hart 0,
 //! S-mode), optional virtio-mmio block and network devices, an optional
-//! NOR flash device (`nor.rs`) and optionally the board's pins (`periph`).
-//! The host supplies the console, the disk, the network link, the flash and
-//! the pins.
+//! NOR flash device (`nor.rs`), optionally the board's pins (`periph`) and
+//! an SD card (a removable virtio block device, `sdcard.rs`). The host
+//! supplies the console, the disk, the network link, the flash, the pins and
+//! the card.
 
 use crate::cpu::exc;
 use crate::nor::{NOR_BASE, NOR_SIZE, NoNor, NorDev, NorFlash};
-use crate::periph::{GPIO_IRQ, IO_BASE, IO_SIZE, Io, NoPins, Pins};
+use crate::periph::{DMA_IRQ, GPIO_IRQ, IO_BASE, IO_SIZE, Io, NoPins, PIO_IRQ, Pins};
 use crate::virtio::{
-    Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE,
-    VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ, VirtioBlk, VirtioNet,
+    Disk, GuestMem, NetLink, NoDisk, NoNet, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SD_BASE,
+    VIRTIO_SD_IRQ, VIRTIO_SIZE, VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ, VirtioBlk, VirtioNet,
 };
 
 pub const PLIC_BASE: u32 = 0xF000_0000;
@@ -211,9 +212,9 @@ impl Uart {
     }
 }
 
-/// UART + PLIC (+ disk, + network, + flash, + swap, + pins) wired together,
-/// generic over the host console, disk, network link, flash, swap backend and
-/// pins.
+/// UART + PLIC (+ disk, + network, + flash, + swap, + pins, + SD card)
+/// wired together, generic over the host console, disk, network link, flash,
+/// swap backend, pins and card.
 pub struct Platform<
     C: Console,
     D: Disk = NoDisk,
@@ -221,6 +222,7 @@ pub struct Platform<
     F: NorFlash = NoNor,
     W: Disk = NoDisk,
     P: Pins = NoPins,
+    S: Disk = NoDisk,
 > {
     pub uart: Uart,
     pub plic: Plic,
@@ -230,12 +232,41 @@ pub struct Platform<
     pub nor: Option<NorDev<F>>,
     pub swap: Option<VirtioBlk<W>>,
     pub io: Option<Io<P>>,
+    pub sd: Option<VirtioBlk<S>>,
 }
 
-impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C, D, N, F, W, P> {
+impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins, S: Disk> Platform<C, D, N, F, W, P, S> {
     /// UART and PLIC only.
     pub fn new(con: C) -> Self {
-        Platform { uart: Uart::default(), plic: Plic::default(), con, blk: None, net: None, nor: None, swap: None, io: None }
+        Platform {
+            uart: Uart::default(),
+            plic: Plic::default(),
+            con,
+            blk: None,
+            net: None,
+            nor: None,
+            swap: None,
+            io: None,
+            sd: None,
+        }
+    }
+
+    /// Add the SD card at `VIRTIO_SD_BASE`: a writable block device whose
+    /// media can come and go (`poll_media`).
+    pub fn with_sd(mut self, card: S, mem: GuestMem) -> Self {
+        self.sd = Some(VirtioBlk::new(card, mem));
+        self
+    }
+
+    /// Removable media: look for a card going in or out (about once a
+    /// second; call it while the guest idles, since bringing a new card up
+    /// takes a while).
+    pub fn poll_media(&mut self) {
+        if let Some(sd) = &mut self.sd
+            && sd.poll_media()
+        {
+            self.plic.set_level(VIRTIO_SD_IRQ, sd.irq_line());
+        }
     }
 
     /// Add the NOR flash device at `NOR_BASE` on `flash`, copying to and from `mem`.
@@ -290,6 +321,9 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C,
         if let Some(io) = &mut self.io {
             io.poll();
             self.plic.set_level(GPIO_IRQ, io.irq_line());
+            self.plic.set_level(PIO_IRQ[0], io.pio_irq_line(0));
+            self.plic.set_level(PIO_IRQ[1], io.pio_irq_line(1));
+            self.plic.set_level(DMA_IRQ, io.dma_irq_line());
         }
     }
 
@@ -301,6 +335,9 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C,
             return Some(r);
         }
         if let Some(r) = self.swap.as_mut().and_then(|w| w.take_dma_write()) {
+            return Some(r);
+        }
+        if let Some(r) = self.sd.as_mut().and_then(|w| w.take_dma_write()) {
             return Some(r);
         }
         if let Some(r) = self.nor.as_mut().and_then(|f| f.take_dma_write()) {
@@ -339,6 +376,11 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C,
             && pa.wrapping_sub(VIRTIO_SWAP_BASE) < VIRTIO_SIZE
         {
             return w.load(pa - VIRTIO_SWAP_BASE, size);
+        }
+        if let Some(w) = &mut self.sd
+            && pa.wrapping_sub(VIRTIO_SD_BASE) < VIRTIO_SIZE
+        {
+            return w.load(pa - VIRTIO_SD_BASE, size);
         }
         if let Some(io) = &mut self.io
             && pa.wrapping_sub(IO_BASE) < IO_SIZE
@@ -390,6 +432,16 @@ impl<C: Console, D: Disk, N: NetLink, F: NorFlash, W: Disk, P: Pins> Platform<C,
             // into the SRAM interpreter.
             let r = w.store(pa - VIRTIO_SWAP_BASE, size, v);
             self.plic.set_level(VIRTIO_SWAP_IRQ, w.irq_line());
+            self.update_irqs();
+            return r;
+        }
+        if let Some(w) = &mut self.sd
+            && pa.wrapping_sub(VIRTIO_SD_BASE) < VIRTIO_SIZE
+        {
+            // as the swap device: only its own stores and `poll_media`
+            // change its line
+            let r = w.store(pa - VIRTIO_SD_BASE, size, v);
+            self.plic.set_level(VIRTIO_SD_IRQ, w.irq_line());
             self.update_irqs();
             return r;
         }

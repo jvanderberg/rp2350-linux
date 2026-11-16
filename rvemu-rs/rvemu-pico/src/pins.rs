@@ -10,10 +10,18 @@
 //!   holding SCL or SDA low would stop the emulator for good.
 //! - SPI0: GP16 RX (MISO), GP17 chip select (driven as a GPIO), GP18 SCK,
 //!   GP19 TX (MOSI).
-//! - SPI1, the SD card: GP8 RX (MISO, pulled up), GP9 chip select (a GPIO),
-//!   GP10 SCK, GP11 TX (MOSI).
+//! - SPI1 is the SD card's (`sd.rs`), not the guest's: transfers on bus 1
+//!   do nothing.
 //! - PWM: the slice and channel that can reach the pin (`periph::pwm_slice`).
 //! - ADC: GP40-GP47 and the temperature sensor.
+//! - PIO: PIO1 and PIO2 themselves, register for register (PIO0 is the
+//!   radio's, `wifi.rs`); a free pin the guest gives a block gets that
+//!   block's function. Their IRQ0 lines are looked at, never taken, as
+//!   IO_IRQ_BANK0 is.
+//! - PIO DMA: the chip's DMA channels 12-15 (the firmware uses none), each
+//!   between guest RAM and one PIO FIFO, paced by its DREQ. rvcore has
+//!   checked the buffer; flash erase and program pause them (`dma_pause`),
+//!   since they stop the XIP bus guest RAM is on.
 //!
 //! rp235x-hal 0.4's ADC knows only the QFN-60 package (channels on
 //! GP26-GP29, the temperature sensor on channel 4). This is the QFN-80
@@ -26,15 +34,17 @@ use embedded_hal::spi::{MODE_0, Mode, Phase, Polarity, SpiBus as _};
 use hal::fugit::RateExtU32;
 use hal::gpio::bank0::{Gpio4, Gpio5, Gpio6, Gpio7, Gpio8, Gpio9, Gpio10, Gpio11, Gpio16, Gpio17, Gpio18, Gpio19};
 use hal::gpio::{
-    DynPinId, DynPullType, FunctionI2C, FunctionNull, FunctionPwm, FunctionSioInput, FunctionSioOutput,
-    FunctionSpi, Interrupt, Pin, PinState, PullDown, PullNone, PullUp,
+    DynPinId, DynPullType, FunctionI2C, FunctionNull, FunctionPio1, FunctionPio2, FunctionPwm, FunctionSioInput,
+    FunctionSioOutput, FunctionSpi, Interrupt, Pin, PinState, PullDown, PullNone, PullUp,
 };
 use hal::pac;
 use hal::pwm::{Slices, ValidSliceMode};
 use hal::spi::{Enabled, FrameFormat, Spi, SpiDevice, ValidSpiPinout};
 use rp235x_hal as hal;
 use rp2350_board as board;
-use rvcore::periph::{FREE_PINS, I2cError, I2cOp, Line, NGPIO, Pins, Pwm, pwm_slice, pwm_timing};
+use rvcore::periph::{
+    DMA_CHANNELS, DmaState, DmaXfer, FREE_PINS, I2cError, I2cOp, Line, NGPIO, Pins, Pwm, pwm_slice, pwm_timing,
+};
 
 type DPin<F> = Pin<DynPinId, F, DynPullType>;
 
@@ -43,6 +53,8 @@ pub enum Gp {
     In(DPin<FunctionSioInput>),
     Out(DPin<FunctionSioOutput>),
     Pwm(DPin<FunctionPwm>),
+    Pio1(DPin<FunctionPio1>),
+    Pio2(DPin<FunctionPio2>),
 }
 
 macro_rules! with_pin {
@@ -51,6 +63,8 @@ macro_rules! with_pin {
             Gp::In($p) => $e,
             Gp::Out($p) => $e,
             Gp::Pwm($p) => $e,
+            Gp::Pio1($p) => $e,
+            Gp::Pio2($p) => $e,
         }
     };
 }
@@ -72,6 +86,8 @@ impl Gp {
             Gp::In(p) => Gp::In(p),
             Gp::Out(p) => Gp::In(p.try_into_function().ok().unwrap()),
             Gp::Pwm(p) => Gp::In(p.try_into_function().ok().unwrap()),
+            Gp::Pio1(p) => Gp::In(p.try_into_function().ok().unwrap()),
+            Gp::Pio2(p) => Gp::In(p.try_into_function().ok().unwrap()),
         }
     }
 
@@ -82,6 +98,8 @@ impl Gp {
             Gp::Out(p) => p,
             Gp::In(p) => p.try_into_function().ok().unwrap(),
             Gp::Pwm(p) => p.try_into_function().ok().unwrap(),
+            Gp::Pio1(p) => p.try_into_function().ok().unwrap(),
+            Gp::Pio2(p) => p.try_into_function().ok().unwrap(),
         };
         let _ = p.set_state(if high { PinState::High } else { PinState::Low });
         Gp::Out(p)
@@ -92,7 +110,25 @@ impl Gp {
             Gp::Pwm(p) => Gp::Pwm(p),
             Gp::In(p) => Gp::Pwm(p.try_into_function().ok().unwrap()),
             Gp::Out(p) => Gp::Pwm(p.try_into_function().ok().unwrap()),
+            Gp::Pio1(p) => Gp::Pwm(p.try_into_function().ok().unwrap()),
+            Gp::Pio2(p) => Gp::Pwm(p.try_into_function().ok().unwrap()),
         }
+    }
+
+    /// PIO1's (block 0) or PIO2's function; edge interrupts stay as they are.
+    fn into_pio(self, blk: usize) -> Self {
+        macro_rules! to {
+            ($v:ident) => {
+                match self {
+                    Gp::In(p) => Gp::$v(p.try_into_function().ok().unwrap()),
+                    Gp::Out(p) => Gp::$v(p.try_into_function().ok().unwrap()),
+                    Gp::Pwm(p) => Gp::$v(p.try_into_function().ok().unwrap()),
+                    Gp::Pio1(p) => Gp::$v(p.try_into_function().ok().unwrap()),
+                    Gp::Pio2(p) => Gp::$v(p.try_into_function().ok().unwrap()),
+                }
+            };
+        }
+        if blk == 0 { to!(Pio1) } else { to!(Pio2) }
     }
 }
 
@@ -121,8 +157,6 @@ pub struct PinSet {
     pub i2c1: I2c1,
     pub spi: Spi0,
     pub spi_cs: SpiCs,
-    pub spi1: Spi1,
-    pub spi1_cs: Spi1Cs,
     /// GP40-GP47, analog.
     pub adc_pins: [Pin<DynPinId, FunctionNull, PullNone>; 8],
 }
@@ -136,11 +170,9 @@ pub struct BoardPins {
     _i2c1: I2c1,
     spi: Spi0,
     spi_cs: SpiCs,
-    spi1: Spi1,
-    spi1_cs: Spi1Cs,
-    /// Each bus's current clock and mode.
-    spi_hz: [u32; 2],
-    spi_mode: [u8; 2],
+    /// SPI0's current clock and mode.
+    spi_hz: u32,
+    spi_mode: u8,
     peri_hz: u32,
     pwm: Slices,
     /// Pins with PWM on, and each slice's (div16, top).
@@ -150,16 +182,102 @@ pub struct BoardPins {
     _adc: hal::adc::Adc,
     _temp: hal::adc::TempSense,
     _adc_pins: [Pin<DynPinId, FunctionNull, PullNone>; 8],
+    /// Ours: the guest drives their registers (`pio_read` / `pio_write`).
+    _pio: (pac::PIO1, pac::PIO2),
+    /// Guest DMA channels started and not stopped, and which of them move
+    /// data out of a FIFO into memory.
+    dma_active: u32,
+    dma_from_fifo: u32,
 }
 
+// ------------------------------------------------------------------ PIO DMA
+
+const DMA_BASE: usize = 0x5000_0000;
+/// The guest's channels are the chip's GUEST_DMA0 and up.
+const GUEST_DMA0: usize = 12;
+const DMA_READ_ADDR: usize = 0x00;
+const DMA_WRITE_ADDR: usize = 0x04;
+const DMA_TRANS_COUNT: usize = 0x08;
+const DMA_CTRL_TRIG: usize = 0x0C;
+const DMA_AL1_CTRL: usize = 0x10;
+const DMA_INTR: usize = 0x400;
+const DMA_CHAN_ABORT: usize = 0x464;
+const DMA_EN: u32 = 1;
+const DMA_BUSY: u32 = 1 << 26;
+const DMA_AHB_ERROR: u32 = 1 << 31;
+/// TRANS_COUNT's MODE: endless.
+const DMA_ENDLESS: u32 = 0xF << 28;
+/// DREQ of PIO1's TX FIFO 0; RX FIFO 0 is 4 up, and PIO2's are 8 up.
+const DREQ_PIO1_TX0: u32 = 8;
+
+#[inline(always)]
+fn dma_reg(ch: usize, off: usize) -> *mut u32 {
+    (DMA_BASE + 0x40 * (GUEST_DMA0 + ch) + off) as *mut u32
+}
+
+/// Stop the guest's DMA channels for a flash erase or program (it stops
+/// the XIP bus their buffers are on); the ones to start again. Inlined into
+/// the SRAM routine that does the operation: register accesses only.
+#[inline(always)]
+pub fn dma_pause() -> u32 {
+    let mut on = 0;
+    for ch in 0..DMA_CHANNELS {
+        // SAFETY: the guest's channels' registers; AL1_CTRL doesn't trigger,
+        // and its CLR alias (+0x3000) clears EN alone.
+        unsafe {
+            if dma_reg(ch, DMA_CTRL_TRIG).read_volatile() & DMA_EN != 0 {
+                on |= 1 << ch;
+                ((dma_reg(ch, DMA_AL1_CTRL) as usize + 0x3000) as *mut u32).write_volatile(DMA_EN);
+            }
+        }
+    }
+    if on != 0 {
+        // the transfers already on the bus finish (a few bus cycles)
+        for _ in 0..2048 {
+            core::hint::spin_loop();
+        }
+    }
+    on
+}
+
+/// Start the channels `dma_pause` stopped again.
+#[inline(always)]
+pub fn dma_resume(on: u32) {
+    for ch in 0..DMA_CHANNELS {
+        if on >> ch & 1 != 0 {
+            // SAFETY: as in dma_pause; the SET alias (+0x2000).
+            unsafe { ((dma_reg(ch, DMA_AL1_CTRL) as usize + 0x2000) as *mut u32).write_volatile(DMA_EN) };
+        }
+    }
+}
+
+/// PIO1's registers; PIO2's are 1 MiB up. The XOR, SET and CLR aliases
+/// are at +0x1000, +0x2000, +0x3000.
+const PIO1_BASE: usize = 0x5030_0000;
+const PIO_STRIDE: usize = 0x10_0000;
+
 impl BoardPins {
-    pub fn new(set: PinSet, pwm: pac::PWM, adc: pac::ADC, resets: &mut pac::RESETS, sys_hz: u32, peri_hz: u32) -> Self {
+    pub fn new(
+        set: PinSet,
+        pwm: pac::PWM,
+        adc: pac::ADC,
+        pio: (pac::PIO1, pac::PIO2),
+        resets: &mut pac::RESETS,
+        sys_hz: u32,
+        peri_hz: u32,
+    ) -> Self {
+        // PIO1 and PIO2 out of reset, as the chip resets them, and the DMA
+        // (nothing else of the firmware's uses it)
+        resets.reset().modify(|_, w| w.pio1().set_bit().pio2().set_bit());
+        resets.reset().modify(|_, w| w.pio1().clear_bit().pio2().clear_bit().dma().clear_bit());
+        while {
+            let d = resets.reset_done().read();
+            !(d.pio1().bit_is_set() && d.pio2().bit_is_set() && d.dma().bit_is_set())
+        } {}
         let mut adc = hal::adc::Adc::new(adc, resets);
         let temp = adc.take_temp_sensor().unwrap();
         let mut spi_cs = set.spi_cs;
         let _ = spi_cs.set_high();
-        let mut spi1_cs = set.spi1_cs;
-        let _ = spi1_cs.set_high();
         let mut adc_pins = set.adc_pins;
         for p in adc_pins.iter_mut() {
             p.set_input_enable(false);
@@ -172,10 +290,8 @@ impl BoardPins {
             _i2c1: set.i2c1,
             spi: set.spi,
             spi_cs,
-            spi1: set.spi1,
-            spi1_cs,
-            spi_hz: [0; 2],
-            spi_mode: [0; 2],
+            spi_hz: 0,
+            spi_mode: 0,
             peri_hz,
             pwm: Slices::new(pwm, resets),
             pwm_on: 0,
@@ -184,6 +300,9 @@ impl BoardPins {
             _adc: adc,
             _temp: temp,
             _adc_pins: adc_pins,
+            _pio: pio,
+            dma_active: 0,
+            dma_from_fifo: 0,
         }
     }
 
@@ -543,22 +662,15 @@ impl Pins for BoardPins {
     }
 
     fn spi_transfer(&mut self, bus: usize, hz: u32, mode: u8, buf: &mut [u8]) {
-        let b = bus & 1;
-        let cur = (&mut self.spi_hz[b], &mut self.spi_mode[b]);
-        if b == 0 {
-            spi_run(&mut self.spi, self.peri_hz, cur, hz, mode, buf);
-        } else {
-            spi_run(&mut self.spi1, self.peri_hz, cur, hz, mode, buf);
+        if bus == 0 {
+            spi_run(&mut self.spi, self.peri_hz, (&mut self.spi_hz, &mut self.spi_mode), hz, mode, buf);
         }
     }
 
     fn spi_cs(&mut self, bus: usize, active: bool) {
-        let _ = match (bus & 1, active) {
-            (0, true) => self.spi_cs.set_low(),
-            (0, false) => self.spi_cs.set_high(),
-            (_, true) => self.spi1_cs.set_low(),
-            (_, false) => self.spi1_cs.set_high(),
-        };
+        if bus == 0 {
+            let _ = if active { self.spi_cs.set_low() } else { self.spi_cs.set_high() };
+        }
     }
 
     fn pwm_set(&mut self, n: u32, want: Pwm) -> Pwm {
@@ -592,6 +704,125 @@ impl Pins for BoardPins {
             self.gp[n as usize] = Some(g.into_pwm());
         }
         Pwm { period_ns: t.period_ns, duty_ns: t.duty_ns, ..want }
+    }
+
+    fn pio_blocks(&self) -> u32 {
+        2
+    }
+
+    fn pio_clk_hz(&self) -> u32 {
+        self.sys_hz
+    }
+
+    fn pio_read(&mut self, blk: usize, reg: u32) -> u32 {
+        // SAFETY: PIO1 / PIO2 are ours (`_pio`); `reg` is a register of the
+        // block (rvcore checks it), and reads have only the chip's effects.
+        unsafe { ((PIO1_BASE + blk * PIO_STRIDE + reg as usize) as *const u32).read_volatile() }
+    }
+
+    fn pio_write(&mut self, blk: usize, alias: u32, reg: u32, v: u32) {
+        // SAFETY: as in pio_read; rvcore has dropped the CTRL bits that
+        // would reach PIO0.
+        unsafe { ((PIO1_BASE + blk * PIO_STRIDE + 0x1000 * alias as usize + reg as usize) as *mut u32).write_volatile(v) }
+    }
+
+    fn pio_pin(&mut self, n: u32, blk: Option<usize>) {
+        let Some(g) = self.gp.get_mut(n as usize).and_then(Option::take) else { return };
+        self.pwm_on &= !(1 << n);
+        // pulls and edge interrupts stay as the GPIO line had them; going
+        // back, `gpio_set` sets the line up again
+        self.gp[n as usize] = Some(match blk {
+            Some(b) => g.into_pio(b),
+            None => g.into_input(),
+        });
+    }
+
+    /// Two CSR reads, from the guest's device poll.
+    #[inline(always)]
+    fn pio_irqs(&mut self) -> u32 {
+        u32::from(hal::xh3irq::is_pending(pac::Interrupt::PIO1_IRQ_0))
+            | u32::from(hal::xh3irq::is_pending(pac::Interrupt::PIO2_IRQ_0)) << 1
+    }
+
+    fn dma_channels(&self) -> u32 {
+        DMA_CHANNELS as u32
+    }
+
+    fn dma_start(&mut self, ch: usize, x: DmaXfer) {
+        self.dma_stop(ch);
+        let fifo = PIO1_BASE + x.blk * PIO_STRIDE + if x.from_fifo { 0x20 } else { 0x10 } + 4 * x.sm;
+        let dreq = DREQ_PIO1_TX0 + 8 * x.blk as u32 + if x.from_fifo { 4 } else { 0 } + x.sm as u32;
+        let (read, write) = if x.from_fifo { (fifo, x.mem as usize) } else { (x.mem as usize, fifo) };
+        let ctrl = DMA_EN
+            | x.size_log2 << 2
+            | u32::from(!x.from_fifo) << 4 // INCR_READ
+            | u32::from(x.from_fifo) << 6 // INCR_WRITE
+            | x.ring_log2 << 8
+            | u32::from(x.from_fifo) << 12 // RING_SEL: the write side
+            | ((GUEST_DMA0 + ch) as u32) << 13 // CHAIN_TO itself: no chain
+            | dreq << 17;
+        // SAFETY: a guest channel; rvcore checked the memory side is guest
+        // RAM for the whole transfer (or ring), and the FIFO is a guest
+        // PIO block's.
+        unsafe {
+            ((DMA_BASE + DMA_INTR) as *mut u32).write_volatile(1 << (GUEST_DMA0 + ch));
+            dma_reg(ch, DMA_READ_ADDR).write_volatile(read as u32);
+            dma_reg(ch, DMA_WRITE_ADDR).write_volatile(write as u32);
+            dma_reg(ch, DMA_TRANS_COUNT).write_volatile(x.count | if x.endless { DMA_ENDLESS } else { 0 });
+            dma_reg(ch, DMA_CTRL_TRIG).write_volatile(ctrl);
+        }
+        self.dma_active |= 1 << ch;
+        if x.from_fifo {
+            self.dma_from_fifo |= 1 << ch;
+        } else {
+            self.dma_from_fifo &= !(1 << ch);
+        }
+    }
+
+    fn dma_stop(&mut self, ch: usize) {
+        let bit = 1u32 << (GUEST_DMA0 + ch);
+        // SAFETY: a guest channel's registers: EN off (no more transfers
+        // start), then ABORT, which returns once the channel has stopped.
+        unsafe {
+            let c = dma_reg(ch, DMA_CTRL_TRIG).read_volatile();
+            if c & (DMA_EN | DMA_BUSY) != 0 {
+                dma_reg(ch, DMA_AL1_CTRL).write_volatile(c & !DMA_EN);
+                ((DMA_BASE + DMA_CHAN_ABORT) as *mut u32).write_volatile(bit);
+                while ((DMA_BASE + DMA_CHAN_ABORT) as *const u32).read_volatile() & bit != 0 {}
+            }
+            ((DMA_BASE + DMA_INTR) as *mut u32).write_volatile(bit);
+        }
+        self.dma_active &= !(1 << ch);
+    }
+
+    fn dma_state(&mut self, ch: usize) -> DmaState {
+        if self.dma_active >> ch & 1 == 0 {
+            return DmaState::default();
+        }
+        // SAFETY: a guest channel's registers (reads have no effect).
+        unsafe {
+            let c = dma_reg(ch, DMA_CTRL_TRIG).read_volatile();
+            let mem = if self.dma_from_fifo >> ch & 1 != 0 { DMA_WRITE_ADDR } else { DMA_READ_ADDR };
+            DmaState {
+                busy: c & DMA_BUSY != 0,
+                error: c & DMA_AHB_ERROR != 0,
+                remaining: dma_reg(ch, DMA_TRANS_COUNT).read_volatile() & 0x0FFF_FFFF,
+                mem: dma_reg(ch, mem).read_volatile() as usize,
+            }
+        }
+    }
+
+    /// One register read, while a guest channel runs.
+    fn dma_done(&mut self) -> u32 {
+        // SAFETY: INTR, the raw completion flags; ours are cleared (write 1).
+        unsafe {
+            let intr = ((DMA_BASE + DMA_INTR) as *const u32).read_volatile();
+            let done = (intr >> GUEST_DMA0) & ((1 << DMA_CHANNELS) - 1) & self.dma_active;
+            if done != 0 {
+                ((DMA_BASE + DMA_INTR) as *mut u32).write_volatile(done << GUEST_DMA0);
+            }
+            done
+        }
     }
 
     fn adc(&mut self, ch: u32) -> Option<u16> {

@@ -33,10 +33,11 @@ guest to `login:` in under a second.
 | `-i FILE` | initramfs (cpio) |
 | `-d FILE` | disk image for the read-only virtio-blk device. Without `-i`, the default command line roots on it: `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`. |
 | `-F FILE` | the NOR flash device (the board's 1 MB `/home` region), backed by FILE, which is created blank (0xFF) if missing and written through, so `/home` persists across runs. `RVEMU_NOR_CUT=N` simulates a power cut: the N-th program or erase is applied halfway and the emulator exits. |
+| `-s FILE` | an SD card backed by FILE (a raw card image), on the firmware's SD path (`rvcore::sdcard` over a simulated SPI card, `rvemu/src/sdsim.rs`): the guest's `/dev/vdc`, serial `rvemu-sd`. The card is present while FILE exists (checked every 500 ms), so renaming it simulates taking the card out. `RVEMU_SD_FLIP=N` corrupts one bit of every Nth data byte the card sends, to exercise the CRC retries. |
 | `-W` | the swap device (below) on a modelled copy of the board's swap flash (511 sectors), with datasheet-typical erase and program times in its statistics. The guest's init enables it as `/dev/vdb`. |
-| `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N. `RVEMU_IO=gpio,i2c0,i2c1,spi0,spi1,pwm,adc` picks which of them go in the device tree. |
+| `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N; PIO1 and PIO2 in software (`piosim.rs`, at `RVEMU_PIO_HZ` cycles a second, default 10 MHz, in step with wall time) with the DMA pool. `RVEMU_IO=gpio,i2c0,i2c1,spi0,pwm,adc,pio` picks which of them go in the device tree (`pio` needs `gpio`). |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
-| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `_etext - _start` from `System.map`, rounded down to a page (2998272 for the disk kernel). |
+| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `__init_begin - _start` from `System.map` when the kernel puts its read-only data after its text (`rodata-in-flash.patch`; 3502080 for the disk kernel), otherwise `_etext - _start` rounded down to a page. |
 | `-b FILE` | use this DTB instead of generating one |
 | `-m MB` | guest RAM (default 64) |
 | `-a ARGS` | kernel command line (default `earlycon console=ttyS0`) |
@@ -143,12 +144,16 @@ receive the same generated device tree, including the fixed entropy seed.
 | virtio-net | 0xF8000200 | 3 |
 | NOR flash (`rvemu,flash`) | 0xF8000400 | |
 | virtio-blk, swap (only with `-W` / `pico-shell.sh -w`) | 0xF8000600 | 5 |
+| virtio-blk, SD card (`-s FILE` on the Mac) | 0xF8000800 | 6 |
 | GPIO | 0xF8001000 | 8 |
 | I2C0, I2C1 | 0xF8001200, 0xF8001400 | |
 | SPI0 | 0xF8001600 | |
-| SPI1 (the SD card) | 0xF8001C00 | |
+| SPI1 (no device-tree node: the firmware's SD card) | 0xF8001C00 | |
 | PWM | 0xF8001800 | |
 | ADC | 0xF8001A00 | |
+| PIO pin control (`PIOCTL`) | 0xF8001E00 | |
+| PIO DMA pool | 0xF8002000 | 11 |
+| PIO1, PIO2 (16 KiB each, the chip's register layout) | 0xF8004000, 0xF8008000 | 9, 10 |
 
 - **No M-mode.** The kernel runs in S-mode, and SBI is implemented in the
   emulator.
@@ -194,6 +199,26 @@ receive the same generated device tree, including the fixed entropy seed.
     duty cycle it achieved, which `get_state` reports.
   - **ADC:** one 12-bit result register per channel: 0-7 GP40-GP47, 8 the
     temperature sensor (bit 31: conversion error).
+  - **PIO:** each of PIO1 and PIO2 is a 16 KiB window in the chip's layout
+    (registers, then the XOR, SET and CLR aliases at +0x1000, +0x2000 and
+    +0x3000), which the guest driver maps into a program, so a register
+    access is one load or store with no system call. Accesses of any width
+    are passed to the backend; a narrow write is replicated across the
+    word, as the chip's bus does. CTRL's neighbour-block bits (PREV/NEXT)
+    are dropped, so a block can't start or stop PIO0. PIOCTL holds a
+    selected pin's function (SIO, PIO1 or PIO2) and which pins and blocks
+    the backend offers. A pin given to PIO is taken from GPIO and PWM until
+    it is given back. Each block's IRQ0 output is a PLIC line.
+  - **DMA pool:** 4 channels, each moving words between guest RAM and one
+    state machine's TX or RX FIFO, once (up to `COUNT` transfers) or
+    endlessly around a ring of up to 4 KiB (2^n bytes, aligned). The
+    device checks the buffer (in guest RAM, not the read-only prefix,
+    aligned to the transfer size and the ring) before the backend starts
+    anything, so the guest can't point a channel at anything else; a
+    rejected start sets STATUS's rejected bit. A finished or failed
+    transfer raises IRQ 11. The Linux driver hands the channels out per
+    open block, and the buffer is pages the driver allocated and the
+    program maps.
 - **DMA and the translator:** each guest RAM range a device writes is
   reported separately (`take_dma_write`). The translator then drops only the
   code pages that were actually written.
@@ -429,18 +454,37 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   fails with `-ETIMEDOUT`: a stuck bus can't stop the emulator.
   The controller can't send an address without data, so a zero-length
   write (i2cdetect's probe) becomes a one-byte read.
-- **SPI.** `hal::spi::Spi`, 8-bit frames: SPI0 on GP16-GP19 for spidev,
-  SPI1 on GP8-GP11 for the SD card (`mmc-spi-slot` at 25 MHz, MISO pulled
-  up). The clock rate (100 kHz to 50 MHz) and mode change per transfer.
+- **SPI.** `hal::spi::Spi`, 8-bit frames: SPI0 on GP16-GP19 for spidev.
+  The clock rate (100 kHz to 50 MHz) and mode change per transfer.
   The controller makes the clock, so no device can hold a transfer up; the
   100 kHz floor bounds the longest one (4 KiB, spidev's buffer) to about
-  0.3 s. Chip selects GP17 and GP9 are GPIOs, held for the whole message,
+  0.3 s. Chip select GP17 is a GPIO, held for the whole message,
   and after it when its last transfer sets `cs_change`.
+- **SD card.** SPI1 on GP8-GP11 (MISO pulled up, GP9 chip select) belongs
+  to the firmware: `rvcore::sdcard` drives the card in SPI mode (CRCs on,
+  CMD18/CMD25 multi-block transfers, 43.5 MHz after CMD6 high speed, back
+  to 25 MHz after repeated CRC errors) through `rvemu-pico/src/sd.rs`,
+  which keeps the PL022's FIFO full. The guest sees a virtio-blk disk with
+  serial `rvemu-sd` at 0xF8000800 (IRQ 6), up to 30 segments per request;
+  a card going in or out is a config-change interrupt.
 - **PWM.** The slice and channel that reach the pin, with the divider and
   TOP worked out from the period. A slice's period can't change while
   another of its pins is running.
 - **ADC.** rp235x-hal 0.4's ADC knows only the QFN-60 channels, so the
   firmware selects the RP2350B's channels itself (AINSEL, START_ONCE).
+- **PIO.** PIO1 and PIO2 are the guest's (PIO0 is the radio's), reset at
+  boot. A guest register access becomes the same access to the block's
+  register or alias, so a program in the guest runs PIO at the chip's
+  speed; the clock is clk_sys. A pin the guest gives to a block gets that
+  block's FUNCSEL, and SIO again when it is given back. Each block's IRQ0
+  output reaches the guest through the PLIC, read from Xh3irq's pending
+  bits in the device poll (the interrupt itself is never taken).
+- **DMA pool.** The guest's 4 channels are the chip's channels 12-15. A
+  start the device accepted (see above) is programmed with the guest
+  buffer's host address, the PIO FIFO's address and its DREQ; an endless
+  ring uses TRANS_COUNT's endless mode. The buffer is PSRAM through the XIP
+  cache. A flash erase or program stops XIP, so `flash.rs` pauses the
+  channels (from RAM, before it leaves XIP) and resumes them after.
 
 ### Wi-Fi (`rvemu-pico/src/wifi.rs`)
 

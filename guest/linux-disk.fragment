@@ -70,10 +70,8 @@ CONFIG_SPI=y
 CONFIG_SPI_MASTER=y
 CONFIG_RVEMU_SPI=y
 CONFIG_SPI_SPIDEV=y
-# the SD card on SPI1 (/dev/mmcblk0), FAT on it
-CONFIG_MMC=y
-CONFIG_MMC_BLOCK=y
-CONFIG_MMC_SPI=y
+# FAT on the SD card (the firmware's SD device, a virtio disk: the SD
+# protocol runs in the firmware, so no MMC layer here)
 CONFIG_VFAT_FS=y
 CONFIG_NLS=y
 CONFIG_NLS_CODEPAGE_437=y
@@ -84,6 +82,8 @@ CONFIG_IIO=y
 # CONFIG_IIO_BUFFER is not set
 # CONFIG_IIO_TRIGGER is not set
 CONFIG_RVEMU_ADC=y
+# the PIO blocks (/dev/pio1, /dev/pio2)
+CONFIG_RVEMU_PIO=y
 # No keyboard, mouse or display, only the serial console: no virtual
 # terminals, input layer, serio (PS/2) or HID, which tinyconfig + olddefconfig
 # would otherwise switch on (with every PS/2 mouse protocol and HID over I2C)
@@ -97,3 +97,12 @@ CONFIG_RVEMU_ADC=y
 CONFIG_RVEMU_CRYPTO=y
 CONFIG_RVEMU_SSH=y
 CONFIG_RVEMU_BENCH=y
+# squashfs's LZ4 blocks decoded by the native engine
+# (drivers/rvemu/lz4-rvemu.c, squashfs-lz4-rvemu.patch). No zswap: on the
+# board its bookkeeping (zsmalloc, the tree, the LRU) runs as emulated code
+# and its pool takes RAM from the working set, so it lost to plain swap on
+# the SD card even with native LZ4 (a Lua job: 134 s against 108 s).
+CONFIG_RVEMU_LZ4=y
+# the kernel log: 16 KiB (512 records), about twice the boot's. The default
+# (17: 128 KiB, and 4096 record descriptors) takes 536 KiB of RAM.
+CONFIG_LOG_BUF_SHIFT=14

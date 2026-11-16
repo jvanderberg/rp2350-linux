@@ -10,15 +10,19 @@ use rvcore::dev::{Console, PLIC_BASE, PLIC_SIZE, Platform, UART_BASE, UART_IRQ, 
 use norfile::FileNor;
 use rvcore::nor::{NOR_BASE, NOR_SIZE};
 use rvcore::swapdev::{CHUNK, Flash, FlashSwap, PAGE};
+use rvcore::sdcard::SdCard;
 use rvcore::virtio::{
-    GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SIZE, VIRTIO_SWAP_BASE,
-    VIRTIO_SWAP_IRQ,
+    GuestMem, MemDisk, VIRTIO_BASE, VIRTIO_IRQ, VIRTIO_NET_BASE, VIRTIO_NET_IRQ, VIRTIO_SD_BASE, VIRTIO_SD_IRQ,
+    VIRTIO_SIZE, VIRTIO_SWAP_BASE, VIRTIO_SWAP_IRQ,
 };
+use sdsim::SimCard;
 use stubnet::StubNet;
 use rvcore::{Bus, Cpu, DTB_RNG_SEED, Halt, Priv, TIMEBASE_HZ};
 use stubpins::StubPins;
 
 mod norfile;
+mod piosim;
+mod sdsim;
 mod sim;
 mod stubnet;
 mod stubpins;
@@ -200,7 +204,7 @@ impl Flash for ModelFlash {
 struct HostBus {
     benchmarks: rvcore::benchmark::Log,
     benchmark_epoch: Instant,
-    plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>, StubPins>,
+    plat: Platform<TermConsole, MemDisk, StubNet, FileNor, FlashSwap<ModelFlash>, StubPins, SdCard<SimCard>>,
     interactive: bool,
     /// Multi-hart: a hart that executed WFI with nothing pending waits here
     /// (the run loop wakes it); time moves on only when every hart waits.
@@ -213,6 +217,7 @@ impl HostBus {
         self.plat.con.read_input();
         self.plat.update_irqs();
         self.plat.poll_pins();
+        self.plat.poll_media();
     }
 }
 
@@ -315,13 +320,15 @@ struct DtsOpts<'a> {
     nor: bool,
     /// swap virtio-blk at VIRTIO_SWAP_BASE, and the top RAM page reserved
     swap: bool,
+    /// the SD card's virtio-blk at VIRTIO_SD_BASE
+    sd: bool,
     /// the pin devices at IO_BASE (gpio)
     gpio: bool,
     harts: u32,
 }
 
 fn make_dts(o: &DtsOpts) -> String {
-    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap, gpio, harts } = *o;
+    let DtsOpts { ram_base, ram_size, bootargs, initrd, disk, net, nor, swap, sd, gpio, harts } = *o;
     let mut cpus = String::new();
     let mut plic_irqs = Vec::new();
     for h in 0..harts {
@@ -398,6 +405,9 @@ fn make_dts(o: &DtsOpts) -> String {
 "#
         );
     }
+    if sd {
+        virtio += &node(VIRTIO_SD_BASE, VIRTIO_SD_IRQ);
+    }
     let (io_root, io_soc) = if gpio { io_nodes() } else { (String::new(), String::new()) };
     format!(
         r#"/dts-v1/;
@@ -452,14 +462,14 @@ fn make_dts(o: &DtsOpts) -> String {
 /// the bus numbers) and the devices on the soc.
 fn io_nodes() -> (String, String) {
     use rvcore::periph::*;
-    // RVEMU_IO=gpio,i2c0,i2c1,spi0,spi1,pwm,adc: only these (for measuring)
+    // RVEMU_IO=gpio,i2c0,i2c1,spi0,pwm,adc,pio: only these (for measuring)
     let only = std::env::var("RVEMU_IO").ok();
     let want = |d: &str| only.as_deref().is_none_or(|o| o.split(',').any(|x| x == d));
     let names = LINE_NAMES.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
     let (mut root, mut soc, mut aliases) = (String::new(), String::new(), String::new());
     if want("gpio") {
         soc += &format!(
-            r#"    gpio@{GPIO_BASE:x} {{
+            r#"    gpio0: gpio@{GPIO_BASE:x} {{
       compatible = "rvemu,gpio";
       reg = <0x{GPIO_BASE:x} 0x{GPIO_SIZE:x}>;
       interrupts = <{GPIO_IRQ}>;
@@ -488,23 +498,23 @@ fn io_nodes() -> (String, String) {
 "#
         );
     }
-    // SPI0 for spidev; SPI1 for the SD card (mmc_spi), at SD's default speed
-    let spi_child = [
-        format!("      spidev@0 {{\n        compatible = \"rohm,dh2228fv\";\n        reg = <0>;\n        spi-max-frequency = <{SPI_MAX_HZ}>;\n      }};\n"),
-        "      mmc@0 {\n        compatible = \"mmc-spi-slot\";\n        reg = <0>;\n        spi-max-frequency = <25000000>;\n        voltage-ranges = <3300 3300>;\n      };\n".to_string(),
-    ];
-    for (k, (base, child)) in SPI_BASE.into_iter().zip(spi_child).enumerate() {
-        if !want(&format!("spi{k}")) {
-            continue;
-        }
-        aliases += &format!("    spi{k} = &spi{k};\n");
+    // SPI0 for spidev. SPI1 is the SD card's, which the host drives itself
+    // (`-s`, the SD card's virtio-blk device): the guest gets no SPI1.
+    if want("spi0") {
+        let base = SPI_BASE[0];
+        aliases += "    spi0 = &spi0;\n";
         soc += &format!(
-            r#"    spi{k}: spi@{base:x} {{
+            r#"    spi0: spi@{base:x} {{
       compatible = "rvemu,spi";
       reg = <0x{base:x} 0x{SPI_SIZE:x}>;
       #address-cells = <1>;
       #size-cells = <0>;
-{child}    }};
+      spidev@0 {{
+        compatible = "rohm,dh2228fv";
+        reg = <0>;
+        spi-max-frequency = <{SPI_MAX_HZ}>;
+      }};
+    }};
 "#
         );
     }
@@ -527,6 +537,36 @@ fn io_nodes() -> (String, String) {
     }};
 "#
         );
+    }
+    // PIO1 and PIO2 (/dev/pio1, /dev/pio2): each block's window, the pin
+    // functions they share, and every GPIO line (by number), which the
+    // driver takes from gpiolib while a block has the pin
+    if want("pio") && want("gpio") {
+        soc += &format!(
+            r#"    dma@{DMA_BASE:x} {{
+      compatible = "rvemu,pio-dma";
+      reg = <0x{DMA_BASE:x} 0x{DMA_SIZE:x}>;
+      interrupts = <{DMA_IRQ}>;
+      interrupt-parent = <&plic0>;
+    }};
+"#
+        );
+        let lines = (0..NGPIO).map(|n| format!("<&gpio0 {n} 0>")).collect::<Vec<_>>().join(", ");
+        for (k, base) in PIO_BASE.into_iter().enumerate() {
+            let irq = PIO_IRQ[k];
+            soc += &format!(
+                r#"    pio@{base:x} {{
+      compatible = "rvemu,pio";
+      reg = <0x{base:x} 0x{PIO_SIZE:x}>, <0x{PIOCTL_BASE:x} 0x{PIOCTL_SIZE:x}>;
+      interrupts = <{irq}>;
+      interrupt-parent = <&plic0>;
+      rvemu,block = <{}>;
+      pio-gpios = {lines};
+    }};
+"#,
+                k + 1
+            );
+        }
     }
     if !aliases.is_empty() {
         root = format!("  aliases {{\n{aliases}  }};\n{root}");
@@ -661,9 +701,13 @@ const USAGE: &str = "usage: rvemu -k Image [-i initrd] [options]
   -W             swap device (/dev/vdb in the disk guest): the board's flash
                  swap on a modelled flash (511 sectors), statistics in the
                  page after the swap area (flashswap-stats)
-  -G             the board's pins: GPIO, I2C, SPI, PWM, ADC on a simulated
+  -s FILE        SD card (the board's, on SPI1) as a virtio block device
+                 (/dev/vdc with -W, else /dev/vdb): a simulated SDHC card in SPI
+                 mode backed by FILE, in while FILE exists (see sdsim.rs)
+  -G             the board's pins: GPIO, I2C, SPI, PWM, ADC, PIO on a simulated
                  board (see stubpins.rs; RVEMU_JUMPERS=14-15 wires two pins,
-                 RVEMU_IO=gpio,i2c0,i2c1,spi0,spi1,pwm,adc picks the devices)
+                 RVEMU_IO=gpio,i2c0,i2c1,spi0,pwm,adc,pio picks the devices),
+                 with software PIO1 and PIO2 and their DMA (piosim.rs)
   -b FILE        use this DTB instead of generating one
   -m MB          guest RAM size in MiB, or KiB as NK (default 64)
   -c HARTS       harts (CPUs), 1 or 2 (default 1); run in turn
@@ -702,6 +746,7 @@ struct Opts {
     bootargs_set: bool,
     net: bool,
     swap: bool,
+    sd: Option<String>,
     io: bool,
     /// -c: harts
     harts: u32,
@@ -736,6 +781,7 @@ fn parse_args() -> Result<Opts, String> {
         bootargs_set: false,
         net: false,
         swap: false,
+        sd: None,
         io: false,
         harts: 1,
     };
@@ -766,6 +812,7 @@ fn parse_args() -> Result<Opts, String> {
             "-N" => o.net = true,
             "-F" => o.nor = Some(val()?),
             "-W" => o.swap = true,
+            "-s" => o.sd = Some(val()?),
             "-G" => o.io = true,
             "-c" => {
                 o.harts = val()?.parse().map_err(|_| "bad -c")?;
@@ -829,6 +876,7 @@ fn run() -> Result<(), String> {
         net: o.net,
         nor: o.nor.is_some(),
         swap: o.swap,
+        sd: o.sd.is_some(),
         gpio: o.io,
         harts: o.harts,
     });
@@ -893,6 +941,11 @@ fn run() -> Result<(), String> {
     }
     if o.io {
         plat = plat.with_io(StubPins::new(), gmem);
+    }
+    if let Some(path) = &o.sd {
+        let mut card = SdCard::new(SimCard::new(path), rvcore::sdcard::DEFAULT_HZ);
+        card.start();
+        plat = plat.with_sd(card, gmem);
     }
     let mut bus = HostBus { plat, interactive: !o.batch,
         benchmarks: Default::default(), benchmark_epoch: Instant::now(),

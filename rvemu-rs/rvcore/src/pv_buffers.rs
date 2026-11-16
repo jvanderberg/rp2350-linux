@@ -113,6 +113,21 @@ impl Cpu {
         // Native libraries can partially write on failure. Invalidate the
         // whole validated output capacity after every slice, before JIT reentry.
         self.native_job_dst = (cap != 0).then_some((dst, dst + cap));
+        // A plain LZ4 decode (squashfs's blocks): no secrets to erase and
+        // too short to pause, so not on the workspace, whose per-call stack
+        // scan and repaint (in PSRAM, through the XIP cache) cost more than
+        // the block.
+        if fid == rvaccel::LZ4_DECODE && !may_pend && plen == 0 {
+            bus.native_slice_begin();
+            // SAFETY: as for `start` below; the call finishes here.
+            let result = unsafe {
+                let src = core::slice::from_raw_parts(self.ram.add(s), len as usize);
+                let dst = core::slice::from_raw_parts_mut(self.ram.add(d), cap as usize);
+                rvaccel::lz4_decode(src, dst)
+            };
+            bus.native_slice_end(self);
+            return self.native_step(rvaccel::Step::Done(result));
+        }
         if let Some(w) = unsafe { self.native_workspace.as_mut() } {
             let preemptible = may_pend && bus.native_preemptible();
             bus.native_slice_begin();

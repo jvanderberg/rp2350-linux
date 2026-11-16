@@ -414,7 +414,7 @@ class PWM:
     def duty_u16(self, d=None):
         p = self._period()
         if d is None:
-            return int(_get(self._d + "/duty_cycle")) * 65535 // p if p else 0
+            return (int(_get(self._d + "/duty_cycle")) * 65535 + p // 2) // p if p else 0
         self._duty16 = d
         _put(self._d + "/duty_cycle", p * d // 65535)
 

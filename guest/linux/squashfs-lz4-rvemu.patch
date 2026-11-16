@@ -1,0 +1,62 @@
+--- a/fs/squashfs/lz4_wrapper.c	2026-11-15 16:11:53.427197055 -0600
++++ b/fs/squashfs/lz4_wrapper.c	2026-11-15 16:11:53.547715869 -0600
+@@ -15,6 +15,16 @@
+ #include "squashfs.h"
+ #include "decompressor.h"
+ #include "page_actor.h"
++#ifdef CONFIG_RVEMU_LZ4
++/* rvemu: blocks are decoded by the firmware's native engine, which reads
++ * and writes physical memory: the buffers are kmalloc'd (contiguous) */
++#include "../../drivers/rvemu/rvemu-lz4.h"
++#define lz4_buf_alloc(n) kmalloc(n, GFP_KERNEL)
++#define lz4_buf_free(p) kfree(p)
++#else
++#define lz4_buf_alloc(n) vmalloc(n)
++#define lz4_buf_free(p) vfree(p)
++#endif
+ 
+ #define LZ4_LEGACY	1
+ 
+@@ -57,17 +67,17 @@
+ 	stream = kzalloc(sizeof(*stream), GFP_KERNEL);
+ 	if (stream == NULL)
+ 		goto failed;
+-	stream->input = vmalloc(block_size);
++	stream->input = lz4_buf_alloc(block_size);
+ 	if (stream->input == NULL)
+ 		goto failed2;
+-	stream->output = vmalloc(block_size);
++	stream->output = lz4_buf_alloc(block_size);
+ 	if (stream->output == NULL)
+ 		goto failed3;
+ 
+ 	return stream;
+ 
+ failed3:
+-	vfree(stream->input);
++	lz4_buf_free(stream->input);
+ failed2:
+ 	kfree(stream);
+ failed:
+@@ -81,8 +91,8 @@
+ 	struct squashfs_lz4 *stream = strm;
+ 
+ 	if (stream) {
+-		vfree(stream->input);
+-		vfree(stream->output);
++		lz4_buf_free(stream->input);
++		lz4_buf_free(stream->output);
+ 	}
+ 	kfree(stream);
+ }
+@@ -108,6 +118,10 @@
+ 		offset = 0;
+ 	}
+ 
++#ifdef CONFIG_RVEMU_LZ4
++	res = rvemu_lz4_decode(stream->output, output->length, stream->input, length);
++	if (res == -EBUSY)
++#endif
+ 	res = LZ4_decompress_safe(stream->input, stream->output,
+ 		length, output->length);
+ 

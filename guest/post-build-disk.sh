@@ -78,6 +78,10 @@ cat > "$T/etc/init.d/S02swap" <<'S'
 #!/bin/sh
 case "$1" in
 start)
+  # a deeper atomic reserve than the default's (~360 KiB for 7.5 MiB):
+  # virtio-net refills its receive ring with GFP_ATOMIC, and under swap
+  # pressure kswapd otherwise lets free memory fall to where those fail
+  echo 1024 > /proc/sys/vm/min_free_kbytes
   for d in /sys/block/vd*; do
     [ "$(cat "$d/serial" 2>/dev/null)" = rvemu-flash-swap ] || continue
     mkswap "/dev/${d##*/}" $(( $(cat "$d/size") / 2 - 4 )) >/dev/null && swapon "/dev/${d##*/}"
@@ -89,35 +93,60 @@ stop)
 esac
 S
 chmod 755 "$T/etc/init.d/S02swap"
-# the SD card (SPI1, /dev/mmcblk0): its first FAT partition at /mnt/sd,
-# mounted in the background once the kernel has found the card
+# the SD card: the firmware's SD device (the virtio disk whose serial is
+# rvemu-sd), its first FAT partition at /mnt/sd and any swap partition on
+# it, in the background
 cat > "$T/etc/init.d/S03sd" <<'S'
 #!/bin/sh
-# The SD card at /mnt/sd: each card is mounted once when it goes in (one can
-# take tens of seconds to start, or be put in after boot), and its mount is
-# dropped when it comes out. A card unmounted by hand stays unmounted. Each
-# card put in is a new disk, a new sysfs node: its inode tells cards apart.
+# The SD card. The firmware looks for a card about once a second, and its
+# disk's size is 0 while there is none. When a card goes in, its partitions
+# are read, every partition with a swap signature (mkswap) becomes swap at
+# priority 10 (ahead of the flash swap), and the first partition, or the
+# whole card if it has no partition table, is mounted as FAT at /mnt/sd.
+# When it comes out, both go. A card unmounted by hand stays unmounted until
+# it comes out.
 PID=/var/run/sd.pid
+sd_disk() {
+  for d in /sys/block/vd*; do
+    [ "$(cat "$d/serial" 2>/dev/null)" = rvemu-sd ] && { echo "${d##*/}"; return; }
+  done
+}
+is_swap() {
+  [ "$(dd if="$1" bs=1 skip=4086 count=10 2>/dev/null)" = SWAPSPACE2 ]
+}
 mounted() {
   while read -r _ m _; do [ "$m" = /mnt/sd ] && return 0; done < /proc/mounts
   return 1
 }
+card_in() {
+  partprobe "/dev/$1" 2>/dev/null
+  for p in /sys/block/"$1"/"$1"*; do
+    [ -e "$p" ] || continue
+    is_swap "/dev/${p##*/}" && swapon -p 10 "/dev/${p##*/}"
+  done
+  p=/dev/${1}1
+  [ -b "$p" ] || p=/dev/$1
+  is_swap "$p" || mount -t vfat -o noatime "$p" /mnt/sd
+}
+card_out() {
+  while read -r f _; do
+    case $f in /dev/"$1"*) swapoff "$f";; esac
+  done < /proc/swaps
+  mounted && umount -l /mnt/sd
+  partprobe "/dev/$1" 2>/dev/null
+}
 follow() {
-  seen=
+  d=$(sd_disk)
+  [ -n "$d" ] || exit 0
+  in=0
   while :; do
-    if [ -e /sys/block/mmcblk0 ]; then
-      set -- $(ls -id /sys/block/mmcblk0)
-      if [ "$1" != "$seen" ]; then
-        seen=$1
-        mounted && umount -l /mnt/sd
-        sleep 1 # the partitions are read just after the disk appears
-        p=/dev/mmcblk0p1
-        [ -b $p ] || p=/dev/mmcblk0
-        mount -t vfat -o noatime $p /mnt/sd
-      fi
-    elif [ -n "$seen" ]; then
-      seen=
-      mounted && umount -l /mnt/sd
+    read -r size < "/sys/block/$d/size"
+    if [ "$size" != 0 ] && [ $in = 0 ]; then
+      in=1
+      card_in "$d"
+    elif [ "$size" = 0 ] && [ $in = 1 ]; then
+      in=0
+      card_out "$d"
     fi
     sleep 2
   done
@@ -132,7 +161,8 @@ start)
 stop)
   [ -f $PID ] && kill "$(cat $PID)" 2>/dev/null
   rm -f $PID
-  umount /mnt/sd 2>/dev/null
+  d=$(sd_disk)
+  [ -n "$d" ] && card_out "$d"
   ;;
 restart)
   "$0" stop
