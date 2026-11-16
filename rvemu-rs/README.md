@@ -33,7 +33,7 @@ guest to `login:` in under a second.
 | `-i FILE` | initramfs (cpio) |
 | `-d FILE` | disk image for the read-only virtio-blk device. Without `-i`, the default command line roots on it: `root=/dev/vda ro rootfstype=squashfs init=/sbin/overlay-init`. |
 | `-F FILE` | the NOR flash device (the board's 1 MB `/home` region), backed by FILE, which is created blank (0xFF) if missing and written through, so `/home` persists across runs. `RVEMU_NOR_CUT=N` simulates a power cut: the N-th program or erase is applied halfway and the emulator exits. |
-| `-s FILE` | an SD card backed by FILE (a raw card image), on the firmware's SD path (`rvcore::sdcard` over a simulated SPI card, `rvemu/src/sdsim.rs`): the guest's `/dev/vdc`, serial `rvemu-sd`. The card is present while FILE exists (checked every 500 ms), so renaming it simulates taking the card out. `RVEMU_SD_FLIP=N` corrupts one bit of every Nth data byte the card sends, to exercise the CRC retries. |
+| `-s FILE` | an SD card backed by FILE (a raw card image), on the firmware's SD path (`rvcore::sdcard` over a simulated SPI card, `rvemu/src/sdsim.rs`): the guest's next virtio disk after `-d`'s and `-W`'s (`/dev/vdc` with both), serial `rvemu-sd`. The card is present while FILE exists (checked every 500 ms), so renaming it simulates taking the card out. `RVEMU_SD_FLIP=N` corrupts one bit of every Nth data byte the card sends, to exercise the CRC retries. |
 | `-W` | the swap device (below) on a modelled copy of the board's swap flash (511 sectors), with datasheet-typical erase and program times in its statistics. The guest's init enables it as `/dev/vdb`. |
 | `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N; PIO1 and PIO2 in software (`piosim.rs`, at `RVEMU_PIO_HZ` cycles a second, default 10 MHz, in step with wall time) with the DMA pool. `RVEMU_IO=gpio,i2c0,i2c1,spi0,pwm,adc,pio` picks which of them go in the device tree (`pio` needs `gpio`). |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
@@ -49,10 +49,12 @@ guest to `login:` in under a second.
 
 ### The board's devices on the Mac
 
-`-F`, `-W` and `-G` stand in for the board's flash, swap and pins, so the
-guest side of those features can be tried and tested without the board.
-`-X 2998272` is the disk kernel's text. The guest's own
-examples, on the board, are in the top-level README.
+`-F`, `-W`, `-s` and `-G` stand in for the board's flash, swap, SD card and
+pins, so the guest side of those features can be tried and tested without
+the board. `-X` takes the board's `text_len`: 3502080 for the current disk
+kernel, whose read-only data follows its text. The runs below used
+2998272, an earlier disk kernel's text alone. The guest's own examples,
+on the board, are in the top-level README.
 
 Boot cost, batch to `login:` (72.9 M guest instructions):
 
@@ -166,11 +168,23 @@ receive the same generated device tree, including the fixed entropy seed.
 - **virtio** (`rvcore/src/virtio.rs`): one virtio-mmio v2 transport (split
   virtqueues, no indirect descriptors) shared by the devices. Requests
   complete synchronously.
-  - **Block device:** one 16-entry queue. Backends implement `Disk`:
+  - **Block device:** one 32-entry queue. Backends implement `Disk`:
     `MemDisk` is a read-only byte range, such as the squashfs in flash. A
     backend can be writable and can offer a larger logical block size
     (`VIRTIO_BLK_F_BLK_SIZE`) and its own device ID (GET_ID, the guest's
     `/sys/block/vdX/serial`).
+    - **Segments.** A backend can take several data segments in one
+      request (`Disk::segments`, offered as `VIRTIO_BLK_F_SEG_MAX`, at most
+      30, the queue less the header and status). Linux then merges
+      adjacent pages into one request, and the backend gets them together
+      (`read_segs`, `write_segs`). `MemDisk` takes 30 and the SD card 16. A
+      read whose segments overlap is refused, and every segment of a read
+      is reported dirty to the translator, even when the read failed.
+    - **Removable media.** `Disk::poll`, called while the guest idles,
+      reports a change of capacity, which the device passes to the driver
+      as a config-change interrupt. The SD card uses it.
+  - **SD card device:** a third, writable block device at 0xF8000800
+    (IRQ 6), backed by `sdcard::SdCard` (below), serial `rvemu-sd`.
   - **Swap device:** a second, writable block device whose backend is
     `swapdev::FlashSwap` (below).
   - **Network device:** rx queue of 16, tx queue of 32. Linux stops a tx
@@ -465,8 +479,15 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   CMD18/CMD25 multi-block transfers, 43.5 MHz after CMD6 high speed, back
   to 25 MHz after repeated CRC errors) through `rvemu-pico/src/sd.rs`,
   which keeps the PL022's FIFO full. The guest sees a virtio-blk disk with
-  serial `rvemu-sd` at 0xF8000800 (IRQ 6), up to 30 segments per request;
-  a card going in or out is a config-change interrupt.
+  serial `rvemu-sd` at 0xF8000800 (IRQ 6), up to 16 segments (64 KiB) per
+  request, which become one multi-block command. After a write the card's
+  busy time is left to the next command, so the guest runs meanwhile. A
+  failed command or a CRC mismatch is tried again (three tries in all),
+  after a status check (CMD13) and, failing that, a fresh initialisation.
+  While the guest idles the firmware looks for a card about once a second,
+  and tells a re-inserted card from a new one by its CID; a card going in
+  or out is a config-change interrupt. SDSC, SDHC and SDXC cards work, SDUC
+  doesn't.
 - **PWM.** The slice and channel that reach the pin, with the divider and
   TOP worked out from the period. A slice's period can't change while
   another of its pins is running.
@@ -501,6 +522,11 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   than 20 ms is abandoned, so a missing radio can't hang core1. The
   firmware blobs are read through flash's uncached alias, so uploading them
   doesn't sweep the guest's data out of the XIP cache.
+- **Interrupt.** The radio's interrupt is the data line (GP24) high while
+  CS is up, and the firmware reads it from SIO. It doesn't use PIO0's IRQ
+  flag for it: the guest's PIO1 and PIO2 can set or clear PIO0's flags with
+  `irq prev`/`irq next`, and no filter can stop that, since `out exec` and
+  `mov exec` build instructions at run time.
 - **Network.** Ethernet frames are bridged to the guest's virtio-net through
   two frame rings (2 slots each way; the driver buffers 4 more received
   frames). A frame the guest sends while core1 is two behind is dropped. The

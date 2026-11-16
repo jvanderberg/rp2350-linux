@@ -26,14 +26,20 @@ The emulator firmwares (`../rvemu-rs/rvemu-pico`) read the guest from flash.
 The flash map is in the [top-level README](../README.md#flash-map-16-mb).
 
 - **Kernel text in place.** Flash ends at 0x11000000, exactly where the
-  PSRAM window begins. The kernel's text goes in the last `text_len` bytes of
-  flash, so guest RAM is one contiguous block of host addresses: guest PA 0
-  is the text, read in place from flash, and the 8 MiB of PSRAM follows.
+  PSRAM window begins. The kernel's text and read-only data go in the last
+  `text_len` bytes of flash, so guest RAM is one contiguous block of host
+  addresses: guest PA 0 is the text, read in place from flash, and the
+  PSRAM follows.
   - The emulator makes the prefix read-only: stores fault
     (`Cpu::set_readonly_prefix`) and DMA writes are refused (`GuestMem::ro`).
-  - The guest sees 11.1 MB of RAM.
-  - `text_len` is `_etext - _start` from `System.map`, rounded down to a page
-    (that page also holds `.init`).
+  - `text_len` is `__init_begin - _start` from `System.map` when the kernel
+    puts its read-only data right after its text
+    (`guest/linux/rodata-in-flash.patch`): 3502080 bytes for the disk
+    kernel. For a kernel without the patch it is `_etext - _start`, rounded
+    down to a page (that page also holds `.init`).
+  - Guest RAM is `text_len` plus the PSRAM part, 8128 KiB by default
+    (`pico-shell.sh`'s `M`; the native engine has the top 64 KiB of the
+    8 MiB): 11825152 bytes with the disk kernel.
 - **Why not `XIP_KERNEL`.** Linux's own RISC-V `XIP_KERNEL` doesn't fit
   here: on RV32 `KERNEL_LINK_ADDR == PAGE_OFFSET`, so the text would collide
   with RAM's linear map.
@@ -56,7 +62,7 @@ The flash map is in the [top-level README](../README.md#flash-map-16-mb).
 | `boot-wait.py START [--log FILE]` | wait for `login:` on the console and print the seconds since START (`pico-shell.sh` writes it to `rvemu-rs/target/pico-last-launch`) |
 | `pack-guest.py IMAGE INITRD DTB RAM_MB TEXT_LEN BLOB TEXT` | split an Image into the flash text and the guest blob |
 | `board-cmd.py [--port P] [--timeout S] COMMAND...` | run a command in the board's shell over the USB console (logs in as root if needed), print its output, exit with its status |
-| `pin-test.py [--host ADDR] [--only NAME,...]` | test the Linux board's GPIO, edges, pull-up, PWM, I2C, SPI, MicroPython `machine`, and PIO and DMA from C and MicroPython `rp2`, against a second board running `pintester/` (wiring in the script) |
+| `pin-test.py [--host ADDR] [--only NAME,...]` | test the Linux board's GPIO, edges, pull-up, PWM, I2C, SPI, MicroPython `machine`, and PIO and DMA from C and MicroPython `rp2`, against a second board running `pintester/` ([Pin tests](#pin-tests)) |
 | `serial-chat.py PORT EXPECT [SEND EXPECT]...` | script a serial console: wait for a pattern, send a line, repeat |
 | `run-riscv.sh ELF [TIMEOUT] [STOP_REGEX]` | flash a Hazard3 ELF with probe-rs and stream RTT; `ATTACH=1` attaches to a running program instead |
 | `rtt.py CB_ADDR` | RTT reader over OpenOCD's Tcl port |
@@ -68,13 +74,37 @@ The echoed command line keeps the quotes, so only real output matches the
 markers, and the random tag rules out stale ones. The port takes one program
 at a time, so close `screen` first.
 
-## pintester/ (RISC-V, Rust, rp235x-hal)
+## Pin tests
 
-A pin test fixture for a second RP2350B board: GPIO levels, pulses, PWM
-measurement and an I2C target (I2C1, GP14/GP15, address 0x42, a 256-byte
-register file), driven over USB serial (`/dev/cu.usbmodempintest1`) by
-`tools/pin-test.py`. Opening that port at 1200 baud, or its `bootsel`
-command, reboots it into BOOTSEL.
+`tools/pin-test.py` tests the Linux board's pins against a second RP2350B
+board running `pintester/`, which drives and measures them. It ends
+with `N of M passed` and exits with 0 only when every check passed. On the
+board it passes 44 of 44.
+
+### pintester/ (RISC-V, Rust, rp235x-hal)
+
+Firmware for the second board: GPIO levels, pulses, frequency and duty
+measurement, and an I2C target, driven over USB serial
+(`/dev/cu.usbmodempintest1`). Each command is one line, and every reply
+ends with a line `ok` or `err WHY`.
+
+| Command | Does |
+|---|---|
+| `id` | prints `pintester` |
+| `out P V` | GP`P` an output at `V` (0 or 1) |
+| `in P [u/d/n]` | GP`P` an input with a pull-up, a pull-down or neither (the default); prints `P=V` |
+| `get P` | GP`P`'s level, `P=V` |
+| `pulse P N US` | toggles output GP`P` `N` times, `US` microseconds apart |
+| `meas P MS` | watches GP`P` for `MS` ms: `rises=R falls=F hz=H duty=D` (duty in %) |
+| `regs` | the I2C target's first 16 registers |
+| `i2c` | the I2C target's counters |
+| `bootsel` | reboots into USB BOOTSEL |
+
+The I2C target is always on: I2C1 on GP14 (SDA) and GP15 (SCL), address
+0x42, internal pull-ups. It is a 256-byte register file like a 24C02: a
+write's first byte sets the register pointer and the rest are stored from
+there, and a read returns bytes from the pointer. Opening the port at 1200
+baud and closing it also reboots into BOOTSEL.
 
 ```sh
 cd pintester && cargo build --release
@@ -84,6 +114,59 @@ picotool load --ser SERIAL -v -x -t elf target/riscv32imac-unknown-none-elf/rele
 `debugprobe-v2.3.1-backup.uf2` is the firmware that board had before
 (Raspberry Pi's debugprobe 2.3.1, read back with picotool); put it back with
 `picotool load --ser SERIAL -v -x debugprobe-v2.3.1-backup.uf2`.
+
+### Wiring
+
+The two boards share a ground. The tester's pin for each wire is in the
+header of `tools/pin-test.py`, which is the reference.
+
+| Linux board | Goes to | Used for |
+|---|---|---|
+| GP13 | a tester input | GPIO output; PIO output (square waves, ws2812, MicroPython blink) |
+| GP14 | a tester output | GPIO input and edge events; PIO edge capture |
+| GP15 | a tester input | PWM (sysfs and MicroPython) |
+| GP3 | a tester pin | the pull-up test |
+| GP4, GP5 | tester GP14, GP15 | I2C0 SDA, SCL (the tester is the target at 0x42) |
+| GP19 | GP16, on the Linux board | SPI0 loopback, MOSI to MISO (a jumper) |
+
+### Running
+
+```
+$ rp2350/tools/pin-test.py [--host ADDR] [--only NAME,...]
+```
+
+- The Linux board is reached by `ssh root@ADDR`, with key login (see the
+  top-level README's [SSH](../README.md#ssh)). Without `--host`, the
+  script asks the board's console for `eth0`'s address with
+  `board-cmd.py`, so the console port must be free (close `screen`).
+- The tester is the first `/dev/cu.usbmodempintest*`.
+- First it checks that the tester answers, and builds two helpers on the
+  board with tcc (a GPIO v2 edge counter and toggler, and an SPI loopback
+  test). Then it runs the sections, all of them or the ones `--only`
+  names, and prints a `PASS` or `FAIL` line for each check (`INFO` lines
+  are reported only).
+
+| Section | Checks |
+|---|---|
+| `gpio` | GP13 driven 1/0/1/0 with `gpioset`, read by the tester; GP14 driven by the tester, read with `gpioget` |
+| `pull` | GP3's pull-up (`gpiomon -b pull-up`) raises the line once the tester lets go of it |
+| `edges` | GP14 edge events through the GPIO v2 uAPI: all 40 at 20 ms and all 100 at 5 ms, rising and falling in turn. 200 at 2 ms and at 1 ms, and GP13 toggled every 25 ms, are reported only (`INFO`). |
+| `pwm` | GP15 by sysfs at 1 kHz 25%, 10 kHz 50%, 100 Hz 75% and 1 MHz 50%, measured within 1% and 2 points of duty; then off |
+| `i2c` | `i2cdetect` finds 0x42; `i2cset`/`i2cget` bytes and words; `i2ctransfer` with a repeated start; an absent address fails; MicroPython `I2C` |
+| `spi` | SPI0 loopback in modes 0-3, at 100 kHz to 50 MHz, 1 to 4096 bytes; MicroPython `SPI` at 10 MHz |
+| `micropython` | `Pin` output, `Pin.irq` catching 20 edges at 20 ms, `PWM` at 2 kHz 25% |
+| `pio` | builds the PIO examples on the board (tcc and `pioasm`); `squarewave` on GP13 at 1 kHz, 100 kHz and 1 MHz, within 1% and 50 ± 3% duty; `ws2812` sends 240 bits for 10 LEDs; `pio-edges` catches all of 200 edges at 1 ms and of 2000 at 20 µs and at 5 µs on GP14, with the right mean spacing; `pio-fifo`; `pio-dma` (echo and ring); MicroPython `pio_blink.py` at 23.7 Hz, `pio_echo.py`, `pio_ring.py` |
+
+Pull-downs aren't tested: on the RP2350 a line that has been high stays
+near 2 V against the internal pull-down (erratum RP2350-E9).
+
+On the board, the whole run passed 44 of 44, and the PIO section alone
+(`--only pio`, 16 checks with the three common ones) passed 16 of 16
+three more times in a row. The PIO section measured:
+
+- the square waves within 0.001% at 1 kHz, 100 kHz and 1 MHz
+- every edge captured down to 5 µs apart
+- the DMA echo at about 18M words a second
 
 ## psramtest/ (Arm, C, Pico SDK)
 

@@ -231,9 +231,11 @@ Swap:          1788         116        1672
 
 ## SD card
 
-An SD card on SPI1 is `/dev/vdc`: the firmware drives the card itself
-(SPI mode, up to 43.5 MHz) and gives the guest a virtio disk whose serial is
-`rvemu-sd`. When a card goes in, at boot or
+The firmware drives an SD card on SPI1 itself (SPI mode, CRCs on, up to
+43.5 MHz) and gives the guest a removable virtio disk whose serial is
+`rvemu-sd`: `/dev/vdc` when the board has swap on flash
+(`pico-shell.sh -w`), `/dev/vdb` without it. With no card in, the disk's
+size is 0. The firmware looks for a card about once a second. When a card goes in, at boot or
 later, its first partition (or the whole card, if it has no partition
 table) is mounted at `/mnt/sd` as FAT16 or FAT32, with long names. Run
 `umount /mnt/sd`, or shut down, before taking the card out; an unmounted
@@ -241,9 +243,16 @@ card stays unmounted until it comes out. The first `df` after mounting
 takes a while: Linux counts the free space itself.
 
 Any partition on the card with a swap signature is used as swap, ahead of
-the flash swap (priority 10). To make one, give the card a small second
-partition (32 MiB is plenty) and run `mkswap` on it once, for example
-`mkswap /dev/vdc2`; it is enabled whenever the card goes in.
+the flash swap (priority 10), and taken off again when the card comes
+out. To make one, give the card a small second partition (32 MiB is
+plenty) and run `mkswap` on it once, for example `mkswap /dev/vdc2`. It is
+then enabled whenever the card goes in. Plain swap on the card beat
+compressed swap in RAM (zswap) on a Lua job, 108 s against 134 s, so the
+kernel has no zswap ([guest/README.md](guest/README.md#swap)).
+
+On the Mac, the emulator's `-s FILE` is a card backed by a raw image
+([rvemu-rs/README.md](rvemu-rs/README.md)).
+
 
 | SD signal | Board |
 |---|---|
@@ -256,7 +265,7 @@ partition (32 MiB is plenty) and run `mkswap` on it once, for example
 Solder a 10 µF capacitor across VCC and GND at the card holder. Without it
 the card can fail to start, or drop off the bus while writing.
 
-**Example:**
+**Example** (with `-w`):
 
 ```
 # grep vdc /proc/partitions
@@ -324,25 +333,32 @@ GP15 set 0, pad reads 0
 
 PIO1 and PIO2 are the guest's (PIO0 drives the Wi-Fi radio). A program
 maps a block's registers and drives them directly, as the pico-sdk does,
-with no system call per register:
+with no system call per register. Its PIO code runs on the chip's own
+blocks, at the chip's speed.
 
 | Linux | Board |
 |---|---|
-| `/dev/pio1`, `/dev/pio2` | one block each: 4 state machines, 32 instructions, FIFOs, IRQs; any free GPIO the program claims |
+| `/dev/pio1`, `/dev/pio2` | one block each: 4 state machines, 32 instructions, FIFOs, IRQ flags; any free GPIO the program claims |
 
-- **Pins.** A program claims each pin it uses (`pio_gpio_init`, or the
-  pins a MicroPython `StateMachine` is given). A claimed pin shows in
-  `gpioinfo` as used by `pio`, and is freed when the program closes the
-  block. A pin already in use is refused (`EBUSY`).
+- **Pins.** A program claims each pin it drives (`pio_gpio_init`, or the
+  pins a MicroPython `StateMachine` sets up). A claimed pin shows in
+  `gpioinfo` as used by `pio`, and is given back when the program closes
+  the block. A pin already in use is refused (`EBUSY`). A block reads
+  every pin without claiming it. Pins are GPIO numbers 0-47, and a block
+  reaches 32 of them at a time: 0-31 or 16-47.
 - **One program per block.** Opening a block is exclusive. Opening and
-  closing it reset it: state machines stopped, instruction memory cleared,
-  pins released.
-- **DMA.** Four DMA channels move words between a buffer the block maps and
-  one of its state machines' FIFOs: one transfer, or endlessly around a
-  ring of up to 4 KiB. The firmware checks every transfer, so a channel can
-  reach only that buffer and that block. A buffer is at most 64 KiB.
+  closing it reset it: state machines stopped, FIFOs emptied, instruction
+  memory cleared, pin levels and directions cleared, pins given back.
+- **DMA.** Four DMA channels, shared by both blocks, move words between
+  a buffer the program maps and one of its block's state machine FIFOs:
+  one transfer, or endlessly around a ring of up to 4 KiB. The kernel
+  and the firmware both check every transfer, so a channel can reach only
+  that buffer and that block. A buffer is at most 64 KiB. A channel is
+  held until the program stops it or exits.
 - **Clock.** The PIO clock is the system clock, 348 MHz; the slowest
   state machine clock is 348 MHz / 65536, about 5.3 kHz.
+- **Interrupts.** A program can sleep until the block's IRQ0 output is
+  up (`pio_wait_irq`, or `poll` on the device).
 - **PIO0.** An `irq prev`/`irq next` instruction still reaches PIO0's IRQ
   flags (no filter can stop it: `out exec` and `mov exec` make instructions
   at run time), but the Wi-Fi driver doesn't use them: it takes the radio's
@@ -350,21 +366,26 @@ with no system call per register:
 
 The build includes:
 
-- `libpio` (`-lpio`, header `pio.h`): the pico-sdk's `hardware/pio.h` API
-  (`pio_add_program`, `sm_config_*`, `pio_sm_init`, `pio_sm_put_blocking`,
-  ...) on an open block (`PIO pio = pio_open(1);`), plus `pio_assemble()`,
-  which assembles pioasm source at run time, `pio_wait_irq()`, and DMA
-  (`pio_sm_dma_write`, `pio_sm_dma_read`, `pio_dma_start` for rings);
-- `pioasm`, the pico-sdk's assembler: `pioasm ws2812.pio ws2812.pio.h`
-  writes a header for `#include`, with the `% c-sdk` blocks;
-- MicroPython's `rp2` module, as on the Pico: `@rp2.asm_pio`,
+- **`libpio`** (`-lpio`, header `pio.h`): the pico-sdk's `hardware/pio.h`
+  API (`pio_add_program`, `sm_config_*`, `pio_sm_init`,
+  `pio_sm_put_blocking`, ...) on an open block (`PIO pio = pio_open(1);`),
+  plus `pio_assemble()`, which assembles pioasm source at run time,
+  `pio_wait_irq()`, and DMA (`pio_dma_start`, `pio_dma_wait`, rings and
+  endless transfers, and `pio_sm_dma_write`/`_read`). Reference:
+  [libpio/README.md](guest/br-external/package/libpio/README.md).
+- **`pioasm`**, the pico-sdk's assembler as a tool: `pioasm ws2812.pio
+  ws2812.pio.h` writes a header for `#include`, with the `% c-sdk` blocks.
+  It knows the RP2350's instructions.
+- **MicroPython's `rp2` module**, as on the Pico: `@rp2.asm_pio`,
   `rp2.StateMachine` (4-7 are PIO1, 8-11 PIO2, numbered as on the Pico 2;
-  0-3, PIO0, are refused),
-  `rp2.PIO(1)`, and `rp2.DMA` for transfers to and from a state machine;
-- C and Python examples in `/usr/share/examples/pio`: `squarewave`,
+  0-3, PIO0, are refused), `rp2.PIO(1)`, and `rp2.DMA` for transfers to
+  and from a state machine. A pin handed to a `StateMachine` leaves
+  `machine.Pin`. Reference:
+  [micropython-machine/README.md](guest/br-external/package/micropython-machine/README.md).
+- **C and Python examples** in `/usr/share/examples/pio`: `squarewave`,
   `pio-fifo`, `pio-dma`, `pio-edges` (edge timestamps by DMA), `ws2812`
-  (with `ws2812.pio`), `pio_blink.py`, `pio_echo.py`, `pio_ring.py`. Build the C ones
-  with `cc -o squarewave squarewave.c -lpio`.
+  (with `ws2812.pio`), `pio_blink.py`, `pio_echo.py`, `pio_ring.py`. Build
+  the C ones with `cc -o squarewave squarewave.c -lpio`.
 
 **Example:**
 
@@ -372,9 +393,17 @@ The build includes:
 # micropython /usr/share/examples/pio/pio_echo.py
 put/get: 4 of 4 right
 DMA: 256 of 256 right
-# mkdir /tmp/p && cd /tmp/p && cp /usr/share/examples/pio/squarewave.c . &&
+# mkdir /tmp/p && cd /tmp/p && cp /usr/share/examples/pio/* . &&
   cc -o squarewave squarewave.c -lpio && ./squarewave 15 100000 5    # 100 kHz on GP15 for 5 s
+GP15: 100000.000 Hz (clock 348000000 Hz, divider 54.3750, delay 31)
 ```
+
+Measured on the board with a second board as the meter
+([rp2350/README.md](rp2350/README.md#pin-tests)):
+
+- `squarewave` within 0.001% at 1 kHz, 100 kHz and 1 MHz.
+- `pio-edges` caught every edge down to 5 µs apart.
+- DMA echoed about 18M words a second.
 
 ## Flash map (16 MB)
 
@@ -386,7 +415,7 @@ DMA: 256 of 256 right
 | 0x103FF000 | Wi-Fi settings, 4 KB | `scripts/pico-wifi.sh` only |
 | 0x10400000 | guest blob, at most 2 MB: kernel, initramfs, device tree | `pico-shell.sh` |
 | 0x10600000 | root filesystem (squashfs) | `pico-shell.sh` |
-| 0x11000000 − text size | kernel text, at most 3.5 MiB, ending at the end of flash | `pico-shell.sh` |
+| 0x11000000 − text size | kernel text and read-only data, at most 3.5 MiB, ending at the end of flash | `pico-shell.sh` |
 
 Never write 0x103FF000 with picotool or SWD: it holds the Wi-Fi
 passphrase. `pico-shell.sh` writes only the regions whose contents changed

@@ -37,8 +37,8 @@ and BusyBox init with a getty on ttyS0. Log in as root, no password.
 | Stages | `all`, `rootfs`, `kernel` | `disk`, `disk-rootfs`, `disk-kernel` |
 | Configs | `buildroot.defconfig`, `post-build.sh`, `linux.fragment` | `buildroot-disk.defconfig`, `busybox-disk.fragment`, `post-build-disk.sh`, `linux.fragment` + `linux-disk.fragment` |
 | Root | `rootfs.cpio` initramfs | `rootfs.squashfs` on a read-only virtio-blk disk, tmpfs overlay; `/home` and `/root` on jffs2 in flash |
-| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`), Dropbear (SSH), libgpiod tools, i2c-tools, spidev_test, MicroPython `machine`, the pin examples |
-| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs, overlayfs, sockets, swap, MTD + jffs2, the pin drivers, the native crypto devices |
+| Userland | static BusyBox | static BusyBox; shared musl for nano, mg, MicroPython, Lua 5.4, htop, tmux, lrzsz, bc, ncdu, lsof, less, tcc (`cc`), Dropbear (SSH), libgpiod tools, i2c-tools, spidev_test, MicroPython `machine` and `rp2`, libpio and `pioasm`, the pin and PIO examples |
+| Kernel | no networking, no block layer | + virtio-mmio blk and net, squashfs (LZ4 decoded natively), overlayfs, sockets, swap, MTD + jffs2, the pin and PIO drivers, the native crypto devices; read-only data in flash with the text |
 | Used by | the boot benchmark (`scripts/pico-linux.sh`), `pico-shell.sh -i` | `scripts/pico-shell.sh` (default) |
 
 Outputs in each directory: `Image`, `vmlinux`, `System.map`, `linux.config`
@@ -46,7 +46,8 @@ and the root filesystem.
 
 ## Disk guest
 
-- **Root filesystem:** squashfs, LZ4, 16 KB blocks.
+- **Root filesystem:** squashfs, LZ4, 16 KB blocks. The firmware's native
+  engine decodes the blocks ([Memory and speed](#memory-and-speed)).
 - **Boot:** the kernel mounts `/dev/vda` read-only and runs
   `/sbin/overlay-init` (from `post-build-disk.sh`). It mounts a tmpfs
   overlay on top of the squashfs, mounts `/home` (below), pivots into it
@@ -59,7 +60,8 @@ and the root filesystem.
   The `/dev/fd` and `/dev/std*` links are made at build time in
   `/lib/devlinks` and copied by one inittab line.
 - **Init scripts:** only `S02sysctl`, `S02swap` (which does nothing without
-  a swap device), `S40network` and `S50dropbear`. There is no syslogd, klogd, crond,
+  a swap device), `S03sd` (the SD card, below), `S40network` and
+  `S50dropbear`. There is no syslogd, klogd, crond,
   seedrng (the device tree's `rng-seed` seeds the CRNG) or modules script.
   `dmesg` has the kernel log.
 - **Network:** `eth0` is virtio-net, bridged to the board's Wi-Fi radio.
@@ -109,7 +111,63 @@ serial is `rvemu-flash-swap`, when the firmware offers one
 (1792 KiB) of swap area, which leaves 1788 KiB of swap after mkswap's
 header, and a last page that holds the device's statistics, which
 `flashswap-stats` prints. The kernel has `CONFIG_SWAP` (on by default with
-`CONFIG_BLOCK`). There is no zram or zswap.
+`CONFIG_BLOCK`). S02swap also sets `vm.min_free_kbytes` to 1024: virtio-net
+refills its receive ring with atomic allocations, and under swap pressure
+those fail with the default reserve (about 360 KiB).
+
+A swap partition on the SD card (below) goes ahead of the flash swap, at
+priority 10.
+
+There is no zram or zswap. zswap was tried and lost to plain swap on the
+SD card, even with native LZ4: a Lua job took 134 s against 108 s. On the
+board its bookkeeping (zsmalloc, its tree and LRU) runs as emulated code,
+and its pool takes RAM from the working set.
+
+## SD card
+
+The firmware drives the card on SPI1 (`rvemu-rs/rvcore/src/sdcard.rs`), and
+the guest sees a removable virtio disk whose serial is `rvemu-sd`. The
+guest has no MMC layer, only `VFAT_FS` and the codepages for it. The
+disk's size is 0 while no card is in, and a card going in or out is a
+config-change interrupt.
+
+`/etc/init.d/S03sd` finds the disk by its serial and follows it in the
+background, looking at its size every 2 s:
+
+- **A card goes in:** it rereads the partitions (`partprobe`), runs
+  `swapon -p 10` on every partition with a swap signature, and mounts the
+  first partition (or the whole card, if it has no partition table) at
+  `/mnt/sd` as FAT, `noatime`, unless that is swap too.
+- **The card comes out:** it turns that swap off and unmounts `/mnt/sd`
+  lazily.
+- A card unmounted by hand stays unmounted until it comes out.
+  `S03sd stop` (at shutdown) does what removal does.
+
+`busybox-disk.fragment` adds `swapon -p` for this.
+
+## Memory and speed
+
+The disk guest has 8 MiB of PSRAM (less the native engine's 64 KiB), so
+these matter:
+
+- **Read-only data in flash.** `linux/rodata-in-flash.patch` moves the
+  kernel's read-only data (`RO_DATA`, `.srodata`) to right after its text,
+  so the two form one read-only block from the start of the image, ending
+  at `__init_begin`. The firmware maps all of it from flash, as it maps the
+  text. `__ro_after_init` data is written during boot, so it goes with the
+  writable data instead. `scripts/pico-common.sh` (`text_len`) uses
+  `__init_begin - _start` when the patch is in (3502080 bytes for the disk
+  kernel), so the read-only data takes no PSRAM. `build.sh` applies the
+  patch to the stock `arch/riscv/kernel/vmlinux.lds.S`, kept beside it.
+- **Native LZ4.** `CONFIG_RVEMU_LZ4` (`linux/drivers/rvemu/lz4-rvemu.c`):
+  squashfs's LZ4 blocks are decoded by the firmware's native engine, one
+  SBI call a block (`RVEMU_NATIVE_EXT`, operation 0), on physical memory.
+  `linux/squashfs-lz4-rvemu.patch` makes `fs/squashfs/lz4_wrapper.c`
+  allocate its buffers with `kmalloc`, so they are physically contiguous.
+  When the engine can't take a block (absent, busy, another CPU's), the
+  kernel decodes it in software. A bad block is an `EIO`.
+- **A 16 KiB kernel log** (`CONFIG_LOG_BUF_SHIFT=14`, 512 records): about
+  twice what a boot writes. The default takes 536 KiB of RAM.
 
 ## C compiler
 
@@ -167,7 +225,8 @@ the tools and examples are in the top-level README; the devices are in
   `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO` without buffers or triggers;
   `VFAT_FS` for the SD card, which the firmware drives and gives the guest
   as a virtio disk (serial `rvemu-sd`); `S03sd` mounts its first partition
-  at `/mnt/sd` and swaps on any partition with a swap signature.
+  at `/mnt/sd` and swaps on any partition with a swap signature
+  ([SD card](#sd-card)).
 - **Packages** (`buildroot-disk.defconfig`): libgpiod 2 tools (`gpiodetect`,
   `gpioinfo`, `gpioget`, `gpioset`, `gpiomon`, ...), i2c-tools,
   `spidev_test`, and three of this repository's (`br-external/package/`):
@@ -181,11 +240,14 @@ the tools and examples are in the top-level README; the devices are in
     rp2 port's `rp2` module on `/dev/pio1` and `/dev/pio2`: the port's own
     assembler, `PIO`, `StateMachine` and `DMA`. It reaches the registers
     through `cmod/rvmem` (`_rvmem`: `mmap` and 32-bit loads and stores),
-    since the unix port's `machine.mem32` goes through `/dev/mem`.
+    since the unix port's `machine.mem32` goes through `/dev/mem`. Both
+    modules are documented in
+    [micropython-machine/README.md](br-external/package/micropython-machine/README.md).
   - `libpio`: `libpio.so`, `pio.h` (the pico-sdk's PIO API, a run-time
     assembler and DMA) and `pioasm`, with examples in
     `/usr/share/examples/pio`. The assembler takes the pico-sdk pioasm's
-    syntax, RP2350 instructions included.
+    syntax, RP2350 instructions included. Reference:
+    [libpio/README.md](br-external/package/libpio/README.md).
   - `pins-examples`: `gpio-blink`, `gpio-edge`, `i2c-scan`, `spi-xfer` and
     `adc-read`, built and as source in `/usr/share/examples/pins`. On the
     board, build one with `cc -o gpio-blink gpio-blink.c`. The directory's
@@ -200,6 +262,8 @@ Of note in `linux-disk.fragment`:
 |---|---|
 | `CONFIG_MISC_FILESYSTEMS=y` | the menu squashfs sits under; tinyconfig turns it off |
 | `CONFIG_SQUASHFS_LZ4`, `SQUASHFS_DECOMP_SINGLE` | matches the image; one decompressor buffer |
+| `CONFIG_RVEMU_LZ4` | squashfs's LZ4 blocks decoded natively |
+| `CONFIG_LOG_BUF_SHIFT=14` | a 16 KiB kernel log |
 | `CONFIG_MTD`, `MTD_RVEMU_FLASH`, `JFFS2_FS` (no write buffer, zlib or lzo) | `/home` on the flash device |
 | `CONFIG_OVERLAY_FS`, `CONFIG_TMPFS_XATTR` | the writable overlay (overlayfs wants xattrs on its upper layer) |
 | `CONFIG_BASE_SMALL=y` | smaller kernel tables, for 8 MiB |
