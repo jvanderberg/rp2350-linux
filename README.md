@@ -422,8 +422,8 @@ Measured on the board with a second board as the meter
 | 0x10200000 | swap, up to 0x103FEFFF | the guest, only with `pico-shell.sh -w` |
 | 0x103FF000 | Wi-Fi settings, 4 KB | `scripts/pico-wifi.sh` only |
 | 0x10400000 | guest blob, at most 2 MB: kernel, initramfs, device tree | `pico-shell.sh` |
-| 0x10600000 | root filesystem (squashfs) | `pico-shell.sh` |
-| 0x11000000 − text size | kernel text and read-only data, at most 3.5 MiB, ending at the end of flash | `pico-shell.sh` |
+| 0x10600000 | root filesystem (squashfs), at most 6 MiB | `pico-shell.sh` |
+| 0x11000000 − text size | kernel text and read-only data, at most 4 MiB, ending at the end of flash | `pico-shell.sh` |
 
 Never write 0x103FF000 with picotool or SWD: it holds the Wi-Fi
 passphrase. `pico-shell.sh` writes only the regions whose contents changed

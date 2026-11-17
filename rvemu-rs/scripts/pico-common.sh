@@ -69,8 +69,13 @@ load_at() {
 # load_blob BLOB: the guest blob (kernel after its text, initramfs, DTB) at 0x10400000
 load_blob() { load_at "$1" 0x10400000 "$BLOB_STAMP" "guest blob"; }
 
-# load_disk IMAGE: the root filesystem (squashfs) at 0x10600000
-load_disk() { load_at "$1" 0x10600000 "$DISK_STAMP" "root filesystem"; }
+# load_disk IMAGE: the root filesystem (squashfs) at 0x10600000, at most
+# 6 MiB: the kernel text may take the 4 MiB above it (guest_blob::TEXT_MAX)
+load_disk() {
+  local n; n=$(wc -c < "$1" | tr -d ' ')
+  [ "$n" -le $((6 << 20)) ] || { echo "pico: root filesystem $1 is $n bytes, over the 6 MiB at 0x10600000"; exit 1; }
+  load_at "$1" 0x10600000 "$DISK_STAMP" "root filesystem"
+}
 
 # load_text TEXT: the kernel text, ending at 0x11000000
 load_text() {
