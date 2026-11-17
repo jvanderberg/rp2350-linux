@@ -156,8 +156,8 @@ these matter:
   at `__init_begin`. The firmware maps all of it from flash, as it maps the
   text. `__ro_after_init` data is written during boot, so it goes with the
   writable data instead. `scripts/pico-common.sh` (`text_len`) uses
-  `__init_begin - _start` when the patch is in (3502080 bytes for the disk
-  kernel), so the read-only data takes no PSRAM. `build.sh` applies the
+  `__init_begin - _start` when the patch is in, so the read-only data takes
+  no PSRAM. `build.sh` applies the
   patch to the stock `arch/riscv/kernel/vmlinux.lds.S`, kept beside it.
 - **Native LZ4.** `CONFIG_RVEMU_LZ4` (`linux/drivers/rvemu/lz4-rvemu.c`):
   squashfs's LZ4 blocks are decoded by the firmware's native engine, one
@@ -168,6 +168,17 @@ these matter:
   kernel decodes it in software. A bad block is an `EIO`.
 - **A 16 KiB kernel log** (`CONFIG_LOG_BUF_SHIFT=14`, 512 records): about
   twice what a boot writes. The default takes 536 KiB of RAM.
+- **A small iomap bio pool.** `linux/iomap-pool-small.patch` gives
+  `fs/iomap/buffered-io.c`'s writeback pool two bios, as the block layer's
+  own pools have, instead of 32 with a 3 KiB vector each.
+- **No clock framework or APLIC/IMSIC.** `arch/riscv/Kconfig` selects
+  `COMMON_CLK`, `RISCV_APLIC` and `RISCV_IMSIC` for every machine;
+  `build.sh` takes those selects out, since rvemu has no clocks to manage
+  (the UART's device tree node gives a `clock-frequency`) and its interrupt
+  controller is a PLIC.
+- **No crypto self-tests.** `CONFIG_CRYPTO` is on only so that
+  `CRYPTO_MANAGER_DISABLE_TESTS` can be: otherwise `lib/crypto` tests
+  BLAKE2s at every boot.
 
 ## C compiler
 
@@ -273,6 +284,8 @@ Of note in `linux-disk.fragment`:
 | `GPIO_CDEV`, `I2C_CHARDEV`, `SPI_SPIDEV`, `PWM`, `IIO`, `RVEMU_GPIO` & co., `RVEMU_PIO` | the board's pins and PIO |
 | `RVEMU_CRYPTO`, `RVEMU_SSH`, `RVEMU_BENCH` | the native crypto devices |
 | no `VT`, `INPUT`, `SERIO`, `HID_SUPPORT` | the board has only the serial console |
+| no `ETHTOOL_NETLINK`, `INET_DIAG`, I/O schedulers, `LEGACY_TIOCSTI` | nothing on the guest uses them |
+| `INIT_STACK_NONE` | stack variables are not zeroed on function entry |
 
 ## Configuration notes
 

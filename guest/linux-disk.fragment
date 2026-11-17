@@ -106,3 +106,22 @@ CONFIG_RVEMU_LZ4=y
 # the kernel log: 16 KiB (512 records), about twice the boot's. The default
 # (17: 128 KiB, and 4096 record descriptors) takes 536 KiB of RAM.
 CONFIG_LOG_BUF_SHIFT=14
+# Nothing here uses these: ethtool's netlink interface (BusyBox's ip and
+# ifconfig use rtnetlink and ioctls), socket diagnostics (ss), I/O
+# schedulers (every disk is a virtio queue in front of flash or the
+# firmware's SD path), the 8250 driver's extra probing, or TIOCSTI
+# CONFIG_ETHTOOL_NETLINK is not set
+# CONFIG_INET_DIAG is not set
+# CONFIG_MQ_IOSCHED_DEADLINE is not set
+# CONFIG_MQ_IOSCHED_KYBER is not set
+# CONFIG_SERIAL_8250_DEPRECATED_OPTIONS is not set
+# CONFIG_SERIAL_8250_16550A_VARIANTS is not set
+# CONFIG_LEGACY_TIOCSTI is not set
+# stack variables are not zeroed at every function entry: smaller text and
+# fewer guest instructions
+CONFIG_INIT_STACK_NONE=y
+# the crypto core, only so its self-tests can be turned off: without it,
+# lib/crypto's BLAKE2s tests itself at boot, about 7 M guest instructions,
+# 40% of the kernel's boot
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_MANAGER_DISABLE_TESTS=y

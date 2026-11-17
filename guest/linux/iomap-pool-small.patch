@@ -1,0 +1,20 @@
+SPDX-License-Identifier: GPL-2.0-only
+A change to a file of the Linux kernel, under the kernel's license (see
+COPYING). Applied by guest/build.sh (patch_stock).
+
+--- a/fs/iomap/buffered-io.c	2026-11-17 03:04:25.703181013 +0000
++++ b/fs/iomap/buffered-io.c	2026-11-17 03:04:25.704181013 +0000
+@@ -2091,7 +2091,12 @@
+ 
+ static int __init iomap_buffered_init(void)
+ {
+-	return bioset_init(&iomap_ioend_bioset, 4 * (PAGE_SIZE / SECTOR_SIZE),
++	/*
++	 * rvemu: two, as the block layer's own pools (BIO_POOL_SIZE), not 32.
++	 * Each holds a 256-entry bvec (3 KiB), and nothing here writes back
++	 * through iomap but buffered writes to a raw block device.
++	 */
++	return bioset_init(&iomap_ioend_bioset, BIO_POOL_SIZE,
+ 			   offsetof(struct iomap_ioend, io_bio),
+ 			   BIOSET_NEED_BVECS);
+ }
