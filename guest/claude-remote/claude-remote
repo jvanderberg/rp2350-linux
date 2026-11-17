@@ -66,7 +66,7 @@ done
 # Remote side of session 1: bridge the socket to this ssh session's stdin/stdout.
 BRIDGE_CMD="rm -f '$SOCK'
 if command -v socat >/dev/null 2>&1; then
-  exec socat -T 600 UNIX-LISTEN:'$SOCK',unlink-early STDIO
+  exec socat UNIX-LISTEN:'$SOCK',unlink-early STDIO
 fi
 exec python3 -c 'import socket,sys,os,select
 s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); c,_=s.accept()
