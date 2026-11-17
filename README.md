@@ -87,8 +87,7 @@ The console is the board's USB serial port. A terminal opened after boot
 shows the end of the boot log. `eth0` joins the Wi-Fi network stored with
 `scripts/pico-wifi.sh` and takes its address by DHCP, in the background.
 When the Wi-Fi link drops or stops passing traffic, the board joins the
-network again by itself within about a minute; `S41wifi-keepalive` sends
-an ARP request to the gateway every 20 s so a stalled link is noticed.
+network again by itself within about a minute.
 There is no syslog or cron: `dmesg` has the kernel log.
 
 **Example:**
@@ -224,6 +223,12 @@ cube.o
 (`/dev/vdb`). It is enabled at boot and empty at every boot.
 `flashswap-stats` prints the swap device's counters.
 A swap partition on the SD card ([SD card](#sd-card)) is used ahead of it.
+
+`vm.swappiness` is 200 (`/etc/sysctl.d/vm.conf`): under memory pressure
+the kernel swaps out idle data before it drops the code of running
+programs. With a program holding 4.5 MiB, keystrokes over the network
+then wait at most about a second; at the default (60) the board stopped
+answering for 3.5 to 12 seconds at a time.
 
 **Example:**
 

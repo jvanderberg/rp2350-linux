@@ -31,3 +31,9 @@ SECTIONS {
     __esram89 = .;
   } > SRAM89
 } INSERT AFTER .stack;
+
+/* core0's stack is the SRAM left over below 0x20080000 after code and data
+ * (_estack.._sstack): code moved into SRAM for core1 or the translator takes
+ * it from there. core0 has used about 5.8 KiB; less room than this and it
+ * runs into the statics below it (the USB driver's among them). */
+ASSERT(_sstack - _estack >= 6K, "rvemu-pico-shell: core0's stack (SRAM left after code and data) is under 6 KiB; move code out of SRAM");

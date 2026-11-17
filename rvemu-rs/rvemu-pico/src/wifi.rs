@@ -481,6 +481,68 @@ pub fn driver(
     run(pwr, spi, creds)
 }
 
+/// The guest's address and gateway, from a DHCP ACK in `f` (if it is one).
+/// In flash (`cold_`), like what it calls: one DHCP exchange in a while.
+#[inline(never)]
+#[unsafe(link_section = ".text.cold_wifi")]
+fn cold_learn_lease(f: &[u8], lease: &mut ([u8; 4], [u8; 4])) {
+    if let Some(l) = dhcp_ack(f)
+        && l != *lease
+    {
+        *lease = l;
+        let (a, g) = l;
+        rprintln!(
+            "[wifi] keepalive: guest {}.{}.{}.{}, gateway {}.{}.{}.{}",
+            a[0], a[1], a[2], a[3], g[0], g[1], g[2], g[3]
+        );
+    }
+}
+
+/// A DHCP ACK (server port 67 to client port 68): the address it gives and
+/// its first router.
+#[inline(always)]
+fn dhcp_ack(f: &[u8]) -> Option<([u8; 4], [u8; 4])> {
+    if f.len() < 14 + 20 || f[12] != 0x08 || f[13] != 0x00 {
+        return None;
+    }
+    let ip = &f[14..];
+    let ihl = usize::from(ip[0] & 0x0F) * 4;
+    if ip[0] >> 4 != 4 || ihl < 20 || ip[9] != 17 || ip.len() < ihl + 8 {
+        return None;
+    }
+    let udp = &ip[ihl..];
+    if udp[0] != 0 || udp[1] != 67 || udp[2] != 0 || udp[3] != 68 {
+        return None;
+    }
+    let b = &udp[8..];
+    if b.len() < 240 || b[0] != 2 || b[236..240] != [99, 130, 83, 99] {
+        return None;
+    }
+    let addr = [b[16], b[17], b[18], b[19]];
+    let (mut ack, mut router) = (false, None);
+    let mut i = 240;
+    while i < b.len() {
+        match b[i] {
+            0 => i += 1,
+            255 => break,
+            code => {
+                let len = usize::from(*b.get(i + 1)?);
+                let v = b.get(i + 2..i + 2 + len)?;
+                match code {
+                    53 if len == 1 => ack = v[0] == 5,
+                    3 if len >= 4 => router = Some([v[0], v[1], v[2], v[3]]),
+                    _ => {}
+                }
+                i += 2 + len;
+            }
+        }
+    }
+    if !ack || addr == [0; 4] {
+        return None;
+    }
+    Some((addr, router?))
+}
+
 // ------------------------------------------------------------------ the guest's link (shared with core0)
 
 /// Frames from the radio to the guest (core1 pushes, core0 pops). More
@@ -509,9 +571,14 @@ const JOIN_RETRY_MAX_S: u32 = 300;
 /// Seconds the guest may go on sending while no unicast frame comes back
 /// before the link counts as stalled. After a deauth the chip sometimes
 /// reports the link up while nothing passes either way; only traffic shows
-/// it. The guest's arping of the gateway every 20 s (S41wifi-keepalive)
-/// gets a unicast reply on a working link, so this never fires there.
+/// it. The keepalive (`KEEPALIVE_S`) gets a unicast reply on a working link,
+/// so this never fires there.
 const TRAFFIC_STALL_S: u32 = 30;
+/// Every this many seconds, while the link is up, the firmware sends an ARP
+/// request for the guest's gateway as the guest (its address and gateway
+/// come from the DHCP ACK it received): the reply keeps a working link from
+/// looking stalled, and a dead link gets something to leave unanswered.
+const KEEPALIVE_S: u32 = 20;
 /// Set by `poll` when the link stalls; the control task rejoins.
 static STALLED: AtomicBool = AtomicBool::new(false);
 /// Set by the control task from `leave` until the next join succeeds;
@@ -532,6 +599,11 @@ pub struct RadioService<F> {
     /// nothing unanswered), and how long that may last (`TRAFFIC_STALL_S`).
     unanswered_since: u64,
     stall_cycles: u64,
+    /// The guest's address and gateway from its last DHCP ACK (0: none yet),
+    /// and when the next keepalive goes.
+    lease: ([u8; 4], [u8; 4]),
+    next_keepalive: u64,
+    keepalive_cycles: u64,
 }
 
 // SAFETY: built on core0 before core1 starts, then used by core1 only.
@@ -547,6 +619,34 @@ impl<F: Future<Output = ()>> RadioService<F> {
             bring_up_cycles: u64::from(sys_hz / 1000) * u64::from(bring_up_ms),
             unanswered_since: 0,
             stall_cycles: u64::from(sys_hz) * u64::from(TRAFFIC_STALL_S),
+            lease: ([0; 4], [0; 4]),
+            next_keepalive: 0,
+            keepalive_cycles: u64::from(sys_hz) * u64::from(KEEPALIVE_S),
+        }
+    }
+
+    /// The keepalive: a broadcast ARP request for the gateway, from the
+    /// guest's MAC and address. It counts as the guest sending. In flash
+    /// (`cold_`): it runs every `KEEPALIVE_S`, and SRAM is core0's stack.
+    #[inline(never)]
+    #[unsafe(link_section = ".text.cold_wifi")]
+    fn cold_keepalive(&mut self, d: &mut cyw43::NetDriver<'static>, cx: &mut Context<'_>) {
+        let HardwareAddress::Ethernet(mac) = d.hardware_address() else { return };
+        let Some(tx) = d.transmit(cx) else { return };
+        let (ip, gw) = self.lease;
+        tx.consume(60, |f| {
+            f.fill(0);
+            f[0..6].fill(0xFF);
+            f[6..12].copy_from_slice(&mac);
+            f[12..22].copy_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+            f[22..28].copy_from_slice(&mac);
+            f[28..32].copy_from_slice(&ip);
+            f[38..42].copy_from_slice(&gw);
+        });
+        let now = core1::now();
+        self.next_keepalive = now + self.keepalive_cycles;
+        if self.unanswered_since == 0 {
+            self.unanswered_since = now;
         }
     }
 
@@ -589,11 +689,17 @@ impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
         while NET_RX.has_room() {
             let Some((rx, _tx)) = d.receive(&mut cx) else { break };
             let answered = &mut self.unanswered_since;
+            let lease = &mut self.lease;
             NET_RX.push_with(|slot| {
                 Some(rx.consume(|b| {
                     // a unicast frame (to us): the link passes traffic
                     if b.first().is_some_and(|&a| a & 1 == 0) {
                         *answered = 0;
+                    }
+                    // DHCP to the client port (IPv4 without options, UDP
+                    // 67 to 68): looked at in flash, rarely
+                    if b.len() > 42 && b[12] == 8 && b[13] == 0 && b[14] == 0x45 && b[23] == 17 && b[35] == 67 && b[37] == 68 {
+                        cold_learn_lease(b, lease);
                     }
                     let n = b.len().min(slot.len());
                     slot[..n].copy_from_slice(&b[..n]);
@@ -622,6 +728,8 @@ impl<F: Future<Output = ()>> core1::Service for RadioService<F> {
         } else if self.unanswered_since != 0 && core1::now() - self.unanswered_since > self.stall_cycles {
             self.unanswered_since = 0;
             STALLED.store(true, Ordering::Relaxed);
+        } else if self.lease.0 != [0; 4] && self.lease.1 != [0; 4] && core1::now() >= self.next_keepalive {
+            self.cold_keepalive(d, &mut cx);
         }
         if got {
             core1::notify_core0();

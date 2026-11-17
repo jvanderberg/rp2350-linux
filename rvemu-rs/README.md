@@ -538,10 +538,12 @@ every 256 dispatches), and only while a line has an edge interrupt on.
 - **Rejoining.** The firmware leaves and joins again when the link has been
   down for 30 s, or when it is up but stalled: the guest has sent for 30 s
   and no unicast frame came back (after a deauth the chip can report the
-  link up while nothing passes). The disk guest's `S41wifi-keepalive` sends
-  an ARP request to the gateway every 20 s, whose unicast reply keeps a
-  working link from looking stalled. The guest sees each rejoin as its
-  carrier going down and up.
+  link up while nothing passes). Every 20 s the firmware itself sends an
+  ARP request for the guest's gateway, as the guest: it reads the guest's
+  address and gateway from the DHCP ACK on its way in. The unicast reply
+  keeps a working link from looking stalled, and a dead link gets something
+  to leave unanswered even when the guest is quiet. The guest sees each
+  rejoin as its carrier going down and up.
 - **Panics.** `rvemu-pico-shell` prints a panic on RTT without blocking,
   waits 3 s and reboots, so the board comes back instead of hanging until
   it is unplugged.
@@ -571,7 +573,14 @@ every 256 dispatches), and only while a line has an edge interrupt on.
   riscv-rt's `pre_init`), as well as any function marked
   `#[unsafe(link_section = ".data.core1")]`. `scripts/check-core1.py` lists
   every call or address from there into flash, and fails on any that isn't
-  a cold path (panics, RTT formatting, BOOTSEL, the radio firmware upload).
+  a cold path (panics, RTT formatting, BOOTSEL, the radio firmware upload,
+  and functions named `cold_*`, which a `link_section` keeps in flash on
+  purpose: `wifi.rs`'s DHCP parsing and keepalive).
+- **core0's stack** is the SRAM left below 0x20080000 after code and data,
+  so every function moved into SRAM for core1 or the translator takes from
+  it. core0 has used about 5.8 KiB; `core1.x` fails the link when less than
+  6 KiB is left, since an overflow runs into the statics below it (the USB
+  driver's among them) and shows up as a crash in the USB driver at boot.
 - **Flash writes.** Erasing or programming flash stalls XIP.
   `core1::park()` holds core1 in an SRAM loop until `core1::unpark()`;
   `flash.rs` calls the pair around every erase and program.
