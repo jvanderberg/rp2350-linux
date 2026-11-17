@@ -30,13 +30,13 @@ if not OBJDUMP.is_file():
 NM = OBJDUMP.with_name("llvm-nm")
 
 # Targets that only run on rare or one-time paths (BYTES: the radio firmware,
-# read once at bring-up). A reference made only from cold functions is cold
-# too.
+# read once at bring-up; functions named cold_*, kept in flash on purpose by
+# a link_section). A reference made only from cold functions is cold too.
 COLD = re.compile(
     r"panic|unwrap_failed|expect_failed|fmt|rtt_target|_print|Debug|Display|Formatter"
     r"|reboot|bootsel|slice_error|str_index|index_order|slice_end_index|slice_start_index"
     r"|len_mismatch|assert_failed|unreachable|from_utf8|escape_debug|Lanon|::fail|index_fail"
-    r"|write_blocking|::BYTES"
+    r"|write_blocking|::BYTES|::cold_"
 )
 
 
