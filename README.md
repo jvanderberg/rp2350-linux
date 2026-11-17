@@ -27,6 +27,7 @@ Linux rp2350 6.12.116 #29 Sun Nov  8 12:56:58 UTC 2026 riscv32 GNU/Linux
 | [USB console and Wi-Fi](#console-and-network) | on | `screen /dev/cu.usbmodemrvemu1 115200`; `eth0` |
 | [`/home` and `/root` on flash](#home-on-flash) | on | files there are kept across reboots |
 | [SSH](#ssh) | on | `ssh root@ADDRESS` with your key in `/root/.ssh/authorized_keys` |
+| [Telnet](#telnet) | on | `telnet ADDRESS`, log in as `root` |
 | [Claude Code on the board's files](#claude-code) | on | `claude-remote user@mac -d DIR` |
 | [C compiler](#c-compiler) | on | `cc`, `tcc -run`, `tcc -ar` |
 | [Swap on flash](#swap) | off | `scripts/pico-shell.sh -w` |
@@ -142,6 +143,43 @@ $ scp -O notes.txt root@192.168.4.171:
 ```
 
 The board has no SFTP server, so the Mac's `scp` needs `-O`.
+
+The Mac's `ssh` asks for P-256 key exchange and AES-GCM first, which the
+engine doesn't do, so the board runs them in emulated code: logins take
+about 4 s on an idle board and over 20 s on a busy one. Asking for the
+engine's algorithms brings that to about 2 s; `ControlMaster` then reuses
+the connection for later commands:
+
+```
+Host rp2350
+    HostName 192.168.4.171
+    User root
+    KexAlgorithms curve25519-sha256,sntrup761x25519-sha512@openssh.com
+    Ciphers chacha20-poly1305@openssh.com
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+```
+
+## Telnet
+
+BusyBox `telnetd` listens on port 23 (`S50telnet`). It is lighter than
+SSH: on an idle board a login takes about 1 s against about 2 s for the
+best SSH setup, and a keystroke echoes in about 33 ms against 55 ms. With
+a busy CPU the gap grows, since SSH encrypts every screen update again.
+
+Nothing is encrypted, and root has no password: anyone on the network
+can log in as root. Use it on a network you trust, or set a password with
+`passwd` (it is kept in `/etc/shadow`, which is not on flash, so it lasts
+until the next boot).
+
+**Example:**
+
+```
+$ telnet 192.168.4.171
+rp2350 login: root
+#
+```
 
 ## Claude Code
 

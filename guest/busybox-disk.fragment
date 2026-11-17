@@ -17,3 +17,6 @@ CONFIG_FEATURE_TAR_AUTODETECT=y
 CONFIG_FEATURE_CPIO_O=y
 # no devmem: the kernel has no /dev/mem
 # CONFIG_DEVMEM is not set
+# telnetd, standalone: Buildroot's S50telnet starts it at boot (README, Telnet)
+CONFIG_TELNETD=y
+CONFIG_FEATURE_TELNETD_STANDALONE=y
