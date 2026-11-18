@@ -37,7 +37,7 @@ guest to `login:` in under a second.
 | `-W` | the swap device (below) on a modelled copy of the board's swap flash (511 sectors), with datasheet-typical erase and program times in its statistics. The guest's init enables it as `/dev/vdb`. |
 | `-G` | the pin devices (GPIO, I2C, SPI, PWM, ADC) on a simulated board (`stubpins.rs`): an output reads back its level, an input its pull, or the line it is jumpered to (`RVEMU_JUMPERS=14-15,...`); a 256-byte EEPROM at 0x50 on I2C bus 0; SPI MISO wired to MOSI; the ADC reads 27 °C and 400 x N + 100 on GP40+N; PIO1 and PIO2 in software (`piosim.rs`, at `RVEMU_PIO_HZ` cycles a second, default 10 MHz, in step with wall time) with the DMA pool. `RVEMU_IO=gpio,i2c0,i2c1,spi0,pwm,adc,pio` picks which of them go in the device tree (`pio` needs `gpio`). |
 | `-N` | virtio-net on a stub LAN (`stubnet.rs`): a gateway at 10.0.2.2 that answers ARP and ping. In the guest: `ifconfig eth0 10.0.2.15 up && ping -c 3 10.0.2.2`. |
-| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `__init_begin - _start` from `System.map` when the kernel puts its read-only data after its text (`rodata-in-flash.patch`; 3502080 for the disk kernel), otherwise `_etext - _start` rounded down to a page. |
+| `-X BYTES` | the kernel's first BYTES (its text) become extra, read-only guest RAM, as on the board. The board's value is `text_len` in `scripts/pico-common.sh`: `__init_begin - _start` from `System.map` when the kernel puts its read-only data after its text (`rodata-in-flash.patch`; 3276800 for the disk kernel), otherwise `_etext - _start` rounded down to a page. |
 | `-b FILE` | use this DTB instead of generating one |
 | `-m MB` | guest RAM (default 64) |
 | `-a ARGS` | kernel command line (default `earlycon console=ttyS0`) |
@@ -51,7 +51,7 @@ guest to `login:` in under a second.
 
 `-F`, `-W`, `-s` and `-G` stand in for the board's flash, swap, SD card and
 pins, so the guest side of those features can be tried and tested without
-the board. `-X` takes the board's `text_len`: 3502080 for the current disk
+the board. `-X` takes the board's `text_len`: 3276800 for the current disk
 kernel, whose read-only data follows its text. The runs below used
 2998272, an earlier disk kernel's text alone. The guest's own examples,
 on the board, are in the top-level README.

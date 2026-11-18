@@ -72,6 +72,10 @@ disk_kernel() {   # TREE OUT [smp]
   # (SCHED_IDLE, not nice 10), so a full /home doesn't hold up the boot. A
   # writer that runs out of space collects garbage itself.
   sed -i 's|^\tset_user_nice(current, 10);$|\tsched_setscheduler_nocheck(current, SCHED_IDLE, \&(struct sched_param){ 0 });|' fs/jffs2/background.c
+  # no clock framework and no APLIC/IMSIC interrupt controllers: arch/riscv
+  # selects them for every machine, and rvemu has none of them (its device
+  # tree gives the UART a clock-frequency; its interrupts are on a PLIC)
+  sed -i '/^\tselect COMMON_CLK$/d; /^\tselect RISCV_APLIC$/d; /^\tselect RISCV_IMSIC$/d' arch/riscv/Kconfig
   local frags=(/guest/linux.fragment /guest/linux-disk.fragment)
   if [[ $smp == smp ]]; then
     frags+=(/guest/linux-smp.fragment)
@@ -101,6 +105,8 @@ disk_kernel() {   # TREE OUT [smp]
   patch_stock arch/riscv/kernel/vmlinux.lds.S /guest/linux/rodata-in-flash.patch
   # squashfs's LZ4 blocks decoded by the native engine (drivers/rvemu/lz4-rvemu.c)
   patch_stock fs/squashfs/lz4_wrapper.c /guest/linux/squashfs-lz4-rvemu.patch
+  # iomap's writeback bio pool: two bios, not 32 (each with a 3 KiB bvec)
+  patch_stock fs/iomap/buffered-io.c /guest/linux/iomap-pool-small.patch
   # mmc_spi.c as it was, from trees built when the guest drove the SD card
   # itself (now the firmware does: the guest has no MMC layer)
   if [[ -f drivers/mmc/host/mmc_spi.c.stock ]]; then
