@@ -140,8 +140,12 @@ impl Cpu {
             }
             let vpn = (va >> (12 + 10 * level)) & 0x3FF;
             let pte_p = self.ram_word((table_ppn << 12) + vpn * 4).ok_or(AFAULT[acc])?;
-            // SAFETY: pte_p points to a 4-byte aligned word in guest RAM (checked above).
-            let pte = unsafe { pte_p.read() };
+            // SAFETY: pte_p points into guest RAM (checked above). Fast-path
+            // aligned host pointers (the common case) without assuming Cpu::new's
+            // caller aligned `ram`.
+            let pte = unsafe {
+                if (pte_p as usize) & 3 == 0 { pte_p.read() } else { pte_p.read_unaligned() }
+            };
             if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) {
                 return Err(PFAULT[acc]);
             }
@@ -172,7 +176,13 @@ impl Cpu {
 
             let updated = pte | PTE_A | if acc == ACC_W { PTE_D } else { 0 };
             if updated != pte {
-                unsafe { pte_p.write(updated) };
+                unsafe {
+                    if (pte_p as usize) & 3 == 0 {
+                        pte_p.write(updated);
+                    } else {
+                        pte_p.write_unaligned(updated);
+                    }
+                }
             }
 
             if ppn >> 20 != 0 {
@@ -325,7 +335,9 @@ impl Cpu {
             },
         };
         // SAFETY: h is within a RAM page; pc is 4-aligned (checked at jumps).
-        let insn = unsafe { (h as *const u32).read() };
+        let insn = unsafe {
+            if h & 3 == 0 { (h as *const u32).read() } else { (h as *const u32).read_unaligned() }
+        };
         Ok((insn, self.host_off(h)))
     }
 }

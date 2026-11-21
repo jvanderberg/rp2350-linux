@@ -2,7 +2,7 @@
 
 On-device C programs, demos, and utilities archived from `/mnt/sd/rp2350-linux` on the RP2350 Linux board. Everything here is designed to build directly on the board with TinyCC (`cc` / `tcc`).
 
-Compiled binaries, object files, and runtime state (`data/` logs and test uploads) are excluded; each directory includes its sources and build script.
+Compiled binaries, object files, and runtime state (`data/` logs and test uploads) are excluded; most directories include a build script, while `noice` and `ws2812` build with a single `cc` command.
 
 ## Inventory
 
@@ -15,6 +15,13 @@ Compiled binaries, object files, and runtime state (`data/` logs and test upload
 | [`nnn/`](nnn/) | **nnn** — port of the `nnn` terminal file manager adapted to build on-device with `tcc` against narrow `libncurses` (using `compat/` shims and headers from `../noice/include`). | `./build.sh && ./nnn` |
 | [`noice/`](noice/) | **noice** — minimal `curses`-based file browser with bundled `ncurses` headers (`include/`) and `strlcpy`/`strlcat` shims for `tcc`. | `cc -Iinclude -o noice noice.c strlcat.c strlcpy.c -lncurses && ./noice` |
 | [`ws2812/`](ws2812/) | **WS2812 PIO demo** — drives NeoPixel/WS2812 LEDs on a GPIO pin using RP2350 PIO via `libpio` (`ws2812.pio`, `ws2812.pio.h`, `ws2812.c`). | `pioasm ws2812.pio ws2812.pio.h && cc -o ws2812 ws2812.c -lpio && ./ws2812 PIN COUNT RRGGBB` |
+
+## Provenance & licensing
+
+- **`bbs/`, `demos/`, `mc/`, `tm/`:** Original C programs written for this project's RP2350 Linux board (under the repository's MIT license).
+- **`nnn/`:** Third-party port of upstream `nnn` (BSD-2-Clause, see [`nnn/LICENSE`](nnn/LICENSE)) with local `tcc` / narrow-ncurses compatibility shims (`compat/fts.h`, `compat/narrowcurses.h`, `build.sh`).
+- **`noice/`:** Third-party port of upstream `noice` (BSD-2-Clause, see [`noice/LICENSE`](noice/LICENSE)) with local `strlcat.c`/`strlcpy.c` shims and bundled `ncurses` headers (`include/`, MIT-X11) for on-device `tcc` builds.
+- **`ws2812/`:** `ws2812.pio` and generated `ws2812.pio.h` are derived from `raspberrypi/pico-examples` (`pio/ws2812/ws2812.pio`, Copyright (c) 2020 Raspberry Pi (Trading) Ltd., BSD-3-Clause); `ws2812.c` is a small `libpio` driver wrapper.
 
 ## Copying back to the board
 

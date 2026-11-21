@@ -1770,24 +1770,38 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         let cold_lock = self.amo_lock.map(|l| l.spin);
+        // Protect the page from writes across all harts BEFORE snapshotting
+        // guest instructions into `insns`, so a concurrent peer store cannot
+        // slip between `scan` and `mark_code_page` without invalidating it.
+        if !self.measure_only {
+            self.mark_code_page(cpu, pa0);
+        }
         // pass 1: find the block
         let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
         let mut insns: Insns = [MaybeUninit::uninit(); MAX_BLOCK];
-        let Scan { n, last, end_interp } = scan(cpu, pc0, pa0, &mut kinds, &mut insns);
-        let pc = pc0.wrapping_add(4 * n as u32);
+        let mut sc = scan(cpu, pc0, pa0, &mut kinds, &mut insns);
 
         // (no-code blocks are not kept: scanning one instruction again is
         // about as cheap as looking it up)
-        if n == 0 {
+        if sc.n == 0 {
             return NO_CODE;
         }
         // room for the worst case (measuring never keeps the block)
         if !self.measure_only {
-            self.make_room(n * MAX_WORDS + 16 + ENTRY_OFF);
+            let flushes = self.stats.flushes;
+            self.make_room(sc.n * MAX_WORDS + 16 + ENTRY_OFF);
+            // A full flush (regions == 1) clears `code_pages`, so re-protect
+            // and re-scan before emitting.
+            if self.stats.flushes != flushes {
+                self.mark_code_page(cpu, pa0);
+                sc = scan(cpu, pc0, pa0, &mut kinds, &mut insns);
+                if sc.n == 0 {
+                    return NO_CODE;
+                }
+            }
         }
-        if !self.measure_only {
-            self.mark_code_page(cpu, pa0);
-        }
+        let Scan { n, last, end_interp } = sc;
+        let pc = pc0.wrapping_add(4 * n as u32);
 
         let r = &self.r;
         let eager_chain = !self.measure_only && self.store.nidx == 0;
@@ -2510,14 +2524,16 @@ impl<'m> Jit<'m> {
         let enter = self.enter;
         smp.in_code[h].store(1, Ordering::Relaxed);
         smp.unlock();
-        let t0 = host_instret();
+        let t0 = if self.profile { host_instret() } else { 0 };
         // SAFETY: as in `run_one_inner`; the blocks stay while this hart is
         // in code (`wait_others_out`).
         unsafe {
             let enter: EnterFn = core::mem::transmute(enter);
             enter(cpu, entry);
         }
-        self.stats.h_code += host_instret() - t0;
+        if self.profile {
+            self.stats.h_code += host_instret() - t0;
+        }
         let info = cpu.jit.exit_info;
         // (reads the block it left: still in code, so it stays)
         if info & 3 == EXIT_MEM {
