@@ -1,0 +1,13 @@
+@name The AHB Crossroads
+@exit south start
+@exit west core0
+@exit east core1
+@exit north sram
+@exit down flash
+@exit up pio
+@look signpost WEST: Core 0.  EAST: Core 1.  NORTH: SRAM Fields.  DOWN: Flash Vault.  UP: PIO Workshop.  SOUTH: you just came from there.
+@look traffic Addresses, mostly. A few of them are even aligned.
+A roaring intersection where six lanes of |11bus traffic|07 meet. Words of data
+rush past in tidy 32-bit convoys, pausing only when something downstream
+raises HREADY and makes everyone wait. A |14signpost|07 bristles with arrows.
+The air smells faintly of ozone and arbitration.

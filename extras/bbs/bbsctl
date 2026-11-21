@@ -1,0 +1,70 @@
+#!/bin/sh
+# bbsctl - build and run the telnet BBS.
+#
+# busybox inetd listens on telnet_port (bbs.conf) and starts one "bbs" per
+# caller.  / is a RAM overlay on this board, so "bbsctl start" must be run
+# after each boot.
+D=$(cd "$(dirname "$0")" && pwd)
+U=$D/data/users
+CONF=/tmp/bbs-inetd.conf
+PID=/var/run/bbs-inetd.pid
+
+okhandle() {
+  case "$1" in ""|*[!A-Za-z0-9]*) echo "handle: letters and digits only" >&2; return 1;; esac
+}
+
+case "$1" in
+build)
+  # build beside it and rename, so callers who are online keep the old binary
+  tcc -DBBSDIR="\"$D\"" -o "$D/bbs.new" "$D/bbs.c" && mv "$D/bbs.new" "$D/bbs" && echo "built $D/bbs"
+  ;;
+start)
+  [ -x "$D/bbs" ] && [ ! "$D/bbs.c" -nt "$D/bbs" ] || "$0" build || exit 1
+  "$0" stop >/dev/null   # also clears the live MUD world, so it is rebuilt from mud/*.txt
+  P=$(sed -n 's/^telnet_port=//p' "$D/bbs.conf" | tr -d '\r ')
+  P=${P:-23}
+  mkdir -p "$D/data"
+  # root because the SD card is FAT: nobody else can write to it
+  echo "$P stream tcp nowait root $D/bbs bbs" > $CONF
+  setsid inetd -f $CONF </dev/null >/dev/null 2>&1 &
+  echo $! > $PID
+  echo "BBS is up: telnet $(ip -4 addr show eth0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p') $P"
+  ;;
+stop)
+  [ -f $PID ] && kill "$(cat $PID)" 2>/dev/null
+  rm -f $PID
+  killall bbs 2>/dev/null
+  rm -rf /tmp/bbs-mud
+  echo "BBS is down"
+  ;;
+mudreset) # forget saved creature/item positions; the world restarts from mud/*.txt
+  rm -f "$D"/data/mud_*.sav; rm -rf /tmp/bbs-mud; echo "MUD world reset"
+  ;;
+who)
+  "$D/bbs" -w
+  ;;
+users)
+  cut -d: -f1 "$U" 2>/dev/null
+  ;;
+passwd) # bbsctl passwd HANDLE [PASSWORD] - create an account or reset its password
+  okhandle "$2" || exit 1
+  pw=$3
+  if [ -z "$pw" ]; then
+    printf 'Password for %s: ' "$2"
+    stty -echo; read -r pw; stty echo; echo
+  fi
+  [ ${#pw} -ge 6 ] || { echo "password: 6 characters or more" >&2; exit 1; }
+  h=$(mkpasswd -m sha256 "$pw") || exit 1
+  mkdir -p "$D/data"; touch "$U"
+  grep -vi "^$2:" "$U" > "$U.new"
+  echo "$2:$h" >> "$U.new"
+  mv "$U.new" "$U" && echo "password set for $2"
+  ;;
+deluser)
+  okhandle "$2" || exit 1
+  grep -vi "^$2:" "$U" > "$U.new"; mv "$U.new" "$U" && echo "removed $2"
+  ;;
+*)
+  echo "usage: bbsctl build|start|stop|who|mudreset|users|passwd HANDLE [PASSWORD]|deluser HANDLE"
+  ;;
+esac

@@ -1,0 +1,8 @@
+@name Core 0, the Hazard3 Forge
+@exit east bus
+@look pipeline Fetch, decode, execute. Three anvils in a row. Sparks fly whenever a branch is mispredicted, which is often.
+@look registers Thirty-one glowing lockers and one that is always empty. Someone has scratched "x0 WAS HERE" on it, to no effect.
+A hot, bright workshop where a three-stage |14pipeline|07 hammers instructions
+flat, one per clock. A wall of |11registers|07 glows along the back. Core 0 never
+looks up from its work; it has an emulated kernel to run and it is |12very|07
+behind schedule.

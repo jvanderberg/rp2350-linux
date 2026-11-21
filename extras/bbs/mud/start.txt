@@ -1,0 +1,18 @@
+# ROOM FILE FORMAT - one room per file, mud/ID.txt (id: a-z 0-9 _).
+#   @name Title              first line that isn't a comment
+#   @exit DIRECTION ROOMID   north south east west up down, or any one word
+#   @look WORD text...       shown for "look WORD"
+#   anything else            the description; |NN colour codes work
+# Lines starting with # are ignored.  The MUD always begins in start.txt.
+# Creatures are in npcs.txt and things in items.txt; after editing those,
+# run "bbsctl start" to rebuild the live world.
+@name The Boot ROM Atrium
+@exit north bus
+@look mask A brass plate: |14"MASK ROM - 32 KB - DO NOT ERASE (YOU CAN'T)"|07.
+@look pillars Each pillar is a column of fuses. Most are intact. One reads |12SECURE BOOT|07 and has never been blown.
+@look vectors Faded arrows painted on the floor, each ending at a little door marked with a number. Number 0 is |15RESET|07.
+You stand in a vaulted hall of |03green solder mask|07 and gold traces. This is
+where everything begins: every reset, every power-on, every brown-out arrives
+here blinking. Pillars of |14fuses|07 hold up the ceiling, and painted |11vectors|07
+on the floor point off in all directions. A |14mask|07 plate hangs over the arch
+to the north, where the bus hums.

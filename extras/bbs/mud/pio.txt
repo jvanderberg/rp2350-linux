@@ -1,0 +1,7 @@
+@name The PIO Workshop
+@exit down bus
+@look machines Four state machines per bench, each running a nine-instruction program somebody was very proud of.
+@look bench Scorch marks, flux, and a half-finished WS2812 driver. The timing is off by one cycle and it will be off by one cycle forever.
+A cluttered attic full of little clockwork |14machines|07, each ticking out its
+own waveform: one bit-bangs video, one talks to an SD card, one does something
+nobody remembers asking for. Tools are scattered across a |11bench|07.
