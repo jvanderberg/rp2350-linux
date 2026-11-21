@@ -131,6 +131,11 @@ impl<'a> Asm<'a> {
     pub fn srai(&mut self, rd: Reg, rs1: Reg, sh: u32) {
         self.emit(i_type(0x13, rd, 5, rs1, 0x400 | sh as i32));
     }
+    /// RV32 Zbb rotate right immediate (Hazard3).
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn rori(&mut self, rd: Reg, rs1: Reg, sh: u32) {
+        self.emit(i_type(0x13, rd, 5, rs1, 0x600 | (sh & 31) as i32));
+    }
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn add(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
         self.emit(r_type(0x33, rd, 0, rs1, rs2, 0));

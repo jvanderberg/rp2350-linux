@@ -23,7 +23,7 @@ bench = false
 
 [dependencies]
 rvcore = { path = "../rvcore", features = ["ram-code", "pv-buffers"] }
-rvjit = { path = "../rvjit", features = ["ram-code"] }
+rvjit = { path = "../rvjit", features = ["ram-code", "zbb"] }
 rp2350-board = { path = "../../rp2350/board" }
 rp235x-hal = { version = "0.4", features = ["rt", "critical-section-impl", "binary-info"] }
 riscv-rt = "0.12"

@@ -460,7 +460,7 @@ impl Transport {
         if q.last_avail == avail_idx {
             return None;
         }
-        self.mem.u16(q.avail + 4 + 2 * (q.last_avail as u64 % q.num as u64))
+        self.mem.u16(q.avail + 4 + 2 * (q.last_avail as u32 % q.num) as u64)
     }
 
     /// Return chain `head` on queue `qi` with `written` bytes, and interrupt.
@@ -468,7 +468,7 @@ impl Transport {
         let q = self.q[qi];
         // used ring: flags, idx, then { id: u32, len: u32 }[num]
         if let Some(used_idx) = self.mem.u16(q.used + 2) {
-            let e = q.used + 4 + 8 * (used_idx as u64 % q.num as u64);
+            let e = q.used + 4 + 8 * (used_idx as u32 % q.num) as u64;
             let mut ent = [0u8; 8];
             ent[..4].copy_from_slice(&(head as u32).to_le_bytes());
             ent[4..].copy_from_slice(&written.to_le_bytes());

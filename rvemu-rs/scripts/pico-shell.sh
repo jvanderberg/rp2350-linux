@@ -42,7 +42,7 @@ ELF=target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 cargo build --locked -q --release -p rvemu
-cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
+RUSTFLAGS="-C target-feature=+zba,+zbb,+zbs,+zcb,+zbkb" cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 # the pin devices only for a kernel with their drivers (the disk guest's)
 IO=0; grep -q '^CONFIG_RVEMU_GPIO=y' "$(dirname "$K")/linux.config" 2>/dev/null && IO=1
 # the SD card's disk for a kernel with a block layer (not the initramfs guest's)

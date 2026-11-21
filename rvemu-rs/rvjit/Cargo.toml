@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# Emit RV32 Zbb (`rori`) in the soft-TLB helper (Hazard3 on RP2350).
+zbb = []
 # Same for the dispatcher and translator.
 ram-code = ["rvcore/ram-code"]
 

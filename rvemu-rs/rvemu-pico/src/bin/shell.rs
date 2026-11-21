@@ -204,7 +204,7 @@ impl NorFlash for BoardNor {
 /// code and buffers (`core1.rs`), the pin devices and core0's stack (about
 /// 10 KiB, what is left above .bss; `setup` and the run each need about 6) have
 /// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
-const CODE_KIB: usize = 326;
+const CODE_KIB: usize = 324;
 const CODE_WORDS: usize = CODE_KIB * 256;
 /// With two harts, the top of the code buffer is hart 1's (in SRAM, as hart
 /// 0's is): its Cpu, its jump cache and the stack core1 runs it on.
@@ -1217,6 +1217,8 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     let jit = make_jit(cpu, if two_harts { CODE_WORDS - HART1_WORDS } else { CODE_WORDS });
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
+    // Shell never prints jit.stats, so skip per-dispatch minstret reads.
+    jit.profile = false;
     if two_harts {
         setup_hart1(jit, cpu, &h, dtb, sys_hz);
     }
