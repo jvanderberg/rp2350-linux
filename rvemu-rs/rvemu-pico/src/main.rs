@@ -415,6 +415,7 @@ fn jit_loop(
 
 #[hal::entry]
 fn main() -> ! {
+    board::bootsel_if_requested();
     rtt_init_print!(ChannelMode::BlockIfFull, 4096);
     let mut pac = hal::pac::Peripherals::take().unwrap();
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);

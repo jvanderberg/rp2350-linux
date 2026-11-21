@@ -22,7 +22,7 @@ read -r REF_N REF_H < "$T/mac.ref"
 echo "pico-linux.sh: Mac reference: $REF_N guest insns, console hash $REF_H"
 
 pack_guest "$K" "$I" "$M" "$T/blob.bin" "$T/text.bin"
-cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
+RUSTFLAGS="-C target-feature=+zba,+zbb,+zbs,+zcb,+zbkb" cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
 ensure_bootsel "$ELF"
 load_text "$T/text.bin"
 load_blob "$T/blob.bin"

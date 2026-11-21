@@ -1,0 +1,60 @@
+# CREATURES - one "@npc ID" block each (at most 16).  Keys:
+#   name TEXT       shown in the room (start it with a capital)
+#   room ROOMID     where it starts and respawns
+#   desc TEXT       shown for "look ID"
+#   say TEXT        repeatable; picked at random when it talks
+#   hp N            0 or missing = cannot be attacked
+#   damage N        hits for 1..N
+#   hostile 1       attacks anyone it sees; otherwise only who attacked it
+#   wander 1        drifts from room to room
+#   drop ITEMID     left behind when it is destroyed
+#   want ITEMID     "give" it this to complete its quest
+#   reward TEXT     what it says then
+#   gives ITEMID    what it hands over then
+# After editing, run "bbsctl start" to rebuild the live world.
+
+@npc wizard
+name Bootrom the Wizard
+room start
+desc A very old program in a robe of gold-plated traces. He has run exactly the same way since the day he was masked, and he is proud of it.
+say I had an interrupt once. Lovely thing. It went north and never came back.
+say If you find my |14Lost Interrupt|07, bring it here and |11give|07 it to me.
+say Something in the SRAM Fields has been eating my vectors.
+say There is a |14probe|07 in the PIO Workshop. You will want it before you go north.
+say Sixteen bytes of stack was enough for anybody.
+want interrupt
+reward At last! IRQ 7, home again. You have my thanks, and this.
+gives medal
+
+@npc packet
+name A Lost Packet
+room bus
+desc A small, anxious bundle of bytes with a checksum that doesn't quite add up. It keeps reading its own header.
+say Excuse me, is this 192.168.4.1?
+say I was sent in 1970. Or possibly 1980. The clock is not reliable here.
+say Don't go into the SRAM Fields. I saw a Glitch there. It had |12teeth|07.
+say Has anyone seen my other fragments?
+say TTL is getting low. I can feel it.
+hp 6
+damage 1
+wander 1
+
+@npc glitch
+name The Glitch
+room sram
+desc A crawling smear of wrong bits, all sharp edges and inverted colours. Something bright is lodged inside it.
+say *bzzt*
+say 0xDEADBEEF. 0xDEADBEEF. 0xDEADBEEF.
+hp 14
+damage 4
+hostile 1
+drop interrupt
+
+@npc rat
+name The Bit Rat
+room flash
+desc A scrawny rodent made of flipped bits. It has been gnawing at sector 3.
+say *squeak*
+hp 5
+damage 2
+hostile 1

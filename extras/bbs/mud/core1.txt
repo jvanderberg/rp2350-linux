@@ -1,0 +1,7 @@
+@name Core 1, the Quiet Twin
+@exit west bus
+@look hammock It is strung between two idle interrupt lines. Very comfortable. A note is pinned to it: "wake me with a FIFO".
+@look fifo A small mail slot in the wall, connecting to Core 0. It is empty, as usual.
+The same forge as next door, but cool and dim. A |14hammock|07 sways where the
+pipeline should be. Core 1 was told to wait for work through the |11fifo|07 a long
+time ago, and it has been waiting patiently ever since.

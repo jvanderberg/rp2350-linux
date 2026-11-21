@@ -1,0 +1,37 @@
+# THINGS - one "@item ID" block each (at most 32).  Keys:
+#   name TEXT      e.g. "a debug probe"
+#   room ROOMID    where it lies at first; leave out for things that only
+#                  appear later (a creature's "drop", a quest's "gives")
+#   desc TEXT      shown for "look ID"
+#   kind weapon    carrying it adds "value" to your hits
+#   kind heal      "use" it to gain "value" health; it then returns to its room
+#   value N
+# Things a caller carries go back where they started when the caller leaves.
+# After editing, run "bbsctl start" to rebuild the live world.
+
+@item probe
+name a debug probe
+room pio
+desc Two sharp pins, SWDIO and SWCLK, on a sturdy handle. It can halt almost anything.
+kind weapon
+value 4
+
+@item capacitor
+name a decoupling capacitor
+room flash
+desc 100 nF of calm in a tiny ceramic body. Just holding it makes your rails feel steadier.
+kind heal
+value 10
+
+@item wire
+name a jumper wire
+room core1
+desc Green, a bit bent. Every project has one of these and nobody knows what it connects.
+
+@item interrupt
+name the Lost Interrupt
+desc IRQ 7, bright and insistent. It keeps trying to get your attention.
+
+@item medal
+name a Boot ROM medal
+desc A gold test pad on a ribbon, stamped "FIRST STAGE - WITH HONOURS".

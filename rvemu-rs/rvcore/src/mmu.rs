@@ -115,12 +115,13 @@ impl Cpu {
         (host - self.ram as usize) as u32
     }
 
+    #[inline(always)]
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    fn ram_word(&self, pa: u64) -> Option<*mut u32> {
-        let base = self.ram_base as u64;
-        if pa >= base && pa + 4 <= base + self.ram_size as u64 {
+    fn ram_word(&self, pa: u32) -> Option<*mut u32> {
+        let off = pa.checked_sub(self.ram_base)?;
+        if off.checked_add(4).is_some_and(|e| e <= self.ram_size) {
             // SAFETY: in bounds of the RAM block.
-            Some(unsafe { self.ram.add((pa - base) as usize) } as *mut u32)
+            Some(unsafe { self.ram.add(off as usize) } as *mut u32)
         } else {
             None
         }
@@ -132,17 +133,24 @@ impl Cpu {
         if self.satp >> 31 == 0 {
             return Ok(va);
         }
-        let mut table = ((self.satp & 0x3F_FFFF) as u64) << 12;
+        let mut table_ppn = self.satp & 0x3F_FFFF;
         for level in [1u32, 0] {
+            if table_ppn >> 20 != 0 {
+                return Err(AFAULT[acc]);
+            }
             let vpn = (va >> (12 + 10 * level)) & 0x3FF;
-            let pte_p = self.ram_word(table + vpn as u64 * 4).ok_or(AFAULT[acc])?;
-            // SAFETY: pte_p points into guest RAM (checked above).
-            let pte = unsafe { pte_p.read_unaligned() };
+            let pte_p = self.ram_word((table_ppn << 12) + vpn * 4).ok_or(AFAULT[acc])?;
+            // SAFETY: pte_p points into guest RAM (checked above). Fast-path
+            // aligned host pointers (the common case) without assuming Cpu::new's
+            // caller aligned `ram`.
+            let pte = unsafe {
+                if (pte_p as usize) & 3 == 0 { pte_p.read() } else { pte_p.read_unaligned() }
+            };
             if pte & PTE_V == 0 || (pte & PTE_R == 0 && pte & PTE_W != 0) {
                 return Err(PFAULT[acc]);
             }
             if pte & (PTE_R | PTE_X) == 0 {
-                table = ((pte >> 10) as u64) << 12;
+                table_ppn = pte >> 10;
                 continue;
             }
 
@@ -168,15 +176,20 @@ impl Cpu {
 
             let updated = pte | PTE_A | if acc == ACC_W { PTE_D } else { 0 };
             if updated != pte {
-                unsafe { pte_p.write_unaligned(updated) };
+                unsafe {
+                    if (pte_p as usize) & 3 == 0 {
+                        pte_p.write(updated);
+                    } else {
+                        pte_p.write_unaligned(updated);
+                    }
+                }
             }
 
-            let mut p = (ppn as u64) << 12;
-            p |= if level == 1 { (va & 0x3F_FFFF) as u64 } else { (va & PAGE_MASK) as u64 };
-            if p >> 32 != 0 {
+            if ppn >> 20 != 0 {
                 return Err(AFAULT[acc]);
             }
-            return Ok(p as u32);
+            let p = (ppn << 12) | if level == 1 { va & 0x3F_FFFF } else { va & PAGE_MASK };
+            return Ok(p);
         }
         Err(PFAULT[acc])
     }
@@ -188,13 +201,13 @@ impl Cpu {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn tlb_refill(&mut self, va: u32, acc: usize) -> Option<usize> {
         let smc = self.smc_page;
-        match self.tlb_fill(va, acc) {
-            Ok((_, Some(h))) if self.tlb_lookup(va, acc).is_some() => Some(h),
-            _ => {
-                self.smc_page = smc;
-                None
-            }
-        }
+        self.smc_page = None;
+        let res = match self.tlb_fill(va, acc) {
+            Ok((_, Some(h))) if self.smc_page.is_none() => Some(h),
+            _ => None,
+        };
+        self.smc_page = smc;
+        res
     }
 
     /// TLB miss: translate and, if the target is RAM, install an entry.
@@ -253,7 +266,9 @@ impl Cpu {
             return Ok(unsafe {
                 match size {
                     1 => *(h as *const u8) as u32,
+                    2 if h & 1 == 0 => *(h as *const u16) as u32,
                     2 => (h as *const u16).read_unaligned() as u32,
+                    _ if h & 3 == 0 => *(h as *const u32),
                     _ => (h as *const u32).read_unaligned(),
                 }
             });
@@ -282,7 +297,9 @@ impl Cpu {
             unsafe {
                 match size {
                     1 => *(h as *mut u8) = val as u8,
+                    2 if h & 1 == 0 => *(h as *mut u16) = val as u16,
                     2 => (h as *mut u16).write_unaligned(val as u16),
+                    _ if h & 3 == 0 => *(h as *mut u32) = val,
                     _ => (h as *mut u32).write_unaligned(val),
                 }
             }
@@ -318,7 +335,9 @@ impl Cpu {
             },
         };
         // SAFETY: h is within a RAM page; pc is 4-aligned (checked at jumps).
-        let insn = unsafe { (h as *const u32).read_unaligned() };
+        let insn = unsafe {
+            if h & 3 == 0 { (h as *const u32).read() } else { (h as *const u32).read_unaligned() }
+        };
         Ok((insn, self.host_off(h)))
     }
 }

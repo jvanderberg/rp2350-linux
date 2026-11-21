@@ -1,0 +1,7 @@
+@name The GPIO Pier
+@exit west sram
+@look pins Thirty of them, numbered. Pin 25 has a little lighthouse on it that blinks once a second, as is tradition.
+@look sea Out there is the Real World: five volts in places, and no pull-ups. Best not to fall in.
+A long pier juts out of the chip and into the hazy analogue |11sea|07. Thirty
+numbered |14pins|07 line its edge like mooring posts, some driven high, some low,
+most just floating. Signals come and go with the tide.

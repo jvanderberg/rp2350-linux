@@ -347,10 +347,8 @@ fn classify(insn: u32, pc: u32, sup: bool) -> Kind {
 }
 
 /// Pass 1 of translation: the extent of the block starting at `pc0`, and
-/// the kind of each instruction (pass 2 reads the instructions again).
+/// the kind and raw word of each instruction.
 struct Scan {
-    /// host address of the instruction at `pc0`
-    host0: usize,
     n: usize,
     /// kind of the last instruction (Interp if n == 0)
     last: Kind,
@@ -365,9 +363,76 @@ fn insn_at(host0: usize, k: usize) -> u32 {
     unsafe { ((host0 + 4 * k) as *const u32).read() }
 }
 
-/// Kinds of a block's instructions; scan() writes the first `n` (left
-/// uninitialized otherwise: zero-filling it cost more than the scan).
+/// Kinds and raw words of a block's instructions; scan() writes the first `n`
+/// (left uninitialized otherwise: zero-filling it cost more than the scan).
 type Kinds = [MaybeUninit<Kind>; MAX_BLOCK];
+type Insns = [MaybeUninit<u32>; MAX_BLOCK];
+
+/// A contiguous run of >= 2 same-width loads or stores off the same non-spilled
+/// base register that can share one page-crossing check and one TLB lookup.
+struct MemRun {
+    len: usize,
+    store: bool,
+    base: u32,
+    min_imm: i32,
+    span: i32,
+    max_lg: usize,
+}
+
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+#[inline(never)]
+fn coalesce_run(insns: &Insns, kinds: &Kinds, start: usize, n: usize) -> Option<MemRun> {
+    if start + 1 >= n {
+        return None;
+    }
+    // SAFETY: scan() initialized kinds[..n] and insns[..n].
+    let k0 = unsafe { kinds[start].assume_init() };
+    if unsafe { kinds[start + 1].assume_init() } != k0 {
+        return None;
+    }
+    let store = match k0 {
+        Kind::Load => false,
+        Kind::Store => true,
+        _ => return None,
+    };
+    let insn0 = unsafe { insns[start].assume_init() };
+    let base = (insn0 >> 15) & 31;
+    if base == 0 || spilled(base) || (!store && ((insn0 >> 7) & 31) == base) {
+        return None;
+    }
+    let imm0 = if store { imm_s(insn0) } else { imm_i(insn0) };
+    let lg0 = ((insn0 >> 12) & 3) as usize;
+    let sz0 = 1i32 << lg0;
+    let align_mask = sz0 - 1;
+    let mut min_imm = imm0;
+    let mut max_end = imm0 + sz0;
+    let mut len = 1usize;
+    while start + len < n {
+        if unsafe { kinds[start + len].assume_init() } != k0 {
+            break;
+        }
+        let ij = unsafe { insns[start + len].assume_init() };
+        if ((ij >> 15) & 31) != base || (((ij >> 12) & 3) as usize) != lg0 {
+            break;
+        }
+        let immj = if store { imm_s(ij) } else { imm_i(ij) };
+        if (immj - imm0) & align_mask != 0 {
+            break;
+        }
+        let new_min = min_imm.min(immj);
+        let new_max_end = max_end.max(immj + sz0);
+        if new_max_end - new_min > 2048 {
+            break;
+        }
+        min_imm = new_min;
+        max_end = new_max_end;
+        len += 1;
+        if !store && ((ij >> 7) & 31) == base {
+            break;
+        }
+    }
+    (len >= 2).then_some(MemRun { len, store, base, min_imm, span: max_end - min_imm, max_lg: lg0 })
+}
 
 /// A translated LR.W / SC.W (out of line like `emit_csr`; not in the hot
 /// code, as blocks with LR/SC are few: with `AmoLock` it runs holding the
@@ -603,19 +668,21 @@ fn emit_csr<'a>(mut a: Asm<'a>, r: &Routines, insn: u32, pc: u32, left: usize) -
 }
 
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-fn scan(cpu: &Cpu, pc0: u32, pa0: u32, kinds: &mut Kinds) -> Scan {
+fn scan(cpu: &Cpu, pc0: u32, pa0: u32, kinds: &mut Kinds, insns: &mut Insns) -> Scan {
     let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
     // instructions left in the page
     let max = (((0x1000 - (pc0 & 0xFFF)) >> 2) as usize).min(MAX_BLOCK);
     let sup = cpu.privilege == Priv::S;
     // header, prologue and the closing jump
-    let mut s = Scan { host0, n: 0, last: Kind::Interp, end_interp: false };
+    let mut s = Scan { n: 0, last: Kind::Interp, end_interp: false };
     while s.n < max {
-        let k = classify(insn_at(host0, s.n), pc0.wrapping_add(4 * s.n as u32), sup);
+        let insn = insn_at(host0, s.n);
+        let k = classify(insn, pc0.wrapping_add(4 * s.n as u32), sup);
         if k == Kind::Interp {
             s.end_interp = true;
             break;
         }
+        insns[s.n] = MaybeUninit::new(insn);
         kinds[s.n] = MaybeUninit::new(k);
         s.last = k;
         s.n += 1;
@@ -801,6 +868,9 @@ pub struct Jit<'m> {
     /// Store/AMO fault. With one guest hart and no host interrupts the plain
     /// sequence is equivalent. Set before running any code.
     pub native_amo: bool,
+    /// Collect per-phase host instruction counts (`minstret`) and interpreted
+    /// opcode histograms. Turn off when those stats aren't read.
+    pub profile: bool,
     /// set while `block_info` measures a block: translate without side effects
     measure_only: bool,
     pub stats: JitStats,
@@ -944,6 +1014,7 @@ impl<'m> Jit<'m> {
             holder: core::ptr::null(),
             budget_cap: BUDGET_CAP,
             native_amo: true,
+            profile: true,
             measure_only: false,
             stats: JitStats::default(),
         };
@@ -1156,9 +1227,8 @@ impl<'m> Jit<'m> {
         a.srli(K2, K2, 12);
         let miss1 = a.branch_fwd(1, K2, ZERO);
         a.lw(K3, K1, OFF_ADDEND); // fetch-TLB addend for the target page
-        a.srli(K1, K0, 2);
-        a.slli(K1, K1, 32 - jc_bits);
-        a.srli(K1, K1, 32 - jc_bits - 4); // index * 16
+        a.slli(K1, K0, 30 - jc_bits);
+        a.srli(K1, K1, 28 - jc_bits); // index * 16 (K0 is 4-aligned)
         a.lw(K2, S, OFF_JC);
         a.add(K1, K1, K2);
         a.lw(K2, K1, 0);
@@ -1200,9 +1270,8 @@ impl<'m> Jit<'m> {
         a.addi(K2, K2, (4 * ENTRY_OFF) as i32);
         a.li(K1, self.ram_off);
         a.add(K3, K3, K1); // the addend again
-        a.srli(K1, K0, 2);
-        a.slli(K1, K1, 32 - jc_bits);
-        a.srli(K1, K1, 32 - jc_bits - 4);
+        a.slli(K1, K0, 30 - jc_bits);
+        a.srli(K1, K1, 28 - jc_bits);
         // (exit_info is free until the exit routine writes it)
         a.sw(K3, S, OFF_EXIT_INFO);
         a.lw(K3, S, OFF_JC);
@@ -1235,6 +1304,35 @@ impl<'m> Jit<'m> {
         for store in 0..2 {
             for lg in 0..3 {
                 r.helper[store][lg] = a.pos();
+                #[cfg(feature = "zbb")]
+                if lg > 0 {
+                    // Fold the alignment check into the TLB tag check using Zbb `rori`:
+                    // tag has low 12 bits 0, so (K0 ^ tag) has page-diff in [31:12] and
+                    // misalign bits in [lg-1:0]. rori 12 then slli (12 - lg) shifts out
+                    // the in-page offset bits [11:lg], leaving non-zero iff miss or misalign.
+                    a.srli(K1, K0, 9);
+                    a.andi(K1, K1, 0x7F8);
+                    a.lw(K2, S, off_tlb_cur(if store == 1 { ACC_W } else { ACC_R }));
+                    a.add(K1, K1, K2);
+                    a.lw(K2, K1, 0);
+                    a.xor(K2, K0, K2);
+                    a.rori(K2, K2, 12);
+                    a.slli(K2, K2, 12 - lg as u32);
+                    let m = a.branch_fwd(1, K2, ZERO);
+                    a.lw(K1, K1, OFF_ADDEND);
+                    a.add(K0, K0, K1);
+                    a.jalr(ZERO, K3, 0);
+                    let here = a.pos();
+                    a.fix(m, here);
+                    a.andi(K2, K0, (1 << lg) - 1);
+                    let mis = a.branch_fwd(1, K2, ZERO);
+                    a.addi(K1, ZERO, if store == 1 { ACC_W } else { ACC_R } as i32);
+                    jump!(refill);
+                    let here = a.pos();
+                    a.fix(mis, here);
+                    jump!(r.mem_miss);
+                    continue;
+                }
                 let misaligned = if lg > 0 {
                     a.andi(K2, K0, (1 << lg) - 1);
                     Some(a.branch_fwd(1, K2, ZERO))
@@ -1524,7 +1622,7 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
-        let t0 = host_instret();
+        let t0 = if self.profile { host_instret() } else { 0 };
         let r = if self.store.nidx == 0 {
             self.translate_inner(cpu, pc0, pa0)
         } else if let Some(e) = self.store_find(cpu, pc0, pa0) {
@@ -1536,7 +1634,9 @@ impl<'m> Jit<'m> {
             }
             r
         };
-        self.stats.h_translate += host_instret() - t0;
+        if self.profile {
+            self.stats.h_translate += host_instret() - t0;
+        }
         r
     }
 
@@ -1670,25 +1770,46 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         let cold_lock = self.amo_lock.map(|l| l.spin);
+        // Protect the page from writes across all harts BEFORE snapshotting
+        // guest instructions into `insns`, so a concurrent peer store cannot
+        // slip between `scan` and `mark_code_page` without invalidating it.
+        if !self.measure_only {
+            self.mark_code_page(cpu, pa0);
+        }
         // pass 1: find the block
         let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
-        let Scan { host0, n, last, end_interp } = scan(cpu, pc0, pa0, &mut kinds);
-        let pc = pc0.wrapping_add(4 * n as u32);
+        let mut insns: Insns = [MaybeUninit::uninit(); MAX_BLOCK];
+        let mut sc = scan(cpu, pc0, pa0, &mut kinds, &mut insns);
 
         // (no-code blocks are not kept: scanning one instruction again is
         // about as cheap as looking it up)
-        if n == 0 {
+        if sc.n == 0 {
             return NO_CODE;
         }
         // room for the worst case (measuring never keeps the block)
         if !self.measure_only {
-            self.make_room(n * MAX_WORDS + 16 + ENTRY_OFF);
+            let flushes = self.stats.flushes;
+            self.make_room(sc.n * MAX_WORDS + 16 + ENTRY_OFF);
+            // A full flush (regions == 1) clears `code_pages`, so re-protect
+            // and re-scan before emitting.
+            if self.stats.flushes != flushes {
+                self.mark_code_page(cpu, pa0);
+                sc = scan(cpu, pc0, pa0, &mut kinds, &mut insns);
+                if sc.n == 0 {
+                    return NO_CODE;
+                }
+            }
         }
-        if !self.measure_only {
-            self.mark_code_page(cpu, pa0);
-        }
+        let Scan { n, last, end_interp } = sc;
+        let pc = pc0.wrapping_add(4 * n as u32);
 
         let r = &self.r;
+        let eager_chain = !self.measure_only && self.store.nidx == 0;
+        let bucket_shift = self.bucket_shift;
+        let code_start = self.code_start;
+        let buckets = &self.buckets;
+        let ring = &mut self.ring;
+        let mut eager_chains = 0u64;
         let mut a = Asm::at(self.code, self.code_base, self.pos);
 
         // `jal link, routine` (the buffer is at most 1 MiB, so always in range)
@@ -1710,20 +1831,106 @@ impl<'m> Jit<'m> {
         a.addi(KB, KB, -(n as i32));
         a.emit(b_type(4, KB, ZERO, -8));
         let same_page = |t: u32| t & !0xFFF == pc0 & !0xFFF;
-        // jump to a known guest pc: chainable slot if same page, else jump cache
+        // jump to a known guest pc: chain immediately if same-page target is
+        // already in the code cache (or this block), else chain_req / ijmp_imm.
+        #[inline(never)]
+        #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+        fn emit_goto(
+            a: &mut Asm<'_>,
+            r: &Routines,
+            ring: &mut Ring<'_>,
+            buckets: &[u32],
+            bucket_shift: u32,
+            code_start: usize,
+            pc0: u32,
+            pa0: u32,
+            start: usize,
+            eager_chain: bool,
+            eager_chains: &mut u64,
+            t: u32,
+        ) {
+            if t & !0xFFF == pc0 & !0xFFF {
+                let slot = a.pos();
+                let mut chained = false;
+                if eager_chain {
+                    let target_code = if t == pc0 {
+                        Some(start)
+                    } else {
+                        let pa_t = (pa0 & !0xFFF) | (t & 0xFFF);
+                        let b = ((t >> 2) ^ (pa_t >> 12)).wrapping_mul(HASH_MUL) as usize >> bucket_shift;
+                        let mut i = buckets[b];
+                        let mut found = None;
+                        while i != EMPTY {
+                            let h = i as usize;
+                            if a.word(h + HDR_VA) == t && a.word(h + HDR_PA) == pa_t {
+                                found = Some(h + ENTRY_OFF);
+                                break;
+                            }
+                            i = a.word(h + HDR_NEXT);
+                        }
+                        found
+                    };
+                    if let Some(code) = target_code {
+                        let off = (code as isize - slot as isize) * 4;
+                        if (-(1 << 20)..(1 << 20)).contains(&off) {
+                            let mut can_chain = true;
+                            if ring.regions > 1 && t != pc0 {
+                                let src = (slot - code_start) / ring.region_words;
+                                let dst = (code - code_start) / ring.region_words;
+                                if ring.seq[dst] < ring.seq[src] {
+                                    let nl = ring.nlog[dst] as usize;
+                                    if nl == ring.log_per {
+                                        can_chain = false;
+                                    } else {
+                                        ring.log[dst * ring.log_per + nl] = slot as u32;
+                                        ring.nlog[dst] += 1;
+                                    }
+                                }
+                            }
+                            if can_chain {
+                                a.emit(j_type(ZERO, off as i32));
+                                chained = true;
+                                *eager_chains += 1;
+                            }
+                        }
+                    }
+                }
+                if !chained {
+                    let off = (r.chain_req as isize - a.pos() as isize) * 4;
+                    a.emit(j_type(K1, off as i32));
+                }
+            } else {
+                let off = (r.ijmp_imm as isize - a.pos() as isize) * 4;
+                a.emit(j_type(K1, off as i32));
+            }
+            a.emit(t);
+        }
+        let _ = same_page;
         macro_rules! goto_pc {
-            ($target:expr) => {{
-                let t: u32 = $target;
-                call!(K1, if same_page(t) { r.chain_req } else { r.ijmp_imm });
-                a.emit(t);
-            }};
+            ($target:expr) => {
+                emit_goto(
+                    &mut a,
+                    r,
+                    ring,
+                    buckets,
+                    bucket_shift,
+                    code_start,
+                    pc0,
+                    pa0,
+                    start,
+                    eager_chain,
+                    &mut eager_chains,
+                    $target,
+                )
+            };
         }
 
-        for (k, kind) in kinds[..n].iter().enumerate() {
-            let insn = insn_at(host0, k);
+        let mut k = 0;
+        while k < n {
+            // SAFETY: scan() wrote insns[..n] and kinds[..n].
+            let insn = unsafe { insns[k].assume_init() };
             let pc = pc0.wrapping_add(4 * k as u32);
-            // SAFETY: scan() wrote kinds[..n].
-            let kind = unsafe { kind.assume_init() };
+            let kind = unsafe { kinds[k].assume_init() };
             let rd = (insn >> 7) & 31;
             let rs1 = (insn >> 15) & 31;
             let rs2 = (insn >> 20) & 31;
@@ -1758,6 +1965,40 @@ impl<'m> Jit<'m> {
                     }
                 }
                 Kind::Load | Kind::Store => {
+                    if let Some(run) = coalesce_run(&insns, &kinds, k, n) {
+                        a.addi(K0, run.base, run.min_imm);
+                        a.addi(K1, K0, run.span - 1);
+                        a.xor(K1, K1, K0);
+                        a.srli(K1, K1, 12);
+                        a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
+                        call!(K3, r.mem_miss);
+                        call!(K3, r.helper[run.store as usize][run.max_lg]);
+                        for j in k..k + run.len {
+                            let jinsn = unsafe { insns[j].assume_init() };
+                            let jf3 = (jinsn >> 12) & 7;
+                            let jimm = if run.store { imm_s(jinsn) } else { imm_i(jinsn) };
+                            let off = jimm - run.min_imm;
+                            if run.store {
+                                let jrs2 = (jinsn >> 20) & 31;
+                                if spilled(jrs2) {
+                                    a.lw(K1, S, xoff(jrs2));
+                                    a.store(jf3, K1, K0, off);
+                                } else {
+                                    a.store(jf3, jrs2, K0, off);
+                                }
+                            } else {
+                                let jrd = (jinsn >> 7) & 31;
+                                if spilled(jrd) {
+                                    a.load(jf3, K1, K0, off);
+                                    a.sw(K1, S, xoff(jrd));
+                                } else {
+                                    a.load(jf3, jrd, K0, off);
+                                }
+                            }
+                        }
+                        k += run.len;
+                        continue;
+                    }
                     let store = kind == Kind::Store;
                     let imm = if store { imm_s(insn) } else { imm_i(insn) };
                     if spilled(rs1) {
@@ -1813,13 +2054,19 @@ impl<'m> Jit<'m> {
                     goto_pc!(pc.wrapping_add(imm_j(insn) as u32));
                 }
                 Kind::Jalr => {
+                    let imm = imm_i(insn);
                     if spilled(rs1) {
                         a.lw(K0, S, xoff(rs1));
-                        a.addi(K0, K0, imm_i(insn));
+                        if imm != 0 {
+                            a.addi(K0, K0, imm);
+                        }
+                        a.andi(K0, K0, -2);
+                    } else if imm == 0 {
+                        a.andi(K0, rs1, -2);
                     } else {
-                        a.addi(K0, rs1, imm_i(insn));
+                        a.addi(K0, rs1, imm);
+                        a.andi(K0, K0, -2);
                     }
-                    a.andi(K0, K0, -2);
                     // misaligned target: let the interpreter raise it
                     a.andi(K1, K0, 2);
                     a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
@@ -1849,15 +2096,13 @@ impl<'m> Jit<'m> {
                     }
                 }
                 Kind::Amo => {
-                    // misaligned AMOs and every slow case go to the interpreter
+                    // helper[1][2] already sends misaligned addresses (K0 & 3 != 0)
+                    // and slow cases to mem_miss -> interpreter.
                     if spilled(rs1) {
                         a.lw(K0, S, xoff(rs1));
                     } else {
                         a.addi(K0, rs1, 0);
                     }
-                    a.andi(K1, K0, 3);
-                    a.emit(b_type(0, K1, ZERO, 8)); // beq K1, zero, +8
-                    call!(K3, r.mem_miss);
                     call!(K3, r.helper[1][2]);
                     let locked = r.amo_begin != 0 && !self.native_amo;
                     if locked {
@@ -1925,6 +2170,7 @@ impl<'m> Jit<'m> {
                 }
                 Kind::Interp => unreachable!(),
             }
+            k += 1;
         }
 
         // block end without a terminator
@@ -1945,6 +2191,7 @@ impl<'m> Jit<'m> {
         self.stats.blocks += 1;
         self.stats.guest_insns_translated += n as u64;
         self.stats.code_words += (end - header) as u64;
+        self.stats.chains += eager_chains;
         self.insert(pc0, pa0, header);
         start as u32
     }
@@ -1953,14 +2200,18 @@ impl<'m> Jit<'m> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn interp<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
-        let t0 = host_instret();
+        let t0 = if self.profile { host_instret() } else { 0 };
         self.interp_inner(cpu, bus);
-        self.stats.h_interp += host_instret() - t0;
+        if self.profile {
+            self.stats.h_interp += host_instret() - t0;
+        }
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn interp_inner<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) {
-        if let Ok((_, h)) = cpu.translate_pc(cpu.pc) {
+        if self.profile
+            && let Ok((_, h)) = cpu.translate_pc(cpu.pc)
+        {
             // SAFETY: h is a host pointer into guest RAM from the fetch TLB.
             let op = unsafe { (h as *const u32).read() } & 0x7F;
             self.stats.interp_op[op as usize] += 1;
@@ -2057,7 +2308,6 @@ impl<'m> Jit<'m> {
     /// (TLB miss, MMIO, fault, misaligned access or jump target): set
     /// `exit_pc` to its instruction and refund the budget for the
     /// instructions from that one to the end of the block, which did not run.
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn mem_exit(&mut self, cpu: &mut Cpu, ret: usize) {
         let site = (ret - self.code_base) / 4 - 1;
         // back to the block's `jal K1, budget_exit`: no other word is a jal
@@ -2077,16 +2327,27 @@ impl<'m> Jit<'m> {
             Some(pa) => pa,
             None => cpu.translate_pc(pc0).map(|(pa, _)| pa).expect("mem exit: block page unmapped"),
         };
-        let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
-        let (mut k, mut seen) = (0u32, 0usize);
-        loop {
-            // SAFETY: instruction k of the block, in the same guest RAM page.
-            let insn = unsafe { ((host0 + 4 * k as usize) as *const u32).read() };
-            let locked = self.r.amo_begin != 0;
-            seen += match classify(insn, pc0.wrapping_add(4 * k), cpu.privilege == Priv::S) {
+        let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
+        let mut insns: Insns = [MaybeUninit::uninit(); MAX_BLOCK];
+        let sc = scan(cpu, pc0, pa0, &mut kinds, &mut insns);
+        let locked = self.r.amo_begin != 0;
+        let (mut k, mut seen) = (0usize, 0usize);
+        while k < sc.n {
+            if let Some(run) = coalesce_run(&insns, &kinds, k, sc.n) {
+                seen += 2;
+                if seen > before {
+                    break;
+                }
+                k += run.len;
+                continue;
+            }
+            // SAFETY: scan() initialized kinds[..sc.n] and insns[..sc.n].
+            let insn = unsafe { insns[k].assume_init() };
+            let kind = unsafe { kinds[k].assume_init() };
+            seen += match kind {
                 Kind::Load | Kind::Store | Kind::Jalr => 1,
-                Kind::Amo if locked && !self.native_amo => 4,
-                Kind::Amo => 2,
+                Kind::Amo if locked && !self.native_amo => 3,
+                Kind::Amo => 1,
                 Kind::Csr => csr_sites(insn),
                 // SC: the helper, the lock, two unlocks
                 Kind::LrSc if locked && insn >> 27 == 3 => 4,
@@ -2098,17 +2359,19 @@ impl<'m> Jit<'m> {
             }
             k += 1;
         }
-        cpu.jit.exit_pc = pc0.wrapping_add(4 * k);
-        cpu.jit.budget += (n - k) as i32;
+        cpu.jit.exit_pc = pc0.wrapping_add(4 * k as u32);
+        cpu.jit.budget += (n - k as u32) as i32;
     }
 
     /// One dispatcher step: take an interrupt, interpret one instruction, or
     /// run translated code until it exits.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn run_one<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B) -> Event {
-        let t0 = host_instret();
+        let t0 = if self.profile { host_instret() } else { 0 };
         let ev = self.run_one_inner(cpu, bus);
-        self.stats.h_total += host_instret() - t0;
+        if self.profile {
+            self.stats.h_total += host_instret() - t0;
+        }
         ev
     }
 
@@ -2159,12 +2422,14 @@ impl<'m> Jit<'m> {
         cpu.jit.budget = budget;
         // SAFETY: `enter` is the trampoline emitted in emit_prelude; the code
         // it jumps to was produced by `translate`.
-        let t0 = host_instret();
+        let t0 = if self.profile { host_instret() } else { 0 };
         unsafe {
             let enter: EnterFn = core::mem::transmute(self.enter);
             enter(cpu, self.code_addr(code));
         }
-        self.stats.h_code += host_instret() - t0;
+        if self.profile {
+            self.stats.h_code += host_instret() - t0;
+        }
         let info = cpu.jit.exit_info;
         if info & 3 == EXIT_MEM {
             self.mem_exit(cpu, (info & !3) as usize);
@@ -2259,14 +2524,16 @@ impl<'m> Jit<'m> {
         let enter = self.enter;
         smp.in_code[h].store(1, Ordering::Relaxed);
         smp.unlock();
-        let t0 = host_instret();
+        let t0 = if self.profile { host_instret() } else { 0 };
         // SAFETY: as in `run_one_inner`; the blocks stay while this hart is
         // in code (`wait_others_out`).
         unsafe {
             let enter: EnterFn = core::mem::transmute(enter);
             enter(cpu, entry);
         }
-        self.stats.h_code += host_instret() - t0;
+        if self.profile {
+            self.stats.h_code += host_instret() - t0;
+        }
         let info = cpu.jit.exit_info;
         // (reads the block it left: still in code, so it stays)
         if info & 3 == EXIT_MEM {
@@ -2304,7 +2571,7 @@ impl<'m> Jit<'m> {
     /// `block_info`, plus the words the translator emits for the block and
     /// the word index they were emitted at (valid until the next translation).
     pub fn block_code(&mut self, cpu: &mut Cpu, va: u32, pa: u32) -> (BlockInfo, &[u32], usize) {
-        let sc = scan(cpu, va, pa, &mut [MaybeUninit::uninit(); MAX_BLOCK]);
+        let sc = scan(cpu, va, pa, &mut [MaybeUninit::uninit(); MAX_BLOCK], &mut [MaybeUninit::uninit(); MAX_BLOCK]);
         let end = match sc.n {
             0 => BlockEnd::Interp,
             _ => match sc.last {

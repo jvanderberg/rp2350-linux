@@ -1,0 +1,10 @@
+@name The SRAM Fields
+@exit south bus
+@exit east gpio
+@look rows Row after row of bits, each one a tiny flip-flop holding its breath. Near the far fence some rows are |12scorched|07.
+@look stack It grows downward from the top of the field. Something has been chewing on the bottom of it.
+@look heap It grows upward. It and the stack eye each other warily across a narrowing gap.
+Flat fields of memory stretch to the horizon in perfect |14rows|07, 520 kilobytes
+of them. A towering |11stack|07 leans in from one side and an untidy |11heap|07 creeps
+in from the other. Everything here is forgotten the moment the power goes,
+and the bits know it. Something has been |12corrupting|07 the crop.

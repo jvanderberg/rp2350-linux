@@ -1,0 +1,8 @@
+@name The Flash Vault
+@exit up bus
+@look shelves Sector after sector, 4096 bytes each. A label reads "ERASE BEFORE WRITING. YES, THE WHOLE SECTOR."
+@look door Four data lines thick, with a chip-select wheel. It is the only thing down here that moves quickly.
+Cold stone steps lead down to the vault where things are kept that must
+survive the dark. |14Shelves|07 of sectors line the walls, every byte |150xFF|07 until
+somebody says otherwise. A heavy quad-SPI |11door|07 stands open. Something small
+is |12gnawing|07 in the corner.

@@ -1,0 +1,64 @@
+; WS2812 (NeoPixel) LEDs: 800 kHz, one pin, colours from the TX FIFO.
+; As the pico-sdk's example: pioasm ws2812.pio ws2812.pio.h
+;
+; The program and ws2812_program_init are pico-examples' pio/ws2812/ws2812.pio
+; (https://github.com/raspberrypi/pico-examples), changed for libpio: the
+; comments, and init returns -1 when a call fails.
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+; SPDX-License-Identifier: BSD-3-Clause
+;
+; Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
+; following conditions are met:
+;
+; 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following
+;    disclaimer.
+;
+; 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following
+;    disclaimer in the documentation and/or other materials provided with the distribution.
+;
+; 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products
+;    derived from this software without specific prior written permission.
+;
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+; INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+; DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+; SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+; SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+; WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+; THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+.program ws2812
+.side_set 1
+
+.define public T1 2
+.define public T2 5
+.define public T3 3
+
+.wrap_target
+bitloop:
+    out x, 1       side 0 [T3 - 1] ; side-set happens even while OUT stalls
+    jmp !x do_zero side 1 [T1 - 1] ; a positive pulse, whatever the bit
+do_one:
+    jmp  bitloop   side 1 [T2 - 1] ; a 1: keep it high
+do_zero:
+    nop            side 0 [T2 - 1] ; a 0: low
+.wrap
+
+% c-sdk {
+static inline int ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq, bool rgbw) {
+    if (pio_gpio_init(pio, pin) < 0)
+        return -1;
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    pio_sm_config c = ws2812_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, false, true, rgbw ? 32 : 24);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    int cycles_per_bit = ws2812_T1 + ws2812_T2 + ws2812_T3;
+    float div = clock_get_hz(clk_sys) / (freq * cycles_per_bit);
+    sm_config_set_clkdiv(&c, div);
+    if (pio_sm_init(pio, sm, offset, &c) < 0)
+        return -1;
+    pio_sm_set_enabled(pio, sm, true);
+    return 0;
+}
+%}
