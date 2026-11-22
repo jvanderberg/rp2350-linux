@@ -25,7 +25,7 @@
 #include <sys/select.h>
 
 #ifndef BBSDIR
-#define BBSDIR "/mnt/sd/rp2350-linux"
+#define BBSDIR "."   /* bbsctl passes the real directory */
 #endif
 #define MAXNODES 8
 #define CHATLOG "data/chat.log"
