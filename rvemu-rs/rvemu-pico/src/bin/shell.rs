@@ -206,12 +206,8 @@ impl NorFlash for BoardNor {
 /// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
 /// The translation threshold's counters (`HOT_COUNTS`) and its cold-block
 /// path take 35 KiB of it; with `async-jit` (no threshold) the translator
-/// service in SRAM takes 5 KiB, and another with `profile`.
-const CODE_KIB: usize = match (cfg!(feature = "async-jit"), cfg!(feature = "profile")) {
-    (true, true) => 315,
-    (true, false) => 316,
-    _ => 286,
-};
+/// service in SRAM takes 3 KiB.
+const CODE_KIB: usize = if cfg!(feature = "async-jit") { 318 } else { 286 };
 const CODE_WORDS: usize = CODE_KIB * 256;
 /// With two harts, the top of the code buffer is hart 1's (in SRAM, as hart
 /// 0's is): its Cpu, its jump cache and the stack core1 runs it on.

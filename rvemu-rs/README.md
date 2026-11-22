@@ -756,8 +756,9 @@ the space stays its own), and inserts under the lock again, dropping the
 block if its page was written meanwhile. Its blocks chain lazily (no eager
 chaining). Core0 runs `run_one_smp`, as with two harts. There is no
 translation threshold (`set_hot`) in this mode: translating costs core0
-nothing, and the counters' 32 KiB do more as code buffer (316 KiB, 315 with
-`profile`). With two harts the feature changes nothing but that.
+nothing, and the counters' 32 KiB do more as code buffer (318 KiB). It is
+on by default (`--no-default-features` for the threshold instead); with two
+harts it changes nothing but that.
 
 On the board (quick runs, one boot each):
 
