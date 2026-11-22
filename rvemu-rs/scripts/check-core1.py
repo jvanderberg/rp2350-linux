@@ -13,6 +13,12 @@ Flash's uncached alias (0x14000000) and SRAM are fine and not listed.
 Cold paths (panics, formatting for RTT, the radio firmware upload, BOOTSEL)
 may stay in flash; anything a poll pass runs must not. Exit status 1 if any
 reference is not to a target matched by COLD below.
+
+Also checks that the translator and the dispatcher (rvjit, and Cpu's own
+methods) are in SRAM: both cores run them outside the XIP lockout's
+spinlock (hart 1 on core1, see smp.rs), where an instruction fetch from
+flash cannot be resumed. Exit status 1 if one is in flash and not in
+FLASH_OK.
 """
 import re
 import subprocess
@@ -40,6 +46,14 @@ COLD = re.compile(
 )
 
 
+# rvjit / Cpu functions that may stay in flash: built once at boot
+# (emit_prelude), run holding the lockout's spinlock (emit_lrsc, under
+# AmoLock), or a native operation, run between Bus::cold_begin and cold_end
+# (pv_buffer).
+MUST_SRAM = re.compile(r"^<?rvjit::|^<rvcore::cpu::Cpu>::")
+FLASH_OK = re.compile(r"rvjit::emit_lrsc$|<rvjit::Jit>::emit_prelude$|<rvcore::cpu::Cpu>::pv_buffer::")
+
+
 def flash(a):
     # the firmware's part of flash (the guest's parts are read through the
     # uncached alias or by core0)
@@ -48,10 +62,13 @@ def flash(a):
 
 def main():
     syms = []
+    funcs = []  # (address, name) of code symbols
     for line in subprocess.run([NM, "-C", "-n", ELF], capture_output=True, text=True, check=True).stdout.splitlines():
         p = line.split(None, 2)
         if len(p) == 3:
             syms.append((int(p[0], 16), p[2]))
+            if p[1] in "tT":
+                funcs.append((int(p[0], 16), p[2]))
 
     def name_at(a):
         best = None
@@ -114,7 +131,12 @@ def main():
         for f in sorted(refs[tgt])[: 4 if not cold else 1]:
             print(f"        from {f[:120]}")
     print(f"check-core1: {len(refs)} flash targets, {hot} not known to be cold")
-    sys.exit(1 if hot else 0)
+
+    misplaced = sorted({n for v, n in funcs if flash(v) and MUST_SRAM.search(n) and not FLASH_OK.search(n)})
+    for n in misplaced:
+        print(f"FLASH {n[:120]}  (translator/dispatcher code must be in SRAM)")
+    print(f"check-core1: {len(misplaced)} translator/dispatcher functions in flash")
+    sys.exit(1 if hot or misplaced else 0)
 
 
 main()

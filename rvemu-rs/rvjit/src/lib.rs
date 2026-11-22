@@ -2308,6 +2308,9 @@ impl<'m> Jit<'m> {
     /// (TLB miss, MMIO, fault, misaligned access or jump target): set
     /// `exit_pc` to its instruction and refund the budget for the
     /// instructions from that one to the end of the block, which did not run.
+    /// (In SRAM: both cores run it outside the XIP lockout's spinlock, see
+    /// rvemu-pico's smp.rs.)
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn mem_exit(&mut self, cpu: &mut Cpu, ret: usize) {
         let site = (ret - self.code_base) / 4 - 1;
         // back to the block's `jal K1, budget_exit`: no other word is a jal

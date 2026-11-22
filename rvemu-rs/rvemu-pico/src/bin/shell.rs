@@ -204,7 +204,7 @@ impl NorFlash for BoardNor {
 /// code and buffers (`core1.rs`), the pin devices and core0's stack (about
 /// 9 KiB, what is left above .bss; `setup` and the run each need about 5-6) have
 /// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
-const CODE_KIB: usize = 322;
+const CODE_KIB: usize = 321;
 const CODE_WORDS: usize = CODE_KIB * 256;
 /// With two harts, the top of the code buffer is hart 1's (in SRAM, as hart
 /// 0's is): its Cpu, its jump cache and the stack core1 runs it on.
