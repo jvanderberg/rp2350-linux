@@ -431,6 +431,7 @@ extern "C" fn main() -> ! {
                     },
                 )
             };
+            jit.profile_phases = option_env!("RVEMU_PHASES").is_some();
             if HOT > 1 {
                 jit.set_hot(unsafe { &mut *addr_of_mut!(HOT_COUNTS) }, HOT.min(255) as u8);
             }
@@ -504,6 +505,12 @@ extern "C" fn main() -> ! {
             println!("host insns per guest insn: total {:.2} = translated code {:.2} + cold {:.2} + interpreter {:.2} + translation {:.2} + dispatch {:.2}",
                 s.h_total as f32 / g, s.h_code as f32 / g, s.h_cold as f32 / g, s.h_interp as f32 / g, s.h_translate as f32 / g,
                 (s.h_total - s.h_code - s.h_cold - s.h_interp - s.h_translate) as f32 / g);
+            let ti = s.guest_insns_translated.max(1) as f32;
+            if jit.profile_phases {
+                println!("translation per translated guest insn: total {:.1} = mark {:.1} + scan {:.1} + room {:.1} + emit {:.1} + fence.i {:.1} + insert {:.1}  (translate() {:.1})",
+                    s.h_tr.iter().sum::<u64>() as f32 / ti, s.h_tr[0] as f32 / ti, s.h_tr[1] as f32 / ti, s.h_tr[2] as f32 / ti,
+                    s.h_tr[3] as f32 / ti, s.h_tr[4] as f32 / ti, s.h_tr[5] as f32 / ti, s.h_translate as f32 / ti);
+            }
             let _ = write!(Out, "interpreted by opcode:");
             for (op, &c) in s.interp_op.iter().enumerate() {
                 if c != 0 {

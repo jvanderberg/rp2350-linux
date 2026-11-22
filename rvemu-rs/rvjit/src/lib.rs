@@ -76,7 +76,8 @@ pub const KB: Reg = 22;
 
 #[inline(always)]
 pub const fn spilled(r: u32) -> bool {
-    r == S || r == K0 || r == K1 || r == K2 || r == K3 || r == KB
+    const M: u32 = 1 << S | 1 << K0 | 1 << K1 | 1 << K2 | 1 << K3 | 1 << KB;
+    (M >> r) & 1 != 0
 }
 
 /// Guest registers held in host registers while in translated code.
@@ -204,6 +205,9 @@ pub struct JitStats {
     pub h_code: u64,
     pub h_cold: u64,
     pub h_total: u64,
+    /// Translation by phase (`profile_phases`): marking the page as code, scanning
+    /// the guest code, making room (evicting), emitting, fence.i, inserting.
+    pub h_tr: [u64; 6],
 }
 
 /// Host retired-instruction counter (0 elsewhere).
@@ -253,6 +257,7 @@ impl Default for JitStats {
             h_code: 0,
             h_cold: 0,
             h_total: 0,
+            h_tr: [0; 6],
         }
     }
 }
@@ -475,8 +480,8 @@ fn emit_lrsc<'a>(mut a: Asm<'a>, r: &Routines, insn: u32) -> Asm<'a> {
     let rs2 = (insn >> 20) & 31;
     macro_rules! call {
         ($link:expr, $to:expr) => {{
-            let off = ($to as isize - a.pos() as isize) * 4;
-            a.emit(j_type($link, off as i32));
+            let off = a.off_to($to);
+            a.emit(j_type($link, off));
         }};
     }
     if spilled(rs1) {
@@ -571,8 +576,8 @@ fn emit_csr<'a>(mut a: Asm<'a>, r: &Routines, insn: u32, pc: u32, left: usize) -
     let f3 = (insn >> 12) & 7;
     macro_rules! call {
         ($link:expr, $to:expr) => {{
-            let off = ($to as isize - a.pos() as isize) * 4;
-            a.emit(j_type($link, off as i32));
+            let off = a.off_to($to);
+            a.emit(j_type($link, off));
         }};
     }
     let csr = insn >> 20;
@@ -707,6 +712,13 @@ fn scan(cpu: &Cpu, pc0: u32, pa0: u32, kinds: &mut Kinds, insns: &mut Insns) -> 
 /// `scan` of the guest code at host address `host0`, in S-mode or not.
 #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
 fn scan_host(host0: usize, pc0: u32, sup: bool, kinds: &mut Kinds, insns: &mut Insns) -> Scan {
+    scan_inline(host0, pc0, sup, kinds, insns)
+}
+
+/// `scan_host`, inlined into the translator (its own call costs a fifth of
+/// a short block's scan).
+#[inline(always)]
+fn scan_inline(host0: usize, pc0: u32, sup: bool, kinds: &mut Kinds, insns: &mut Insns) -> Scan {
     // instructions left in the page
     let max = (((0x1000 - (pc0 & 0xFFF)) >> 2) as usize).min(MAX_BLOCK);
     // header, prologue and the closing jump
@@ -910,6 +922,9 @@ pub struct Jit<'m> {
     /// Collect per-phase host instruction counts (`minstret`) and interpreted
     /// opcode histograms. Turn off when those stats aren't read.
     pub profile: bool,
+    /// Also split translation into phases (`JitStats::h_tr`): costs about
+    /// 70 host instructions a block, so off unless those stats are read.
+    pub profile_phases: bool,
     /// set while `block_info` measures a block: translate without side effects
     measure_only: bool,
     /// Another host core translates (`enable_async`).
@@ -1053,8 +1068,8 @@ fn emit_block(
     // `jal link, routine` (the buffer is at most 1 MiB, so always in range)
     macro_rules! call {
         ($link:expr, $to:expr) => {{
-            let off = ($to as isize - a.pos() as isize) * 4;
-            a.emit(j_type($link, off as i32));
+            let off = a.off_to($to);
+            a.emit(j_type($link, off));
         }};
     }
 
@@ -1067,82 +1082,78 @@ fn emit_block(
     let start = a.pos();
     a.addi(KB, KB, -(n as i32));
     a.emit(b_type(4, KB, ZERO, -8));
-    // jump to a known guest pc: chain immediately if same-page target is
-    // already in the code cache (or this block), else chain_req / ijmp_imm.
+    // Where a jump from word `slot` to the known guest pc `t` (on this
+    // block's page) can go at once: to the target's code if it is already
+    // in the code cache (or is this block) and the chain can be logged.
     #[inline(never)]
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     #[allow(clippy::too_many_arguments)]
-    fn emit_goto(
-        a: &mut Asm<'_>,
-        r: &Routines,
-        eager: &mut Option<Eager<'_, '_>>,
+    fn eager_target(
+        e: &mut Eager<'_, '_>,
+        code: &[u32],
+        slot: usize,
         pc0: u32,
         pa0: u32,
         start: usize,
-        eager_chains: &mut u64,
         t: u32,
-    ) {
-        if t & !0xFFF == pc0 & !0xFFF {
-            let slot = a.pos();
-            let mut chained = false;
-            if let Some(Eager { ring, buckets, bucket_shift, code_start }) = eager {
-                let (bucket_shift, code_start) = (*bucket_shift, *code_start);
-                let target_code = if t == pc0 {
-                    Some(start)
-                } else {
-                    let pa_t = (pa0 & !0xFFF) | (t & 0xFFF);
-                    let b = ((t >> 2) ^ (pa_t >> 12)).wrapping_mul(HASH_MUL) as usize >> bucket_shift;
-                    let mut i = buckets[b];
-                    let mut found = None;
-                    while i != EMPTY {
-                        let h = i as usize;
-                        if a.word(h + HDR_VA) == t && a.word(h + HDR_PA) == pa_t {
-                            found = Some(h + ENTRY_OFF);
-                            break;
-                        }
-                        i = a.word(h + HDR_NEXT);
-                    }
-                    found
-                };
-                if let Some(code) = target_code {
-                    let off = (code as isize - slot as isize) * 4;
-                    if (-(1 << 20)..(1 << 20)).contains(&off) {
-                        let mut can_chain = true;
-                        if ring.regions > 1 && t != pc0 {
-                            let src = (slot - code_start) / ring.region_words;
-                            let dst = (code - code_start) / ring.region_words;
-                            if ring.seq[dst] < ring.seq[src] {
-                                let nl = ring.nlog[dst] as usize;
-                                if nl == ring.log_per {
-                                    can_chain = false;
-                                } else {
-                                    ring.log[dst * ring.log_per + nl] = slot as u32;
-                                    ring.nlog[dst] += 1;
-                                }
-                            }
-                        }
-                        if can_chain {
-                            a.emit(j_type(ZERO, off as i32));
-                            chained = true;
-                            *eager_chains += 1;
-                        }
-                    }
-                }
-            }
-            if !chained {
-                let off = (r.chain_req as isize - a.pos() as isize) * 4;
-                a.emit(j_type(K1, off as i32));
-            }
+    ) -> Option<usize> {
+        let Eager { ring, buckets, bucket_shift, code_start } = e;
+        let word = |i: usize| code.get(i).copied().unwrap_or(0);
+        let target = if t == pc0 {
+            start
         } else {
-            let off = (r.ijmp_imm as isize - a.pos() as isize) * 4;
-            a.emit(j_type(K1, off as i32));
-        }
-        a.emit(t);
-    }
-    macro_rules! goto_pc {
-        ($target:expr) => {
-            emit_goto(&mut a, r, &mut eager, pc0, pa0, start, &mut eager_chains, $target)
+            let pa_t = (pa0 & !0xFFF) | (t & 0xFFF);
+            let b = ((t >> 2) ^ (pa_t >> 12)).wrapping_mul(HASH_MUL) as usize >> *bucket_shift;
+            let mut i = buckets[b];
+            loop {
+                if i == EMPTY {
+                    return None;
+                }
+                let h = i as usize;
+                if word(h + HDR_VA) == t && word(h + HDR_PA) == pa_t {
+                    break h + ENTRY_OFF;
+                }
+                i = word(h + HDR_NEXT);
+            }
         };
+        let off = (target as isize - slot as isize) * 4;
+        if !(-(1 << 20)..(1 << 20)).contains(&off) {
+            return None;
+        }
+        if ring.regions > 1 && t != pc0 {
+            let src = (slot - *code_start) / ring.region_words;
+            let dst = (target - *code_start) / ring.region_words;
+            if ring.seq[dst] < ring.seq[src] {
+                let nl = ring.nlog[dst] as usize;
+                if nl == ring.log_per {
+                    return None;
+                }
+                ring.log[dst * ring.log_per + nl] = slot as u32;
+                ring.nlog[dst] += 1;
+            }
+        }
+        Some(target)
+    }
+    // jump to a known guest pc: chain at once when `eager_target` can, else
+    // chain_req (same page) / ijmp_imm, then the target word.
+    macro_rules! goto_pc {
+        ($target:expr) => {{
+            let t: u32 = $target;
+            let same = t & !0xFFF == pc0 & !0xFFF;
+            let code = match &mut eager {
+                Some(e) if same => eager_target(e, a.words(), a.pos(), pc0, pa0, start, t),
+                _ => None,
+            };
+            let w = match code {
+                Some(c) => {
+                    eager_chains += 1;
+                    j_type(ZERO, a.off_to(c))
+                }
+                None => j_type(K1, a.off_to(if same { r.chain_req } else { r.ijmp_imm })),
+            };
+            a.emit(w);
+            a.emit(t);
+        }};
     }
 
     let mut k = 0;
@@ -1185,7 +1196,9 @@ fn emit_block(
                 }
             }
             Kind::Load | Kind::Store => {
-                if let Some(run) = coalesce_run(insns, kinds, k, n) {
+                // (a run needs the next instruction to be the same kind)
+                let next_same = k + 1 < n && unsafe { kinds[k + 1].assume_init() } == kind;
+                if let Some(run) = if next_same { coalesce_run(insns, kinds, k, n) } else { None } {
                     a.addi(K0, run.base, run.min_imm);
                     a.addi(K1, K0, run.span - 1);
                     a.xor(K1, K1, K0);
@@ -1406,7 +1419,6 @@ fn emit_block(
 
 
     let end = a.pos();
-    assert!(!a.overflowed(), "code buffer overflow");
     (end, start, eager_chains)
 }
 
@@ -1464,6 +1476,7 @@ impl<'m> Jit<'m> {
             budget_cap: BUDGET_CAP,
             native_amo: true,
             profile: true,
+            profile_phases: false,
             measure_only: false,
             async_on: false,
             aq: [(0, 0); AQ_LEN],
@@ -1866,7 +1879,6 @@ impl<'m> Jit<'m> {
             a.jalr(ZERO, K3, 0);
         }
 
-        assert!(!a.overflowed());
         self.enter = self.code_base + enter * 4;
         self.code_start = a.pos();
         self.pos = self.code_start;
@@ -2492,16 +2504,30 @@ impl<'m> Jit<'m> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate_inner(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         let cold_lock = self.amo_lock.map(|l| l.spin);
+        let prof = self.profile_phases && !self.measure_only;
+        let mut tp = if prof { host_instret() } else { 0 };
+        macro_rules! phase {
+            ($i:expr) => {
+                if prof {
+                    let t = host_instret();
+                    self.stats.h_tr[$i] += t - tp;
+                    tp = t;
+                }
+            };
+        }
         // Protect the page from writes across all harts BEFORE snapshotting
         // guest instructions into `insns`, so a concurrent peer store cannot
         // slip between `scan` and `mark_code_page` without invalidating it.
         if !self.measure_only {
             self.mark_code_page(cpu, pa0);
         }
+        phase!(0);
         // pass 1: find the block
         let mut kinds: Kinds = [MaybeUninit::uninit(); MAX_BLOCK];
         let mut insns: Insns = [MaybeUninit::uninit(); MAX_BLOCK];
-        let mut sc = scan(cpu, pc0, pa0, &mut kinds, &mut insns);
+        let host0 = cpu.ram_ptr() as usize + (pa0 - cpu.ram_base()) as usize;
+        let mut sc = scan_inline(host0, pc0, cpu.privilege == Priv::S, &mut kinds, &mut insns);
+        phase!(1);
 
         // (no-code blocks are not kept: scanning one instruction again is
         // about as cheap as looking it up)
@@ -2522,6 +2548,7 @@ impl<'m> Jit<'m> {
                 }
             }
         }
+        phase!(2);
         let n = sc.n;
         let eager = (!self.measure_only && self.store.nidx == 0).then_some(Eager {
             ring: &mut self.ring,
@@ -2534,13 +2561,17 @@ impl<'m> Jit<'m> {
         let (end, start, eager_chains) =
             emit_block(a, &self.r, self.native_amo, cold_lock, eager, pc0, pa0, &insns, &kinds, sc);
         self.pos = end;
+        phase!(3);
         fence_i();
+        phase!(4);
 
         self.stats.blocks += 1;
         self.stats.guest_insns_translated += n as u64;
         self.stats.code_words += (end - header) as u64;
         self.stats.chains += eager_chains;
         self.insert(pc0, pa0, header);
+        phase!(5);
+        let _ = tp;
         start as u32
     }
 

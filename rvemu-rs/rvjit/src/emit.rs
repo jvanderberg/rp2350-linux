@@ -1,5 +1,7 @@
 //! RV32I instruction encoder writing into a word buffer.
 
+use core::marker::PhantomData;
+
 pub type Reg = u32;
 pub const ZERO: Reg = 0;
 pub const RA: Reg = 1;
@@ -52,32 +54,50 @@ pub const fn fits_i12(v: i32) -> bool {
 
 /// Word-addressed code emitter. `base` is the host address of `buf[0]`.
 pub struct Asm<'a> {
-    buf: &'a mut [u32],
+    /// `buf[0]`, the next word, one past the end
+    start: *mut u32,
+    cur: *mut u32,
+    end: *mut u32,
     base: usize,
-    pos: usize,
-    overflow: bool,
+    _buf: PhantomData<&'a mut [u32]>,
+}
+
+/// A write past the end of the buffer: callers reserve room first.
+#[cold]
+#[inline(never)]
+#[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+fn overflow() -> ! {
+    panic!("code buffer overflow")
 }
 
 impl<'a> Asm<'a> {
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn new(buf: &'a mut [u32], base: usize) -> Self {
-        Asm { buf, base, pos: 0, overflow: false }
+        Self::at(buf, base, 0)
     }
 
     /// Continue emitting at word `pos` of `buf`.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn at(buf: &'a mut [u32], base: usize, pos: usize) -> Self {
-        Asm { buf, base, pos, overflow: false }
+        assert!(pos <= buf.len());
+        let r = buf.as_mut_ptr_range();
+        // SAFETY: pos is within the buffer (or one past it).
+        Asm { start: r.start, cur: unsafe { r.start.add(pos) }, end: r.end, base, _buf: PhantomData }
     }
 
     /// Number of words emitted.
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    #[inline(always)]
     pub fn pos(&self) -> usize {
-        self.pos
+        (self.cur as usize - self.start as usize) / 4
     }
-    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    pub fn overflowed(&self) -> bool {
-        self.overflow
+    #[inline(always)]
+    fn len(&self) -> usize {
+        (self.end as usize - self.start as usize) / 4
+    }
+    /// Byte offset from the next word to word `to` (for a pc-relative jump).
+    #[inline(always)]
+    pub fn off_to(&self, to: usize) -> i32 {
+        (self.start as usize + to * 4).wrapping_sub(self.cur as usize) as i32
     }
     /// Host address of word `pos`.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
@@ -87,26 +107,37 @@ impl<'a> Asm<'a> {
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn emit(&mut self, w: u32) -> usize {
-        let p = self.pos;
-        if p < self.buf.len() {
-            self.buf[p] = w;
-        } else {
-            self.overflow = true;
+        if self.cur == self.end {
+            overflow();
         }
-        self.pos += 1;
+        let p = self.pos();
+        // SAFETY: cur is inside the buffer `at` borrowed.
+        unsafe {
+            self.cur.write(w);
+            self.cur = self.cur.add(1);
+        }
         p
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn patch(&mut self, pos: usize, w: u32) {
-        if pos < self.buf.len() {
-            self.buf[pos] = w;
+        if pos < self.len() {
+            // SAFETY: in bounds.
+            unsafe { self.start.add(pos).write(w) }
         }
+    }
+
+    /// The whole buffer.
+    #[inline(always)]
+    pub fn words(&self) -> &[u32] {
+        // SAFETY: the buffer `at` borrowed; no writes while this lives.
+        unsafe { core::slice::from_raw_parts(self.start, self.len()) }
     }
 
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     pub fn word(&self, pos: usize) -> u32 {
-        self.buf.get(pos).copied().unwrap_or(0)
+        // SAFETY: in bounds.
+        if pos < self.len() { unsafe { self.start.add(pos).read() } } else { 0 }
     }
 
     // ---- common instructions
