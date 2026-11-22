@@ -2274,6 +2274,7 @@ impl<'m> Jit<'m> {
     /// Queue block (`va`, `pa`) for the other core (lock held). One queued
     /// lately (a loop being interpreted comes back to it) moves to the top.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    #[allow(clippy::modulo_one)] // AQ_LEN is 1 without the `async` feature
     fn async_push(&mut self, va: u32, pa: u32, sup: bool) {
         let e = (va, pa | u32::from(sup));
         for i in 0..self.aq_len.min(4) {
@@ -2302,6 +2303,7 @@ impl<'m> Jit<'m> {
     /// is left or `more` (asked after each) says to stop. True if blocks
     /// are still waiting.
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    #[allow(clippy::modulo_one)] // AQ_LEN is 1 without the `async` feature
     pub fn async_serve(&mut self, mut more: impl FnMut() -> bool) -> bool {
         // SAFETY: `enable_async` set `smp`, which outlives the translator.
         let smp = unsafe { &*self.smp };
