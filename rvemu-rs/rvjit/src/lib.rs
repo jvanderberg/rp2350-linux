@@ -43,6 +43,13 @@
 //! chain request when the region is evicted; chains into the same or a newer
 //! region need nothing, because the source is evicted first.
 //!
+//! Optionally (`Jit::set_hot`) a block is translated only once the
+//! dispatcher has missed it `threshold` times; until then `Cpu::run_block`
+//! interprets it with the same semantics as translated code (no traps, no
+//! interrupt checks, the same exits). The counts are saturating bytes in a
+//! table hashed by (virtual pc, physical pc), and are never reset, so a hot
+//! block evicted from the code buffer is translated again at once.
+//!
 //! Optionally every translated block is also appended to a backing store
 //! (`JitMem::store`, e.g. PSRAM): a block missing from the code buffer is
 //! then copied back from there instead of translated again. Stored blocks
@@ -187,10 +194,15 @@ pub struct JitStats {
     pub async_cold_insns: u64,
     /// Interpreted instructions by major opcode.
     pub interp_op: [u64; 128],
+    /// Blocks run by `Cpu::run_block` because they were not hot yet, and
+    /// the instructions they retired.
+    pub cold_runs: u64,
+    pub cold_insns: u64,
     /// Host instructions spent (riscv32 hosts; minstret based).
     pub h_translate: u64,
     pub h_interp: u64,
     pub h_code: u64,
+    pub h_cold: u64,
     pub h_total: u64,
 }
 
@@ -234,9 +246,12 @@ impl Default for JitStats {
             async_cold_runs: 0,
             async_cold_insns: 0,
             interp_op: [0; 128],
+            cold_runs: 0,
+            cold_insns: 0,
             h_translate: 0,
             h_interp: 0,
             h_code: 0,
+            h_cold: 0,
             h_total: 0,
         }
     }
@@ -906,6 +921,10 @@ pub struct Jit<'m> {
     aq_len: usize,
     /// Called when the queue stops being empty: wake the other core.
     pub async_wake: Option<fn()>,
+    /// dispatcher misses per block, hashed (`set_hot`; empty: translate at once)
+    hot: &'m mut [u8],
+    hot_shift: u32,
+    hot_threshold: u8,
     pub stats: JitStats,
 }
 
@@ -1451,6 +1470,9 @@ impl<'m> Jit<'m> {
             aq_top: 0,
             aq_len: 0,
             async_wake: None,
+            hot: &mut [],
+            hot_shift: 0,
+            hot_threshold: 1,
             stats: JitStats::default(),
         };
         j.emit_prelude();
@@ -2093,6 +2115,94 @@ impl<'m> Jit<'m> {
 
     // ------------------------------------------------------------ translate
 
+    /// Translate a block only on the dispatcher's `threshold`th miss of it
+    /// (1: at once). `counters` (a power of two of them) count the misses.
+    pub fn set_hot(&mut self, counters: &'m mut [u8], threshold: u8) {
+        assert!(counters.len().is_power_of_two() && counters.len() >= 2);
+        counters.fill(0);
+        self.hot_shift = 32 - counters.len().trailing_zeros();
+        self.hot = counters;
+        self.hot_threshold = threshold.max(1);
+    }
+
+    #[inline(always)]
+    fn hot_index(&self, va: u32, pa: u32) -> usize {
+        ((va >> 2) ^ (pa >> 12)).wrapping_mul(HASH_MUL) as usize >> self.hot_shift
+    }
+
+    /// A dispatcher miss of (`va`, `pa`): counts it, and whether the block
+    /// is still too cold to translate.
+    #[inline(always)]
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn cold_miss(&mut self, va: u32, pa: u32) -> bool {
+        if self.hot.is_empty() {
+            return false;
+        }
+        let i = self.hot_index(va, pa);
+        let c = self.hot[i].saturating_add(1);
+        self.hot[i] = c;
+        c < self.hot_threshold
+    }
+
+    /// Whether (`va`, `pa`) would be translated on a miss (without counting).
+    #[inline(always)]
+    fn is_hot(&self, va: u32, pa: u32) -> bool {
+        self.hot.is_empty() || self.hot[self.hot_index(va, pa)] >= self.hot_threshold
+    }
+
+    /// Run the cold block at `cpu.pc` (host address `host`) with
+    /// `Cpu::run_block`, or interpret its first instruction if it cannot.
+    /// With one hart, carry on into the next block while it is cold too,
+    /// within the same budget: like chained translated code, with no
+    /// interrupt check between blocks. Stop at a translated block (left
+    /// for the dispatcher, with its lookup saved), a block now hot enough
+    /// to translate, a fetch fault, an instruction for the interpreter or
+    /// the end of the budget.
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    fn run_cold<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, mut host: usize) -> Event {
+        let va = cpu.pc;
+        let mut left = cpu.timer_deadline().min(self.budget_cap) as u32;
+        let t0 = if self.profile { host_instret() } else { 0 };
+        let mut total = 0u32;
+        loop {
+            let (n, before) = cpu.run_block(host, left);
+            self.stats.cold_runs += (n != 0) as u64;
+            total += n;
+            left -= n;
+            if n == 0 || before {
+                // the instruction at pc needs the interpreter
+                cpu.jit.force_interp = total != 0;
+                break;
+            }
+            if left == 0 || !self.smp.is_null() {
+                break;
+            }
+            let pc = cpu.pc;
+            let Ok((pa, h)) = cpu.translate_pc(pc) else { break };
+            match self.lookup(pc, pa) {
+                Some(code) => {
+                    cpu.jit.next_valid = true;
+                    cpu.jit.next_pc = pc;
+                    cpu.jit.next_host = h;
+                    cpu.jit.next_code = code;
+                    cpu.jit.next_gen = self.generation;
+                    break;
+                }
+                None if self.cold_miss(pc, pa) => host = h,
+                None => break,
+            }
+        }
+        if self.profile {
+            self.stats.h_cold += host_instret() - t0;
+        }
+        if total == 0 {
+            self.interp(cpu, bus);
+            return Event::Interp;
+        }
+        self.stats.cold_insns += total as u64;
+        Event::Block { va }
+    }
+
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn translate(&mut self, cpu: &mut Cpu, pc0: u32, pa0: u32) -> u32 {
         let t0 = if self.profile { host_instret() } else { 0 };
@@ -2531,6 +2641,8 @@ impl<'m> Jit<'m> {
         let Ok((pa, host)) = cpu.translate_pc(target) else { return };
         let code = match self.lookup(target, pa) {
             Some(c) => c,
+            // not hot yet: the dispatcher counts it and runs it cold
+            None if !self.is_hot(target, pa) => return,
             None if self.translating_async() => {
                 // the next step misses too: queue the target already
                 let sup = cpu.privilege == Priv::S;
@@ -2672,6 +2784,7 @@ impl<'m> Jit<'m> {
             };
             let code = match self.lookup(pc, pa) {
                 Some(c) => c,
+                None if self.cold_miss(pc, pa) => return self.run_cold(cpu, bus, host),
                 None => self.translate(cpu, pc, pa),
             };
             (host, code)
@@ -2768,6 +2881,10 @@ impl<'m> Jit<'m> {
             };
             let code = match self.lookup(pc, pa) {
                 Some(c) => c,
+                None if self.cold_miss(pc, pa) => {
+                    smp.unlock();
+                    return self.run_cold(cpu, bus, host);
+                }
                 None if self.translating_async() => return self.async_miss(cpu, bus, pc, pa, host),
                 None => self.translate(cpu, pc, pa),
             };

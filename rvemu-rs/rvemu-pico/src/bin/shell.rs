@@ -205,11 +205,12 @@ impl NorFlash for BoardNor {
 /// 9 KiB, what is left above .bss; `setup` and the run each need about 5-6) have
 /// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
 /// (`async-jit`: its translator service in SRAM costs two KiB, and another
-/// with `profile`.)
+/// with `profile`.) The translation threshold's counters (`HOT_COUNTS`) and
+/// its cold-block path take 35 KiB of it.
 const CODE_KIB: usize = match (cfg!(feature = "async-jit"), cfg!(feature = "profile")) {
-    (true, true) => 318,
-    (true, false) => 319,
-    _ => 321,
+    (true, true) => 283,
+    (true, false) => 284,
+    _ => 286,
 };
 const CODE_WORDS: usize = CODE_KIB * 256;
 /// With two harts, the top of the code buffer is hart 1's (in SRAM, as hart
@@ -231,6 +232,13 @@ const NJC: usize = 1024;
 const REGIONS: usize = 8;
 
 static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
+/// The translation threshold (rvjit `set_hot`): a block is translated on its
+/// HOT_THRESHOLD-th dispatcher miss and run by `Cpu::run_block` until then.
+/// Under QEMU (boot to login:, 200 fork+exec) 32 KiB of counters at 128 was
+/// the best use of the SRAM: a smaller table makes most blocks look hot.
+const HOT_COUNTS_N: usize = 32 * 1024;
+const HOT_THRESHOLD: u8 = 128;
+static mut HOT_COUNTS: [u8; HOT_COUNTS_N] = [0; HOT_COUNTS_N];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
 /// Guest RAM as Linux sees it, at most: flash-backed kernel text + PSRAM.
 const GUEST_MAX: u32 = RAM_MAX + guest_blob::TEXT_MAX;
@@ -1315,6 +1323,8 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         CODE_WORDS
     };
     let jit = make_jit(cpu, code_words);
+    // SAFETY: the counters are used only by this Jit, from here on.
+    jit.set_hot(unsafe { &mut *addr_of_mut!(HOT_COUNTS) }, HOT_THRESHOLD);
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
     // Only profiling builds print jit.stats: skip per-dispatch minstret reads.

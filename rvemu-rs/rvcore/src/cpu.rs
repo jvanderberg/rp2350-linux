@@ -761,6 +761,204 @@ impl Cpu {
         }
     }
 
+    /// Run the block at `pc` the way translated code runs it: the translator's
+    /// path for code that is not hot yet. `host` is the host address of `pc`
+    /// (from `translate_pc`). Runs ALU, M, loads and stores to RAM through the
+    /// soft TLB (refilled as the translator's TLB helper refills it) and
+    /// fences, and stops after the first branch or jump, after `max`
+    /// instructions, at the end of the page, or before an instruction a
+    /// translated block would leave for the interpreter: MMIO, a fault, a
+    /// misaligned access or target, a store to a page holding translated
+    /// code, and anything else (CSR, system, AMO, LR/SC, illegal). Like
+    /// translated code it takes no trap and checks no interrupt, so a block
+    /// is the same unit for interrupts and lockstep checking.
+    ///
+    /// Returns the instructions retired, and whether it stopped before one
+    /// that needs the interpreter (which must then run it next).
+    #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
+    pub fn run_block(&mut self, host: usize, max: u32) -> (u32, bool) {
+        let mut pc = self.pc;
+        let mut h = host;
+        let max = max.min((0x1000 - (pc & 0xFFF)) >> 2);
+        let mut n = 0u32;
+        let mut before = false;
+        while n < max {
+            // SAFETY: h is the host address of pc, inside the RAM page the
+            // fetch TLB mapped (max stops at the page end); pc is 4-aligned.
+            let insn = unsafe { (h as *const u32).read() };
+            let rd = ((insn >> 7) & 31) as usize;
+            let rs1 = ((insn >> 15) & 31) as usize;
+            let rs2 = ((insn >> 20) & 31) as usize;
+            let f3 = (insn >> 12) & 7;
+            let f7 = insn >> 25;
+            let a = self.x[rs1];
+            let b = self.x[rs2];
+            let val = match insn & 0x7F {
+                0x37 => insn & 0xFFFF_F000,
+                0x17 => pc.wrapping_add(insn & 0xFFFF_F000),
+                0x13 => {
+                    let imm = imm_i(insn);
+                    let sh = rs2 as u32;
+                    match f3 {
+                        0 => a.wrapping_add(imm),
+                        1 if f7 == 0 => a << sh,
+                        2 => ((a as i32) < (imm as i32)) as u32,
+                        3 => (a < imm) as u32,
+                        4 => a ^ imm,
+                        5 if f7 == 0 => a >> sh,
+                        5 if f7 == 0x20 => ((a as i32) >> sh) as u32,
+                        6 => a | imm,
+                        7 => a & imm,
+                        _ => {
+                            before = true;
+                            break;
+                        }
+                    }
+                }
+                0x33 if f7 == 1 => match f3 {
+                    0 => a.wrapping_mul(b),
+                    1 => (((a as i32 as i64) * (b as i32 as i64)) >> 32) as u32,
+                    2 => (((a as i32 as i64) * (b as u64 as i64)) >> 32) as u32,
+                    3 => (((a as u64) * (b as u64)) >> 32) as u32,
+                    4 => {
+                        if b == 0 {
+                            u32::MAX
+                        } else if a == 0x8000_0000 && b == u32::MAX {
+                            a
+                        } else {
+                            ((a as i32) / (b as i32)) as u32
+                        }
+                    }
+                    5 => a.checked_div(b).unwrap_or(u32::MAX),
+                    6 => {
+                        if b == 0 {
+                            a
+                        } else if a == 0x8000_0000 && b == u32::MAX {
+                            0
+                        } else {
+                            ((a as i32) % (b as i32)) as u32
+                        }
+                    }
+                    _ => a.checked_rem(b).unwrap_or(a),
+                },
+                0x33 if f7 == 0 || (f7 == 0x20 && (f3 == 0 || f3 == 5)) => match f3 {
+                    0 if f7 != 0 => a.wrapping_sub(b),
+                    0 => a.wrapping_add(b),
+                    1 => a << (b & 31),
+                    2 => ((a as i32) < (b as i32)) as u32,
+                    3 => (a < b) as u32,
+                    4 => a ^ b,
+                    5 if f7 != 0 => ((a as i32) >> (b & 31)) as u32,
+                    5 => a >> (b & 31),
+                    6 => a | b,
+                    _ => a & b,
+                },
+                0x03 if matches!(f3, 0 | 1 | 2 | 4 | 5) => {
+                    let va = a.wrapping_add(imm_i(insn));
+                    if va & ((1 << (f3 & 3)) - 1) != 0 {
+                        before = true;
+                        break;
+                    }
+                    let Some(p) = self.tlb_lookup(va, ACC_R).or_else(|| self.tlb_refill(va, ACC_R)) else {
+                        before = true;
+                        break;
+                    };
+                    // SAFETY: p maps va in a RAM page; the access is aligned,
+                    // so it stays in the page.
+                    unsafe {
+                        match f3 {
+                            0 => *(p as *const i8) as i32 as u32,
+                            1 => *(p as *const i16) as i32 as u32,
+                            2 => *(p as *const u32),
+                            4 => *(p as *const u8) as u32,
+                            _ => *(p as *const u16) as u32,
+                        }
+                    }
+                }
+                0x23 if f3 <= 2 => {
+                    let va = a.wrapping_add(imm_s(insn));
+                    if va & ((1 << f3) - 1) != 0 {
+                        before = true;
+                        break;
+                    }
+                    let Some(p) = self.tlb_lookup(va, ACC_W).or_else(|| self.tlb_refill(va, ACC_W)) else {
+                        before = true;
+                        break;
+                    };
+                    // SAFETY: as for loads; write entries never map code pages.
+                    unsafe {
+                        match f3 {
+                            0 => *(p as *mut u8) = b as u8,
+                            1 => *(p as *mut u16) = b as u16,
+                            _ => *(p as *mut u32) = b,
+                        }
+                    }
+                    pc = pc.wrapping_add(4);
+                    h += 4;
+                    n += 1;
+                    continue;
+                }
+                0x63 if !matches!(f3, 2 | 3) => {
+                    let t = match f3 {
+                        0 => a == b,
+                        1 => a != b,
+                        4 => (a as i32) < (b as i32),
+                        5 => (a as i32) >= (b as i32),
+                        6 => a < b,
+                        _ => a >= b,
+                    };
+                    let next = if t { pc.wrapping_add(imm_b(insn)) } else { pc.wrapping_add(4) };
+                    if next & 3 != 0 {
+                        before = true;
+                        break;
+                    }
+                    pc = next;
+                    n += 1;
+                    break;
+                }
+                0x6F | 0x67 => {
+                    let next = if insn & 8 != 0 {
+                        pc.wrapping_add(imm_j(insn))
+                    } else if f3 == 0 {
+                        a.wrapping_add(imm_i(insn)) & !1
+                    } else {
+                        before = true;
+                        break;
+                    };
+                    if next & 3 != 0 {
+                        before = true;
+                        break;
+                    }
+                    if rd != 0 {
+                        self.x[rd] = pc.wrapping_add(4);
+                    }
+                    pc = next;
+                    n += 1;
+                    break;
+                }
+                0x0F if f3 <= 1 => {
+                    pc = pc.wrapping_add(4);
+                    h += 4;
+                    n += 1;
+                    continue;
+                }
+                _ => {
+                    before = true;
+                    break;
+                }
+            };
+            if rd != 0 {
+                self.x[rd] = val;
+            }
+            pc = pc.wrapping_add(4);
+            h += 4;
+            n += 1;
+        }
+        self.pc = pc;
+        self.instret += n as u64;
+        (n, before)
+    }
+
     /// Ok(()) retires the instruction; Err((cause, tval)) traps.
     #[inline(always)]
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
