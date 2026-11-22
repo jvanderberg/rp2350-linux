@@ -204,12 +204,12 @@ impl NorFlash for BoardNor {
 /// code and buffers (`core1.rs`), the pin devices and core0's stack (about
 /// 9 KiB, what is left above .bss; `setup` and the run each need about 5-6) have
 /// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
-/// (`async-jit`: its translator service in SRAM costs two KiB, and another
-/// with `profile`.) The translation threshold's counters (`HOT_COUNTS`) and
-/// its cold-block path take 35 KiB of it.
+/// The translation threshold's counters (`HOT_COUNTS`) and its cold-block
+/// path take 35 KiB of it; with `async-jit` (no threshold) the translator
+/// service in SRAM takes 5 KiB, and another with `profile`.
 const CODE_KIB: usize = match (cfg!(feature = "async-jit"), cfg!(feature = "profile")) {
-    (true, true) => 283,
-    (true, false) => 284,
+    (true, true) => 315,
+    (true, false) => 316,
     _ => 286,
 };
 const CODE_WORDS: usize = CODE_KIB * 256;
@@ -236,7 +236,10 @@ static mut CODE: [u32; CODE_WORDS] = [0; CODE_WORDS];
 /// HOT_THRESHOLD-th dispatcher miss and run by `Cpu::run_block` until then.
 /// Under QEMU (boot to login:, 200 fork+exec) 32 KiB of counters at 128 was
 /// the best use of the SRAM: a smaller table makes most blocks look hot.
-const HOT_COUNTS_N: usize = 32 * 1024;
+/// None with `async-jit`: translating costs core0 nothing there, and on the
+/// board the threshold made it slower (boot 14.2 -> 15.6 s, 200 fork+exec
+/// 14.1 -> 14.4 s) than the 32 KiB more code buffer.
+const HOT_COUNTS_N: usize = if cfg!(feature = "async-jit") { 0 } else { 32 * 1024 };
 const HOT_THRESHOLD: u8 = 128;
 static mut HOT_COUNTS: [u8; HOT_COUNTS_N] = [0; HOT_COUNTS_N];
 static mut BUCKETS: [u32; NBUCKETS] = [0; NBUCKETS];
@@ -1324,7 +1327,9 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     };
     let jit = make_jit(cpu, code_words);
     // SAFETY: the counters are used only by this Jit, from here on.
-    jit.set_hot(unsafe { &mut *addr_of_mut!(HOT_COUNTS) }, HOT_THRESHOLD);
+    if HOT_COUNTS_N != 0 && !async_jit {
+        jit.set_hot(unsafe { &mut *addr_of_mut!(HOT_COUNTS) }, HOT_THRESHOLD);
+    }
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
     // Only profiling builds print jit.stats: skip per-dispatch minstret reads.

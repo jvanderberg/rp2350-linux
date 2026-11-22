@@ -2227,9 +2227,8 @@ impl<'m> Jit<'m> {
 
     /// Async mode, a miss at (`pc`, `pa`; host address `host`) with the
     /// lock held: queue the block for the other core, let go of the lock,
-    /// and interpret the block meanwhile, about as far as its translation
-    /// would run: to the first branch, jump or SYSTEM instruction (after
-    /// which an interrupt may be due), a trap, or the page end.
+    /// and run the block meanwhile with `Cpu::run_block`, as its
+    /// translation would run it.
     #[inline(never)]
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
     fn async_miss<B: Bus>(&mut self, cpu: &mut Cpu, bus: &mut B, pc: u32, pa: u32, host: usize) -> Event {
@@ -2244,41 +2243,20 @@ impl<'m> Jit<'m> {
         }
         self.async_push(pc, pa, sup);
         smp.unlock();
-        // (the next timer deadline: interrupts as on time as translated code)
-        let left = ((0x1000 - (pc & 0xFFF)) >> 2) as usize;
-        let max = left.min(MAX_BLOCK).min(cpu.timer_deadline().min(BUDGET_CAP) as usize).max(1);
         let t0 = if self.profile { host_instret() } else { 0 };
-        let mut k = 0;
-        loop {
-            let op = insn_at(host, k) & 0x7F;
-            cpu.step(bus);
-            k += 1;
-            // (a store to translated code: dropped below before the next,
-            // as `smc_page` holds one page; device writes add up)
-            if k >= max
-                || matches!(op, 0x63 | 0x67 | 0x6F | 0x73)
-                || cpu.pc != pc.wrapping_add(4 * k as u32)
-                || cpu.halt.is_some()
-                || cpu.smc_page.is_some()
-                || cpu.has_native_write()
-            {
-                break;
-            }
-        }
-        let dma = bus.take_dma_write();
-        if cpu.smc_page.is_some() || cpu.has_native_write() || dma.is_some() {
-            smp.lock();
-            self.holder = cpu;
-            self.invalidations(cpu, bus, dma);
-            smp.unlock();
-        }
+        let (n, before) = cpu.run_block(host, cpu.timer_deadline().min(self.budget_cap) as u32);
         if self.profile {
-            self.stats.h_interp += host_instret() - t0;
+            self.stats.h_cold += host_instret() - t0;
         }
-        self.stats.interp_steps += k as u64;
+        if n == 0 {
+            self.interp(cpu, bus);
+            return Event::Interp;
+        }
+        // the instruction at pc needs the interpreter
+        cpu.jit.force_interp = before;
         self.stats.async_cold_runs += 1;
-        self.stats.async_cold_insns += k as u64;
-        Event::Interp
+        self.stats.async_cold_insns += n as u64;
+        Event::Block { va: pc }
     }
 
     /// Queue block (`va`, `pa`) for the other core (lock held). One queued
