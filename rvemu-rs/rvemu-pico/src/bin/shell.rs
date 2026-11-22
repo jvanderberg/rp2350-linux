@@ -578,6 +578,8 @@ impl PicoBus {
             core1::STACK_BYTES
         );
         b.log.clear();
+        #[cfg(feature = "profile")]
+        PROFILE_REPORT.store(true, Ordering::Relaxed);
         Some(n as u32)
     }
 }
@@ -988,6 +990,76 @@ fn fail(msg: &str) -> ! {
 
 // ------------------------------------------------------------------ run
 
+/// Set by a benchmark report in profiling builds: `jit_loop` then prints
+/// `profile_report` (it holds the translator, which the bus doesn't).
+#[cfg(feature = "profile")]
+static PROFILE_REPORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Profiling builds: the translator's, the MMU's and swap's counters on the
+/// console, totals since boot (diff two reports for an interval).
+#[cfg(feature = "profile")]
+#[inline(never)]
+fn profile_report(jit: &Jit, cpu: &Cpu, bus: &mut PicoBus) {
+    use core::fmt::Write as _;
+    let _g = BusGuard::new();
+    let (s, c) = (&jit.stats, &cpu.stats);
+    let swap = bus.plat.swap.as_ref().map(|v| {
+        let t = &v.disk.stats;
+        [t.pages_read, t.pages_written, t.zero_pages, t.pages_refused, t.write_cycles, t.erases_sync]
+    });
+    let mut w = ConWriter(&mut bus.plat.con);
+    let _ = writeln!(
+        w,
+        "\nprofile cycles={} host_instret={} guest_instret={}",
+        board::mcycle64(),
+        board::minstret64(),
+        cpu.instret
+    );
+    let _ = writeln!(
+        w,
+        "profile host translate={} interp={} code={} total={}",
+        s.h_translate, s.h_interp, s.h_code, s.h_total
+    );
+    let _ = writeln!(
+        w,
+        "profile jit blocks={} translated={} code_words={} entries={} jit_insns={} interp_steps={} \
+         exit_jump={} exit_interp={} exit_budget={} chains={} flushes={} evictions={} smc={}",
+        s.blocks,
+        s.guest_insns_translated,
+        s.code_words,
+        s.entries,
+        s.jit_insns,
+        s.interp_steps,
+        s.exit_jump,
+        s.exit_interp,
+        s.exit_budget,
+        s.chains,
+        s.flushes,
+        s.evictions,
+        s.smc_invalidations
+    );
+    let _ = writeln!(
+        w,
+        "profile mmu tlb_miss={:?} tlb_flushes={} tlb_page_flushes={} exceptions={} interrupts={} \
+         sbi_calls={} wfi={} idle_ticks={}",
+        c.tlb_miss, c.tlb_flushes, c.tlb_page_flushes, c.exceptions, c.interrupts, c.sbi_calls, c.wfi, c.idle_ticks
+    );
+    let _ = write!(w, "profile interp_op");
+    for (op, &n) in s.interp_op.iter().enumerate() {
+        if n != 0 {
+            let _ = write!(w, " {op:#04x}={n}");
+        }
+    }
+    let _ = writeln!(w);
+    if let Some([rd, wr, zero, refused, wcyc, erases]) = swap {
+        let _ = writeln!(
+            w,
+            "profile swap pages_read={rd} pages_written={wr} zero_pages={zero} refused={refused} \
+             write_cycles={wcyc} erases_sync={erases}"
+        );
+    }
+}
+
 #[inline(never)]
 #[unsafe(link_section = ".data.rvemu_hot")]
 fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus) {
@@ -999,6 +1071,10 @@ fn jit_loop(jit: &mut Jit, cpu: &mut Cpu, bus: &mut PicoBus) {
         // something for the guest, plus the pins' pending check
         if events & 0xFF == 0 {
             bus.poll();
+            #[cfg(feature = "profile")]
+            if PROFILE_REPORT.swap(false, Ordering::Relaxed) {
+                profile_report(jit, cpu, bus);
+            }
             if smp::on() && let Some(h) = smp::take_halt() {
                 cpu.halt = Some(h);
             }
@@ -1217,8 +1293,8 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     let jit = make_jit(cpu, if two_harts { CODE_WORDS - HART1_WORDS } else { CODE_WORDS });
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
-    // Shell never prints jit.stats, so skip per-dispatch minstret reads.
-    jit.profile = false;
+    // Only profiling builds print jit.stats: skip per-dispatch minstret reads.
+    jit.profile = cfg!(feature = "profile");
     if two_harts {
         setup_hart1(jit, cpu, &h, dtb, sys_hz);
     }

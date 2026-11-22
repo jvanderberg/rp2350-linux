@@ -21,6 +21,13 @@ path = "src/bin/linux.rs"
 test = false
 bench = false
 
+[features]
+# rvemu-pico-shell: count the translator's work (host instructions per phase,
+# exits, interpreted opcodes) and print it, with the MMU's and swap's
+# counters, after each benchmark report (`/dev/rvemu-bench` in the guest).
+# The counting itself costs a little; not for the perf gate.
+profile = []
+
 [dependencies]
 rvcore = { path = "../rvcore", features = ["ram-code", "pv-buffers"] }
 rvjit = { path = "../rvjit", features = ["ram-code", "zbb"] }
