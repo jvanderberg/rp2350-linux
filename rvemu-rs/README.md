@@ -708,6 +708,41 @@ The model accounts for the current design:
   code, not translating cold code once.
 - **A ring of regions beats flush-all** at the same size.
 
+## Profiling a workload
+
+Three views of one workload, each an interval between two marks:
+
+- **The board's counters.** `PICO_FEATURES=profile scripts/pico-shell.sh`
+  loads a firmware that prints the translator's counters (host
+  instructions translating, interpreting and in translated code; blocks,
+  exits, chains, evictions; TLB misses and flushes; interpreted opcodes)
+  after each guest benchmark report (`RVEMU_BENCH_REPORT` on
+  `/dev/rvemu-bench`, `guest/tests/rvemu-bench-report.c`). Run the report,
+  the workload and the report again, and diff the two.
+- **Where core0 spends its time.** With that firmware running, the
+  Debugprobe samples core0's pc (halt, read, resume; about 10 per second):
+
+      probe-rs profile --chip RP235x_riscv --protocol swd --duration 100 \
+          target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell flat --line-info naive
+
+  Samples that stall land on the instruction after a missing load.
+- **The guest's side, on the Mac.** `RVEMU_PROF=FILE` makes `rvemu` count
+  S-mode pcs (user mode as one entry), and `-S` simulates the code cache.
+  Run the guest to a mark printed before the workload (`-u`) and to one
+  after it, and diff: the guest kernel's functions per run (with
+  `System.map`), and the translations, evictions and modelled board time.
+
+What this showed for `fork_exec_s` (200 fork+exec of busybox `true`, about
+100 ms each): 370 k guest instructions per run, 92% kernel, of which
+fault-around and unmapping at exit were about 30%; but 60% of core0's host
+instructions went to translating, since the guest code a run goes through
+doesn't fit the code buffer: the whole buffer turns over twice per run and
+45 k guest instructions are translated again each time (273 host
+instructions each). In the simulator a 640 KiB buffer takes the 200 runs
+from 21.5 s to 8.3 s, a twice-as-fast translator to 15.8 s, a 1 MiB PSRAM
+backing store to 13.7 s, translated code at 60% of its size to 17.3 s; more
+or fewer regions, and a bigger jump cache, change nothing.
+
 ## Native buffer engine (`rvaccel/`, `rvcore/pv-buffers`)
 
 `rvaccel` runs LZ4, ChaCha20-Poly1305, the SSH packet cipher, X25519,
