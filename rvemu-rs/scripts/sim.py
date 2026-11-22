@@ -72,6 +72,18 @@ def board(p, a):
     if p["xip"]:
         store += p["promote_words"] * per_word_in + a["xip_hit"] * p["xip_words"]
     cyc["store"] = store
+    # a second core translating (rvemu -S pf=...): core0 takes its blocks
+    # over (a copy and relink out of a side store for pf=ghost, a hand-over
+    # otherwise) and may wait for one
+    pf = p.get("pf", 0)
+    if pf:
+        if pf == 1:
+            take = 150.0 * p["pf_blocks"] + 2.5 * p["pf_words"]
+        elif pf in (2, 4, 5):
+            take = 100.0 * p["pf_blocks"]
+        else:
+            take = 0.0
+        cyc["pf"] = a["cpi"] * take + p.get("pf_wait_cyc", 0)
     return sum(cyc.values()), cyc, h
 
 
