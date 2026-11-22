@@ -25,6 +25,30 @@
 //!   wscale=100     translated size in percent of rvjit's (a denser encoding)
 //!   regions=0      with evict=fifo: evict whole regions (the buffer split in
 //!                  N), 0 = block by block
+//!   pf=none        a second core (core1) translating ahead, with a time
+//!                  budget of pf_avail% of core0's modelled cycles:
+//!                  ghost   evicted blocks noted by page; a translation miss
+//!                          has core1 translate the page's other ghosts into
+//!                          a side store of pf_store_kb, which core0 copies
+//!                          from (the reverted plan C, prefetch.rs)
+//!                  direct  the same, but core1 puts them in the code buffer
+//!                  oracle  upper bound: a block evicted before costs core0
+//!                          nothing to bring back while core1 has the time
+//!                  async   a miss queues the block for core1 and core0
+//!                          interprets it (cold steps) until core1 has put
+//!                          it in the code buffer; with more than 1 ms
+//!                          queued, core0 translates it itself
+//!                  succ    core0 translates a miss itself, and sends its
+//!                          same-page successors (fall-through, branch and
+//!                          jal targets) to core1, which puts them in the
+//!                          code buffer and follows theirs to pf_depth; a
+//!                          miss on the block core1 is on waits for it if
+//!                          that is quicker than translating it
+//!   pf_depth=1     with pf=succ: pf_lifo=1 newest request first,
+//!                  pf_ret=1 also the return point after a call,
+//!                  pf_xpage=1 targets on other pages too, pf_async=1 a
+//!                  miss interprets while core1 translates (as pf=async)
+//!   pf_store_kb=16 pf_avail=90
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -61,6 +85,15 @@ struct Cfg {
     wscale: u32,
     regions: usize,
     store_ring: bool,
+    /// 0 none, 1 ghost, 2 direct, 3 oracle
+    pf: u8,
+    pf_store_words: usize,
+    pf_avail: u32,
+    pf_depth: u32,
+    pf_lifo: bool,
+    pf_ret: bool,
+    pf_xpage: bool,
+    pf_async: bool,
 }
 
 fn parse_cfg(line: &str) -> Result<Cfg, String> {
@@ -80,6 +113,14 @@ fn parse_cfg(line: &str) -> Result<Cfg, String> {
         wscale: 100,
         regions: 0,
         store_ring: false,
+        pf: 0,
+        pf_store_words: 16 * 256,
+        pf_avail: 90,
+        pf_depth: 1,
+        pf_lifo: false,
+        pf_ret: false,
+        pf_xpage: false,
+        pf_async: false,
     };
     for kv in it {
         let (k, v) = kv.split_once('=').ok_or_else(|| format!("bad policy field {kv}"))?;
@@ -103,6 +144,24 @@ fn parse_cfg(line: &str) -> Result<Cfg, String> {
             "wscale" => c.wscale = num()?.clamp(10, 100) as u32,
             "regions" => c.regions = num()?,
             "store_ring" => c.store_ring = num()? != 0,
+            "pf" => {
+                c.pf = match v {
+                    "none" => 0,
+                    "ghost" => 1,
+                    "direct" => 2,
+                    "oracle" => 3,
+                    "async" => 4,
+                    "succ" => 5,
+                    _ => return Err(format!("bad pf {v}")),
+                }
+            }
+            "pf_store_kb" => c.pf_store_words = num()? * 256,
+            "pf_avail" => c.pf_avail = num()? as u32,
+            "pf_depth" => c.pf_depth = num()? as u32,
+            "pf_lifo" => c.pf_lifo = num()? != 0,
+            "pf_ret" => c.pf_ret = num()? != 0,
+            "pf_xpage" => c.pf_xpage = num()? != 0,
+            "pf_async" => c.pf_async = num()? != 0,
             _ => return Err(format!("unknown policy field {k}")),
         }
     }
@@ -293,6 +352,19 @@ struct Counts {
     /// chains from a newer region into an older one (need an unlink record)
     chain_recs: u64,
     max_region_recs: u64,
+    /// blocks core0 got from core1 (pf), their words and guest insns
+    pf_blocks: u64,
+    pf_words: u64,
+    pf_insns: u64,
+    /// core1's translations, their guest insns, and ones already resident
+    pf_jobs: u64,
+    pf_job_insns: u64,
+    pf_skipped: u64,
+    /// requests dropped from a full queue
+    pf_dropped: u64,
+    /// core0's cycles waiting for core1 (succ)
+    pf_wait_cyc: u64,
+    pf_waits: u64,
 }
 
 macro_rules! json_counts {
@@ -332,7 +404,32 @@ struct Policy {
     region_seq: Vec<u32>,
     region_recs: Vec<u64>,
     seq_next: u32,
+    // pf: ghost ring (key) and per-page lists, core1's queue, side store,
+    // blocks ever evicted (oracle), and core1's clock in cycles
+    ghost_ring: VecDeque<u64>,
+    ghosts: HashMap<u32, Vec<u64>>,
+    pfq: VecDeque<u64>,
+    pf_store: HashMap<u64, u16>,
+    pf_fifo: VecDeque<(u64, u16)>,
+    pf_used: usize,
+    evicted_ever: HashSet<u64>,
+    core1_cyc: f64,
+    /// pf=async: blocks queued on core1, in finishing order (key, done at)
+    pending: VecDeque<(u64, f64)>,
+    pending_set: HashSet<u64>,
+    /// pf=succ: core1's queue (key, depth) and what is in it
+    sq: VecDeque<(u64, u32, f64)>,
+    sq_set: HashSet<u64>,
+    scur: Option<(u64, u32, f64)>,
 }
+
+/// pf: ghost entries kept (prefetch.rs GN), and core1's queue length.
+const PF_GHOSTS: usize = 2048;
+const PF_QUEUE: usize = 512;
+/// Board cycles, as scripts/sim.py prices them (CPI 1.12; the translator
+/// also misses 0.61 times per guest insn at 137 cycles).
+const CPI: f64 = 1.12;
+const TR_CYC: f64 = CPI * 358.0 + 0.61 * 137.0;
 
 struct Flags {
     r_miss: bool,
@@ -372,6 +469,383 @@ impl Policy {
             region_seq: Vec::new(),
             region_recs: Vec::new(),
             seq_next: 1,
+            ghost_ring: VecDeque::new(),
+            ghosts: HashMap::new(),
+            pfq: VecDeque::new(),
+            pf_store: HashMap::new(),
+            pf_fifo: VecDeque::new(),
+            pf_used: 0,
+            evicted_ever: HashSet::new(),
+            core1_cyc: 0.0,
+            pending: VecDeque::new(),
+            pending_set: HashSet::new(),
+            sq: VecDeque::new(),
+            sq_set: HashSet::new(),
+            scur: None,
+        }
+    }
+
+    /// core0's modelled board cycles so far (scripts/sim.py's base terms,
+    /// without the XIP misses of translated code).
+    fn core0_cyc(&self) -> f64 {
+        let c = &self.c;
+        let s2 = |a: [u64; 2]| (a[0] + a[1]) as f64;
+        CPI * (7.54 * s2(c.jit_insns)
+            + 101.1 * c.entries as f64
+            + 157.6 * c.runs as f64
+            + 148.6 * c.chain_attempts as f64
+            + 333.0 * s2(c.interp)
+            + 176.0 * s2(c.cold_steps)
+            + 40.0 * c.cold_blocks as f64
+            + 12000.0 * c.flushes as f64
+            + 80.0 * c.evicted as f64
+            + 30.0 * c.unlinks as f64)
+            + TR_CYC * s2(c.translate_insns)
+            + c.pf_wait_cyc as f64
+            + Self::pf_copy_cyc(self.cfg.pf, c.pf_blocks, c.pf_words)
+    }
+
+    /// What core0 pays to take blocks from core1: a copy out of the side
+    /// store and a relink (ghost), or a hand-over (direct).
+    fn pf_copy_cyc(pf: u8, blocks: u64, words: u64) -> f64 {
+        match pf {
+            1 => CPI * (150.0 * blocks as f64 + 2.5 * words as f64),
+            2 | 4 | 5 => CPI * 100.0 * blocks as f64,
+            _ => 0.0,
+        }
+    }
+
+    /// Read-only Sv32 walk for an executable page (no A/D updates, no TLB).
+    fn peek_pa(cpu: &Cpu, va: u32) -> Option<u32> {
+        if cpu.satp >> 31 == 0 {
+            return Some(va);
+        }
+        let rd = |pa: u32| -> Option<u32> {
+            let off = pa.wrapping_sub(cpu.ram_base()) as usize;
+            if off + 4 > cpu.ram_size() as usize {
+                return None;
+            }
+            // SAFETY: inside guest RAM (checked above)
+            Some(unsafe { (cpu.ram_ptr().add(off) as *const u32).read_unaligned() })
+        };
+        let mut table = (cpu.satp & 0x3F_FFFF) << 12;
+        for level in [1u32, 0] {
+            let pte = rd(table + ((va >> (12 + 10 * level)) & 0x3FF) * 4)?;
+            if pte & 1 == 0 {
+                return None;
+            }
+            if pte & 0xA == 0 {
+                table = (pte >> 10) << 12;
+                continue;
+            }
+            if pte & 0x8 == 0 {
+                return None;
+            }
+            let ppn = pte >> 10;
+            return Some(if level == 1 { (ppn << 12) | (va & 0x3F_FFFF) } else { (ppn << 12) | (va & 0xFFF) });
+        }
+        None
+    }
+
+    /// Successors of block (va, pa): fall-through, branch and jal targets;
+    /// with pf_ret the return point after a call, with pf_xpage on other
+    /// pages too.
+    fn successors(&self, cpu: &Cpu, va: u32, pa: u32, info: Info) -> Vec<u64> {
+        let n = info.n as u32;
+        let last = va.wrapping_add(4 * (n.max(1) - 1));
+        let insn = || {
+            let lpa = (pa & !0xFFF) | (last & 0xFFF);
+            let off = lpa.wrapping_sub(cpu.ram_base()) as usize;
+            if off + 4 > cpu.ram_size() as usize {
+                return 0;
+            }
+            // SAFETY: inside guest RAM (checked above)
+            unsafe { (cpu.ram_ptr().add(off) as *const u32).read_unaligned() }
+        };
+        let fall = va.wrapping_add(4 * n);
+        let mut t = Vec::with_capacity(3);
+        match info.end {
+            BlockEnd::Branch => {
+                let i = insn();
+                let imm = (((i as i32) >> 31) << 12)
+                    | ((i << 4) & 0x800) as i32
+                    | ((i >> 20) & 0x7E0) as i32
+                    | ((i >> 7) & 0x1E) as i32;
+                t.push(last.wrapping_add(imm as u32));
+                t.push(fall);
+            }
+            BlockEnd::Jal => {
+                let i = insn();
+                t.push(last.wrapping_add(imm_j(i) as u32));
+                let rd = (i >> 7) & 31;
+                if self.cfg.pf_ret && (rd == 1 || rd == 5) {
+                    t.push(fall);
+                }
+            }
+            BlockEnd::Fall => t.push(fall),
+            BlockEnd::Jalr | BlockEnd::Interp => {}
+        }
+        t.into_iter()
+            .filter_map(|x| {
+                if x & !0xFFF == va & !0xFFF {
+                    Some(key(x, (pa & !0xFFF) | (x & 0xFFF)))
+                } else if self.cfg.pf_xpage {
+                    Self::peek_pa(cpu, x).map(|p| key(x, p))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn now1(&self) -> f64 {
+        self.core0_cyc() * self.cfg.pf_avail as f64 / 100.0
+    }
+
+    /// Queue `g` for core1 (at the front with pf_lifo, or `urgent`).
+    fn succ_push(&mut self, g: u64, depth: u32, urgent: bool) {
+        if self.sram.contains_key(&g) || self.scur.is_some_and(|c| c.0 == g) {
+            return;
+        }
+        let now = self.now1();
+        if !self.sq_set.insert(g) {
+            if (urgent || self.cfg.pf_lifo)
+                && let Some(i) = self.sq.iter().position(|e| e.0 == g)
+            {
+                let e = self.sq.remove(i).unwrap();
+                self.sq.push_front(e);
+            }
+            return;
+        }
+        if self.sq.len() == PF_QUEUE {
+            let old = if self.cfg.pf_lifo { self.sq.pop_back() } else { self.sq.pop_front() };
+            if let Some((o, _, _)) = old {
+                self.sq_set.remove(&o);
+            }
+            self.c.pf_dropped += 1;
+        }
+        if urgent || self.cfg.pf_lifo {
+            self.sq.push_front((g, depth, now));
+        } else {
+            self.sq.push_back((g, depth, now));
+        }
+    }
+
+    fn succ_enqueue(&mut self, cpu: &Cpu, k: u64, info: Info, depth: u32) {
+        if depth > self.cfg.pf_depth {
+            return;
+        }
+        let mut v = self.successors(cpu, key_va(k), key_pa(k), info);
+        if self.cfg.pf_lifo {
+            // pushed to the front one by one: the first successor ends up first
+            v.reverse();
+        }
+        for g in v {
+            self.succ_push(g, depth, false);
+        }
+    }
+
+    /// pf=succ: core1's work up to now. core1 finishes a block once it has
+    /// started it (`scur`: key, depth, done at).
+    fn succ_drain(&mut self, cpu: &mut Cpu, inf: &mut Infos) {
+        let now = self.now1();
+        loop {
+            if let Some((g, d, done)) = self.scur {
+                if done > now {
+                    return;
+                }
+                self.scur = None;
+                self.core1_cyc = done;
+                self.succ_finish(cpu, inf, g, d);
+                continue;
+            }
+            let Some((g, d, enq)) = self.sq.pop_front() else {
+                self.core1_cyc = self.core1_cyc.max(now);
+                return;
+            };
+            self.sq_set.remove(&g);
+            if self.sram.contains_key(&g) {
+                self.c.pf_skipped += 1;
+                continue;
+            }
+            let info = inf.get(cpu, key_va(g), key_pa(g));
+            if info.n == 0 {
+                continue;
+            }
+            let start = self.core1_cyc.max(enq);
+            self.core1_cyc = start;
+            self.scur = Some((g, d, start + TR_CYC * info.n as f64));
+        }
+    }
+
+    fn succ_finish(&mut self, cpu: &mut Cpu, inf: &mut Infos, g: u64, d: u32) {
+        if self.sram.contains_key(&g) {
+            return;
+        }
+        let mut info = inf.get(cpu, key_va(g), key_pa(g));
+        self.c.pf_jobs += 1;
+        self.c.pf_job_insns += info.n as u64;
+        self.succ_enqueue(cpu, g, info, d + 1);
+        info.words = (info.words as u32 * self.cfg.wscale / 100) as u16;
+        let rb = inf.ram_base;
+        self.sram_insert(g, info, rb);
+        self.c.pf_blocks += 1;
+        self.c.pf_words += info.words as u64;
+        self.c.pf_insns += info.n as u64;
+    }
+
+    /// pf=succ with pf_async, on a dispatch miss: interpret while core1
+    /// translates (Some), or None for core0 to translate it itself.
+    fn succ_async_miss(&mut self, cpu: &mut Cpu, inf: &mut Infos, k: u64) -> Option<Mode> {
+        let info = inf.get(cpu, key_va(k), key_pa(k));
+        if info.n == 0 {
+            return None;
+        }
+        let busy = self.scur.is_some_and(|c| c.0 == k) || self.sq_set.contains(&k);
+        if !busy {
+            // core1's backlog ahead of this block: what it is on now
+            let ahead = self.scur.map_or(0.0, |c| c.2 - self.now1());
+            if ahead > 348_000.0 {
+                return None;
+            }
+        } else {
+            self.c.pf_skipped += 1;
+        }
+        self.succ_push(k, 0, true);
+        self.succ_drain(cpu, inf);
+        self.c.cold_blocks += 1;
+        self.st = St::Cold { left: info.n };
+        Some(Mode::Cold)
+    }
+
+    /// pf=async: core1's finished blocks, into the code buffer.
+    fn async_drain(&mut self, cpu: &mut Cpu, inf: &mut Infos) {
+        let now = self.core0_cyc() * self.cfg.pf_avail as f64 / 100.0;
+        while let Some(&(g, done)) = self.pending.front() {
+            if done > now {
+                break;
+            }
+            self.pending.pop_front();
+            if !self.pending_set.remove(&g) || self.sram.contains_key(&g) {
+                continue;
+            }
+            let mut info = inf.get(cpu, key_va(g), key_pa(g));
+            info.words = (info.words as u32 * self.cfg.wscale / 100) as u16;
+            let rb = inf.ram_base;
+            self.sram_insert(g, info, rb);
+            self.c.pf_blocks += 1;
+            self.c.pf_words += info.words as u64;
+            self.c.pf_insns += info.n as u64;
+        }
+    }
+
+    /// pf=async miss: Some(mode) to interpret, None for core0 to translate.
+    fn async_miss(&mut self, cpu: &mut Cpu, inf: &mut Infos, k: u64) -> Option<Mode> {
+        let (va, pa) = (key_va(k), key_pa(k));
+        let info = inf.get(cpu, va, pa);
+        if info.n == 0 {
+            return None;
+        }
+        if !self.pending_set.contains(&k) {
+            let now = self.core0_cyc() * self.cfg.pf_avail as f64 / 100.0;
+            let start = self.core1_cyc.max(now);
+            if start - now > 348_000.0 {
+                return None;
+            }
+            let done = start + TR_CYC * info.n as f64;
+            self.core1_cyc = done;
+            self.pending.push_back((k, done));
+            self.pending_set.insert(k);
+            self.c.pf_jobs += 1;
+            self.c.pf_job_insns += info.n as u64;
+        } else {
+            self.c.pf_skipped += 1;
+        }
+        self.c.cold_blocks += 1;
+        self.st = St::Cold { left: info.n };
+        Some(Mode::Cold)
+    }
+
+    fn ghost_note(&mut self, k: u64) {
+        if self.cfg.pf == 3 {
+            self.evicted_ever.insert(k);
+            return;
+        }
+        if self.cfg.pf == 0 {
+            return;
+        }
+        if self.ghost_ring.len() == PF_GHOSTS
+            && let Some(old) = self.ghost_ring.pop_front()
+            && let Some(v) = self.ghosts.get_mut(&(key_pa(old) >> 12))
+        {
+            v.retain(|&x| x != old);
+        }
+        self.ghost_ring.push_back(k);
+        self.ghosts.entry(key_pa(k) >> 12).or_default().push(k);
+    }
+
+    /// core0 translated `k` itself: ask core1 for the page's other ghosts.
+    fn pf_request(&mut self, k: u64) {
+        if !matches!(self.cfg.pf, 1 | 2) {
+            return;
+        }
+        let Some(v) = self.ghosts.get(&(key_pa(k) >> 12)) else { return };
+        for &g in v.iter().rev() {
+            if g == k || self.sram.contains_key(&g) || self.pf_store.contains_key(&g) {
+                continue;
+            }
+            if self.pfq.len() == PF_QUEUE {
+                self.pfq.pop_front();
+                self.c.pf_dropped += 1;
+            }
+            self.pfq.push_back(g);
+        }
+    }
+
+    /// core1's work up to core0's present time.
+    fn pf_drain(&mut self, cpu: &mut Cpu, inf: &mut Infos) {
+        if !matches!(self.cfg.pf, 1 | 2) {
+            return;
+        }
+        let now = self.core0_cyc() * self.cfg.pf_avail as f64 / 100.0;
+        while self.core1_cyc < now {
+            let Some(g) = self.pfq.pop_front() else {
+                // idle: core1's clock keeps up with core0's
+                self.core1_cyc = now;
+                break;
+            };
+            if self.sram.contains_key(&g) || self.pf_store.contains_key(&g) {
+                self.c.pf_skipped += 1;
+                self.core1_cyc += CPI * 100.0;
+                continue;
+            }
+            let mut info = inf.get(cpu, key_va(g), key_pa(g));
+            if info.n == 0 {
+                continue;
+            }
+            info.words = (info.words as u32 * self.cfg.wscale / 100) as u16;
+            self.core1_cyc += TR_CYC * info.n as f64;
+            self.c.pf_jobs += 1;
+            self.c.pf_job_insns += info.n as u64;
+            if self.cfg.pf == 1 {
+                let w = info.words + 4;
+                while self.pf_used + w as usize > self.cfg.pf_store_words {
+                    let Some((ok, ow)) = self.pf_fifo.pop_front() else { break };
+                    self.pf_used -= ow as usize;
+                    if self.pf_store.get(&ok) == Some(&ow) {
+                        self.pf_store.remove(&ok);
+                    }
+                }
+                self.pf_used += w as usize;
+                self.pf_fifo.push_back((g, w));
+                self.pf_store.insert(g, w);
+            } else {
+                let rb = inf.ram_base;
+                self.sram_insert(g, info, rb);
+                self.c.pf_blocks += 1;
+                self.c.pf_words += info.words as u64;
+                self.c.pf_insns += info.n as u64;
+            }
         }
     }
 
@@ -431,6 +905,7 @@ impl Policy {
         self.c.evicted += 1;
         if self.sram.get(&k).is_some_and(|b| b.id == id) {
             self.sram.remove(&k);
+            self.ghost_note(k);
         }
         if let Some(v) = self.incoming.remove(&id) {
             for (sk, sid, s) in v {
@@ -562,6 +1037,16 @@ impl Policy {
         self.sram.retain(|k, _| same(k));
         self.xipb.retain(|k, _| same(k));
         self.store.retain(|k, _| same(k));
+        self.pf_store.retain(|k, _| same(k));
+        self.evicted_ever.retain(|k| same(k));
+        self.pfq.retain(|k| same(k));
+        self.pending_set.retain(|k| same(k));
+        self.sq.retain(|(k, _, _)| same(k));
+        if self.scur.is_some_and(|c| !same(&c.0)) {
+            self.scur = None;
+        }
+        self.sq_set.retain(|k| same(k));
+        self.ghosts.remove(&((p << 12).wrapping_add(ram_base) >> 12));
         self.jc.fill((0, 0));
         self.sram_pages[p as usize] = false;
         self.store_pages[p as usize] = false;
@@ -589,6 +1074,53 @@ impl Policy {
         }
         let w = info.words as u64;
         let pv = (cpu.privilege == Priv::U) as usize;
+        self.pf_drain(cpu, inf);
+        if self.cfg.pf == 1 && self.pf_store.remove(&k).is_some() {
+            self.c.pf_blocks += 1;
+            self.c.pf_words += w;
+            self.c.pf_insns += info.n as u64;
+            return self.sram_insert(k, info, rb);
+        }
+        if self.cfg.pf == 3 && self.evicted_ever.contains(&k) {
+            let cost = TR_CYC * info.n as f64;
+            let now = self.core0_cyc() * self.cfg.pf_avail as f64 / 100.0;
+            // core1 works at most 1 ms (348 k cycles) ahead of core0
+            self.core1_cyc = self.core1_cyc.max(now - 348_000.0);
+            if self.core1_cyc + cost <= now {
+                self.core1_cyc += cost;
+                self.c.pf_jobs += 1;
+                self.c.pf_job_insns += info.n as u64;
+                self.c.pf_blocks += 1;
+                self.c.pf_words += w;
+                self.c.pf_insns += info.n as u64;
+                return self.sram_insert(k, info, rb);
+            }
+        }
+        if self.cfg.pf == 5 {
+            self.succ_drain(cpu, inf);
+            if let Some(b) = self.find(k) {
+                return b;
+            }
+            if let Some((g, d, done)) = self.scur
+                && g == k
+            {
+                // core1 is on it: wait if that's quicker
+                let left = (done - self.now1()).max(0.0);
+                if left < TR_CYC * info.n as f64 {
+                    self.c.pf_wait_cyc += left as u64;
+                    self.c.pf_waits += 1;
+                    self.scur = None;
+                    self.core1_cyc = done;
+                    self.succ_finish(cpu, inf, k, d);
+                    if let Some(b) = self.find(k) {
+                        return b;
+                    }
+                }
+            }
+            if self.sq_set.remove(&k) {
+                self.sq.retain(|e| e.0 != k);
+            }
+        }
         let from_store = !self.cfg.xip && self.store.contains_key(&k);
         if from_store {
             self.c.restore_blocks += 1;
@@ -600,6 +1132,11 @@ impl Policy {
             self.c.translate_blocks[pv] += 1;
             self.c.translate_insns[pv] += info.n as u64;
             self.c.translate_words[pv] += w;
+            self.pf_request(k);
+            if self.cfg.pf == 5 {
+                let raw = inf.get(cpu, va, pa);
+                self.succ_enqueue(cpu, k, raw, 1);
+            }
         }
         if self.cfg.xip {
             let addr = self.store_alloc(k, info.words, rb);
@@ -692,6 +1229,22 @@ impl Policy {
         let Ok((pa, _)) = cpu.translate_pc(pc) else { return Mode::Interp };
         let k = key(pc, pa);
         self.c.lookups += 1;
+        if self.cfg.pf == 5 && self.cfg.pf_async && self.find(k).is_none() {
+            self.succ_drain(cpu, inf);
+            if self.find(k).is_none()
+                && let Some(m) = self.succ_async_miss(cpu, inf, k)
+            {
+                return m;
+            }
+        }
+        if self.cfg.pf == 4 && self.find(k).is_none() {
+            self.async_drain(cpu, inf);
+            if self.find(k).is_none()
+                && let Some(m) = self.async_miss(cpu, inf, k)
+            {
+                return m;
+            }
+        }
         let b = match self.find(k) {
             Some(b) => b,
             None => {
@@ -855,7 +1408,7 @@ impl Policy {
     fn json(&self, cpu: &Cpu) -> String {
         let c = &self.c;
         let mut s = format!(
-            "{{\"name\": \"{}\", \"kb\": {}, \"blocks\": {}, \"evict\": \"{:?}\", \"hot\": {}, \"store_kb\": {}, \"xip\": {}, \"promote\": {}, \"aot\": {}, \"jc\": {}, \"wscale\": {}, \"regions\": {}, ",
+            "{{\"name\": \"{}\", \"kb\": {}, \"blocks\": {}, \"evict\": \"{:?}\", \"hot\": {}, \"store_kb\": {}, \"xip\": {}, \"promote\": {}, \"aot\": {}, \"jc\": {}, \"wscale\": {}, \"regions\": {}, \"pf\": {}, \"pf_store_kb\": {}, \"pf_avail\": {}, ",
             self.cfg.name,
             self.cfg.words / 256,
             self.cfg.max_blocks,
@@ -867,7 +1420,10 @@ impl Policy {
             self.cfg.aot,
             self.cfg.jc,
             self.cfg.wscale,
-            self.cfg.regions
+            self.cfg.regions,
+            self.cfg.pf,
+            self.cfg.pf_store_words / 256,
+            self.cfg.pf_avail
         );
         json_counts!(
             c,
@@ -907,7 +1463,16 @@ impl Policy {
                 desync,
                 max_sram_blocks,
                 chain_recs,
-                max_region_recs
+                max_region_recs,
+                pf_blocks,
+                pf_words,
+                pf_insns,
+                pf_jobs,
+                pf_job_insns,
+                pf_skipped,
+                pf_dropped,
+                pf_wait_cyc,
+                pf_waits
             ],
             [interp, cold_steps, jit_insns, translate_blocks, translate_insns, translate_words]
         );

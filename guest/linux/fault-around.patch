@@ -1,0 +1,35 @@
+SPDX-License-Identifier: GPL-2.0-only
+A change to a file of the Linux kernel, under the kernel's license (see
+COPYING). Applied by guest/build.sh (patch_stock).
+
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5191,8 +5191,27 @@
+ 	return ret;
+ }
+ 
++/*
++ * rvemu: no fault-around by default (one page, not 64 KiB), and
++ * fault_around_bytes=N on the command line, as debugfs is off. Each page
++ * mapped around a fault costs a PTE now and its teardown at exit, about a
++ * fifth of the guest instructions of a fork+exec of a small static program
++ * (busybox), while the first runs of larger programs lose nothing.
++ */
+ static unsigned long fault_around_pages __read_mostly =
+-	65536 >> PAGE_SHIFT;
++	PAGE_SIZE >> PAGE_SHIFT;
++
++static int __init fault_around_bytes_setup(char *s)
++{
++	unsigned long val;
++
++	if (kstrtoul(s, 0, &val) || val / PAGE_SIZE > PTRS_PER_PTE)
++		return 0;
++	val = max(val, PAGE_SIZE);
++	fault_around_pages = rounddown_pow_of_two(val) >> PAGE_SHIFT;
++	return 1;
++}
++__setup("fault_around_bytes=", fault_around_bytes_setup);
+ 
+ #ifdef CONFIG_DEBUG_FS
+ static int fault_around_bytes_get(void *data, u64 *val)

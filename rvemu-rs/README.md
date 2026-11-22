@@ -708,6 +708,72 @@ The model accounts for the current design:
   code, not translating cold code once.
 - **A ring of regions beats flush-all** at the same size.
 
+## Profiling a workload
+
+Three views of one workload, each an interval between two marks:
+
+- **The board's counters.** `PICO_FEATURES=profile scripts/pico-shell.sh`
+  loads a firmware that prints the translator's counters (host
+  instructions translating, interpreting and in translated code; blocks,
+  exits, chains, evictions; TLB misses and flushes; interpreted opcodes)
+  after each guest benchmark report (`RVEMU_BENCH_REPORT` on
+  `/dev/rvemu-bench`, `guest/tests/rvemu-bench-report.c`). Run the report,
+  the workload and the report again, and diff the two.
+- **Where core0 spends its time.** With that firmware running, the
+  Debugprobe samples core0's pc (halt, read, resume; about 10 per second):
+
+      probe-rs profile --chip RP235x_riscv --protocol swd --duration 100 \
+          target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell flat --line-info naive
+
+  Samples that stall land on the instruction after a missing load.
+- **The guest's side, on the Mac.** `RVEMU_PROF=FILE` makes `rvemu` count
+  S-mode pcs (user mode as one entry), and `-S` simulates the code cache.
+  Run the guest to a mark printed before the workload (`-u`) and to one
+  after it, and diff: the guest kernel's functions per run (with
+  `System.map`), and the translations, evictions and modelled board time.
+
+What this showed for `fork_exec_s` (200 fork+exec of busybox `true`, about
+100 ms each): 370 k guest instructions per run, 92% kernel, of which
+fault-around and unmapping at exit were about 30%; but 60% of core0's host
+instructions went to translating, since the guest code a run goes through
+doesn't fit the code buffer: the whole buffer turns over twice per run and
+45 k guest instructions are translated again each time (273 host
+instructions each). In the simulator a 640 KiB buffer takes the 200 runs
+from 21.5 s to 8.3 s, a twice-as-fast translator to 15.8 s, a 1 MiB PSRAM
+backing store to 13.7 s, translated code at 60% of its size to 17.3 s; more
+or fewer regions, and a bigger jump cache, change nothing.
+
+### Translating on core1 (`PICO_FEATURES=async-jit`)
+
+With one guest hart, core1 can do the translating (rvjit's `async`
+feature, `Jit::enable_async`). A block missing from the cache is queued for
+core1 (newest first) and core0 runs it meanwhile with `Cpu::run_block`, as
+its translation would; the next time round the block is there. Core1
+translates in 200 us slices between its I/O passes, on a 4 KiB stack at the
+top of the code buffer: it marks the page and makes room under the
+translator's lock, emits with the lock released (only core1 adds blocks, so
+the space stays its own), and inserts under the lock again, dropping the
+block if its page was written meanwhile. Its blocks chain lazily (no eager
+chaining). Core0 runs `run_one_smp`, as with two harts. There is no
+translation threshold (`set_hot`) in this mode: translating costs core0
+nothing, and the counters' 32 KiB do more as code buffer (318 KiB). It is
+on by default (`--no-default-features` for the threshold instead); with two
+harts it changes nothing but that.
+
+On the board (quick runs, one boot each):
+
+| | boot | 200 fork+exec | first_runs | lua |
+|---|---|---|---|---|
+| inline translation, 321 KiB | 17.4 s | 18.0 s | 4.34 s | 1.49 s |
+| threshold 128, 286 KiB | 15.9 s | 18.2-18.5 s | 4.62 s | 1.51 s |
+| async + threshold, 284 KiB | 15.6 s | 14.3-14.5 s | 4.66 s | 1.50 s |
+| async, 316 KiB | 14.2 s | 14.1 s | 4.33 s | 1.45 s |
+
+Core1 keeps up: each block is run cold about once (8.9 M of 61 M guest
+instructions in the fork loop). With `Cpu::step` in place of `run_block`
+async gave 18.0 -> 16.6 s; a first version that also classified the whole
+block on core0 to find its end was no faster than translating inline.
+
 ## Native buffer engine (`rvaccel/`, `rvcore/pv-buffers`)
 
 `rvaccel` runs LZ4, ChaCha20-Poly1305, the SSH packet cipher, X25519,

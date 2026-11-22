@@ -151,7 +151,12 @@ impl Cpu {
             },
             EXT_SRST => {
                 if fid == 0 {
-                    self.halt = Some(Halt::Shutdown);
+                    // a0: reset type (0 shutdown, 1 cold reboot, 2 warm reboot)
+                    match a0 {
+                        0 => self.halt = Some(Halt::Shutdown),
+                        1 | 2 => self.halt = Some(Halt::Reboot),
+                        _ => err = ERR_INVALID_PARAM,
+                    }
                 } else {
                     err = ERR_NOT_SUPPORTED;
                 }

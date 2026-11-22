@@ -15,6 +15,10 @@
 # guest RAM in MiB, or KiB as NK (default 8128K: the PSRAM's 8 MiB less the
 # native engine's 64 KiB). -c 2: two harts, the second on core1, with the
 # disk guest's SMP kernel (DIR/smp, guest/run-build.sh disk-smp-kernel).
+# PICO_FEATURES=profile: the firmware with rvemu-pico's `profile` feature
+# (the translator's counters after each guest benchmark report).
+# PICO_NO_DEFAULT_FEATURES=1: without the default features (`async-jit`:
+# translating on core1), so with the translation threshold instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/pico-common.sh
@@ -42,7 +46,7 @@ ELF=target/riscv32imac-unknown-none-elf/release/rvemu-pico-shell
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 cargo build --locked -q --release -p rvemu
-RUSTFLAGS="-C target-feature=+zba,+zbb,+zbs,+zcb,+zbkb" cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf
+RUSTFLAGS="-C target-feature=+zba,+zbb,+zbs,+zcb,+zbkb" cargo build --locked -q --release -p rvemu-pico --target riscv32imac-unknown-none-elf ${PICO_NO_DEFAULT_FEATURES:+--no-default-features} ${PICO_FEATURES:+--features "$PICO_FEATURES"}
 # the pin devices only for a kernel with their drivers (the disk guest's)
 IO=0; grep -q '^CONFIG_RVEMU_GPIO=y' "$(dirname "$K")/linux.config" 2>/dev/null && IO=1
 # the SD card's disk for a kernel with a block layer (not the initramfs guest's)

@@ -8,6 +8,9 @@ edition = "2024"
 zbb = []
 # Same for the dispatcher and translator.
 ram-code = ["rvcore/ram-code"]
+# Translation on another host core (`Jit::enable_async`); without it the
+# dispatcher carries none of its code.
+async = []
 
 [dependencies]
 rvcore = { path = "../rvcore" }

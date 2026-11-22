@@ -107,6 +107,8 @@ disk_kernel() {   # TREE OUT [smp]
   patch_stock fs/squashfs/lz4_wrapper.c /guest/linux/squashfs-lz4-rvemu.patch
   # iomap's writeback bio pool: two bios, not 32 (each with a 3 KiB bvec)
   patch_stock fs/iomap/buffered-io.c /guest/linux/iomap-pool-small.patch
+  # no fault-around by default (fault_around_bytes= to set it)
+  patch_stock mm/memory.c /guest/linux/fault-around.patch
   # mmc_spi.c as it was, from trees built when the guest drove the SD card
   # itself (now the firmware does: the guest has no MMC layer)
   if [[ -f drivers/mmc/host/mmc_spi.c.stock ]]; then
