@@ -82,6 +82,9 @@ screen /dev/cu.usbmodemrvemu1 115200
 `pico-shell.sh` refuses to run while another program (`screen`, say) has
 the console port open. Running it again reboots the board.
 
+`reboot` in the guest restarts the board, and Linux boots again. `poweroff`
+stops it in BOOTSEL, ready for `pico-shell.sh`.
+
 ## Console and network
 
 The console is the board's USB serial port. A terminal opened after boot

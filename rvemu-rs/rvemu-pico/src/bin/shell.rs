@@ -1111,11 +1111,17 @@ fn main() -> ! {
     jit_loop(jit, cpu, bus);
     let why = match cpu.halt {
         Some(Halt::Shutdown) => "guest shut down",
+        Some(Halt::Reboot) => "guest reboot",
         _ => "guest stopped",
     };
     // let the last output reach the terminal
     let t0 = board::mcycle64();
     while !CON_OUT.is_empty() && board::mcycle64() - t0 < u64::from(sys_hz) {}
+    // a reboot restarts the board (and Linux); anything else waits in BOOTSEL
+    if cpu.halt == Some(Halt::Reboot) {
+        rprintln!("[rvemu-pico] {}; restarting", why);
+        hal::reboot::reboot(hal::reboot::RebootKind::Normal, hal::reboot::RebootArch::Riscv)
+    }
     fail(why);
 }
 

@@ -114,6 +114,8 @@ impl Smp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Halt {
     Shutdown,
+    /// SBI system reset with a cold or warm reboot type (Linux `reboot`).
+    Reboot,
     Until,
     MaxInsns,
     Idle,

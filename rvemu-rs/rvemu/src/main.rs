@@ -974,6 +974,7 @@ fn run() -> Result<(), String> {
         bus.plat.con.restore();
         let why = match cpu.halt {
             Some(Halt::Shutdown) => "guest shutdown",
+            Some(Halt::Reboot) => "guest reboot",
             Some(Halt::Until) => "--until matched",
             Some(Halt::MaxInsns) => "instruction limit",
             Some(Halt::Idle) => "guest idle",
@@ -1054,6 +1055,7 @@ fn run() -> Result<(), String> {
 
     let why = match cpu.halt {
         Some(Halt::Shutdown) => "guest shutdown",
+        Some(Halt::Reboot) => "guest reboot",
         Some(Halt::Until) => "--until matched",
         Some(Halt::MaxInsns) => "instruction limit",
         Some(Halt::Idle) => "guest idle",
