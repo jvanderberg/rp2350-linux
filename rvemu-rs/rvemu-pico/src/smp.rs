@@ -460,8 +460,16 @@ pub fn hart1_after(cpu: &mut Cpu) {
     }
 }
 
-const HALTS: [Halt; 7] =
-    [Halt::Shutdown, Halt::Until, Halt::MaxInsns, Halt::Idle, Halt::User, Halt::Panic, Halt::Stopped];
+const HALTS: [Halt; 8] = [
+    Halt::Shutdown,
+    Halt::Until,
+    Halt::MaxInsns,
+    Halt::Idle,
+    Halt::User,
+    Halt::Panic,
+    Halt::Stopped,
+    Halt::Reboot,
+];
 
 fn halt_code(h: Halt) -> u32 {
     HALTS.iter().position(|&x| x == h).map_or(1, |i| i as u32 + 1)

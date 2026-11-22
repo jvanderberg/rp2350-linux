@@ -743,6 +743,37 @@ from 21.5 s to 8.3 s, a twice-as-fast translator to 15.8 s, a 1 MiB PSRAM
 backing store to 13.7 s, translated code at 60% of its size to 17.3 s; more
 or fewer regions, and a bigger jump cache, change nothing.
 
+### Translating on core1 (`PICO_FEATURES=async-jit`)
+
+With one guest hart, core1 can do the translating (rvjit's `async`
+feature, `Jit::enable_async`). A block missing from the cache is queued for
+core1 (newest first) and core0 runs it meanwhile with `Cpu::run_block`, as
+its translation would; the next time round the block is there. Core1
+translates in 200 us slices between its I/O passes, on a 4 KiB stack at the
+top of the code buffer: it marks the page and makes room under the
+translator's lock, emits with the lock released (only core1 adds blocks, so
+the space stays its own), and inserts under the lock again, dropping the
+block if its page was written meanwhile. Its blocks chain lazily (no eager
+chaining). Core0 runs `run_one_smp`, as with two harts. There is no
+translation threshold (`set_hot`) in this mode: translating costs core0
+nothing, and the counters' 32 KiB do more as code buffer (318 KiB). It is
+on by default (`--no-default-features` for the threshold instead); with two
+harts it changes nothing but that.
+
+On the board (quick runs, one boot each):
+
+| | boot | 200 fork+exec | first_runs | lua |
+|---|---|---|---|---|
+| inline translation, 321 KiB | 17.4 s | 18.0 s | 4.34 s | 1.49 s |
+| threshold 128, 286 KiB | 15.9 s | 18.2-18.5 s | 4.62 s | 1.51 s |
+| async + threshold, 284 KiB | 15.6 s | 14.3-14.5 s | 4.66 s | 1.50 s |
+| async, 316 KiB | 14.2 s | 14.1 s | 4.33 s | 1.45 s |
+
+Core1 keeps up: each block is run cold about once (8.9 M of 61 M guest
+instructions in the fork loop). With `Cpu::step` in place of `run_block`
+async gave 18.0 -> 16.6 s; a first version that also classified the whole
+block on core0 to find its end was no faster than translating inline.
+
 ## Native buffer engine (`rvaccel/`, `rvcore/pv-buffers`)
 
 `rvaccel` runs LZ4, ChaCha20-Poly1305, the SSH packet cipher, X25519,

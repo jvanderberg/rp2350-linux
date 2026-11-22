@@ -55,7 +55,7 @@ hex() { printf "0x%x" "$1"; }
 [ -n "$D" ] && LOADERS+=(-device "loader,file=$D,addr=0x8a000000,force-raw=on")
 
 qemu-system-riscv32 -machine virt -bios none -m 256M -nographic -monitor none -serial stdio \
-  "${ICOUNT[@]}" \
+  "${ICOUNT[@]}" ${QEMU_EXTRA:-} \
   -kernel "$ELF" \
   -device "loader,file=$K,addr=$(hex $BASE),force-raw=on" \
   "${LOADERS[@]}" \

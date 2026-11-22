@@ -51,7 +51,7 @@ impl Cpu {
 
     #[inline(always)]
     #[cfg_attr(feature = "ram-code", unsafe(link_section = ".data.rvemu_hot"))]
-    fn tlb_lookup(&self, va: u32, acc: usize) -> Option<usize> {
+    pub(crate) fn tlb_lookup(&self, va: u32, acc: usize) -> Option<usize> {
         let slot = ((va >> 12) as usize) & (TLB_SIZE - 1);
         debug_assert!(self.mmu_idx < MMU_N && acc < ACC_N);
         // SAFETY: mmu_idx < MMU_N and acc < ACC_N by construction; slot is masked.
@@ -233,8 +233,8 @@ impl Cpu {
             let e = &mut self.tlb[self.mmu_idx][acc][slot];
             e.tag = vpage;
             e.addend = hp.wrapping_sub(vpage as usize);
-            if acc == ACC_W && !self.smp.is_null() {
-                // another hart may have marked the page as code since the
+            if acc == ACC_W && (self.code_pages_shared || !self.smp.is_null()) {
+                // another core may have marked the page as code since the
                 // check above (it then drops write entries, ours included,
                 // after its mark): look again after publishing the entry
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
