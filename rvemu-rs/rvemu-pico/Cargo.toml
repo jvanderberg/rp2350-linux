@@ -27,6 +27,9 @@ bench = false
 # counters, after each benchmark report (`/dev/rvemu-bench` in the guest).
 # The counting itself costs a little; not for the perf gate.
 profile = []
+# rvemu-pico-shell with one hart: core1 translates the blocks core0 misses
+# (rvjit `enable_async`) while core0 interprets them.
+async-jit = ["rvjit/async"]
 
 [dependencies]
 rvcore = { path = "../rvcore", features = ["ram-code", "pv-buffers"] }

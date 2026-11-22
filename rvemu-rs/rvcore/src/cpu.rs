@@ -282,6 +282,10 @@ pub struct Cpu {
     /// Null when no translator is attached. Writes to such pages never get
     /// a write-TLB entry; the first one sets `smc_page`.
     pub code_pages: *const u8,
+    /// Another host core may mark pages as code while this hart runs (a
+    /// second hart, or a translator on another core): `tlb_fill` looks at
+    /// the page bit again after publishing a write entry.
+    pub code_pages_shared: bool,
     pub smc_page: Option<u32>,
     #[cfg(feature = "pv-buffers")]
     pub(crate) native_write: Option<(u32, u32)>,
@@ -378,6 +382,7 @@ macro_rules! cpu_fields {
             ram_size: $ram_size,
             ro_size: 0,
             code_pages: core::ptr::null(),
+            code_pages_shared: false,
             smc_page: None,
             #[cfg(feature = "pv-buffers")]
             native_write: None,

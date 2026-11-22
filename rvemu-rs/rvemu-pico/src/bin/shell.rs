@@ -204,12 +204,23 @@ impl NorFlash for BoardNor {
 /// code and buffers (`core1.rs`), the pin devices and core0's stack (about
 /// 9 KiB, what is left above .bss; `setup` and the run each need about 5-6) have
 /// theirs. core0's stack is painted at boot; core1 reports its depth on RTT.
-const CODE_KIB: usize = 321;
+/// (`async-jit`: its translator service in SRAM costs two KiB, and another
+/// with `profile`.)
+const CODE_KIB: usize = match (cfg!(feature = "async-jit"), cfg!(feature = "profile")) {
+    (true, true) => 318,
+    (true, false) => 319,
+    _ => 321,
+};
 const CODE_WORDS: usize = CODE_KIB * 256;
 /// With two harts, the top of the code buffer is hart 1's (in SRAM, as hart
 /// 0's is): its Cpu, its jump cache and the stack core1 runs it on.
 const HART1_WORDS: usize = (core::mem::size_of::<Cpu>() + NJC * core::mem::size_of::<JcEntry>() + smp::HART1_STACK_BYTES + 32) / 4;
 const _: () = assert!(core::mem::align_of::<Cpu>() <= 16 && core::mem::align_of::<JcEntry>() <= 16);
+/// With `async-jit` and one hart, the top of the code buffer is the stack
+/// core1 translates on (`setup_async`).
+const ASYNC_STACK_WORDS: usize = 1024;
+#[cfg(feature = "async-jit")]
+static mut ASYNC_STACK: (usize, usize) = (0, 0);
 /// Hart 1's Cpu and the top of its stack (`setup_hart1`).
 static mut HART1_CPU: usize = 0;
 static mut HART1_STACK: (usize, usize) = (0, 0);
@@ -1040,6 +1051,11 @@ fn profile_report(jit: &Jit, cpu: &Cpu, bus: &mut PicoBus) {
     );
     let _ = writeln!(
         w,
+        "profile async queued={} dropped={} blocks={} discards={} cold_runs={} cold_insns={}",
+        s.async_queued, s.async_dropped, s.async_blocks, s.async_discards, s.async_cold_runs, s.async_cold_insns
+    );
+    let _ = writeln!(
+        w,
         "profile mmu tlb_miss={:?} tlb_flushes={} tlb_page_flushes={} exceptions={} interrupts={} \
          sbi_calls={} wfi={} idle_ticks={}",
         c.tlb_miss, c.tlb_flushes, c.tlb_page_flushes, c.exceptions, c.interrupts, c.sbi_calls, c.wfi, c.idle_ticks
@@ -1290,7 +1306,15 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
         c.set_readonly_prefix(h.text_len);
         c
     };
-    let jit = make_jit(cpu, if two_harts { CODE_WORDS - HART1_WORDS } else { CODE_WORDS });
+    let async_jit = cfg!(feature = "async-jit") && !two_harts;
+    let code_words = if two_harts {
+        CODE_WORDS - HART1_WORDS
+    } else if async_jit {
+        CODE_WORDS - ASYNC_STACK_WORDS
+    } else {
+        CODE_WORDS
+    };
+    let jit = make_jit(cpu, code_words);
     // Guest RAM is PSRAM, where Hazard3 AMOs fault.
     jit.native_amo = false;
     // Only profiling builds print jit.stats: skip per-dispatch minstret reads.
@@ -1298,12 +1322,17 @@ fn setup() -> (&'static mut Jit<'static>, &'static mut Cpu, &'static mut PicoBus
     if two_harts {
         setup_hart1(jit, cpu, &h, dtb, sys_hz);
     }
+    #[cfg(feature = "async-jit")]
+    if async_jit {
+        setup_async(jit, cpu, sys_hz);
+    }
     rprintln!(
-        "guest RAM {} KiB, {} hart(s), translator {} KiB code cache + {} KiB PSRAM store, disk {} KiB, swap {}, SD {}; console on USB",
+        "guest RAM {} KiB, {} hart(s), translator {} KiB code cache + {} KiB PSRAM store{}, disk {} KiB, swap {}, SD {}; console on USB",
         h.ram_size >> 10,
         if two_harts { 2 } else { 1 },
-        if two_harts { CODE_WORDS - HART1_WORDS } else { CODE_WORDS } * 4 / 1024,
+        code_words * 4 / 1024,
         STORE_WORDS * 4 / 1024,
+        if async_jit { ", translating on core1" } else { "" },
         disk_kib,
         if swap_on { "on" } else { "off" },
         if sd_on { "on" } else { "off" }
@@ -1372,6 +1401,58 @@ fn setup_hart1(jit: &mut Jit<'static>, cpu: &mut Cpu, h: &BlobHeader, dtb: u32, 
     jit.budget_cap = smp::BUDGET_CAP;
     smp::enable();
     core1::set_hook(hart1_hook);
+}
+
+/// One hart, translating on core1: a stack for it at the top of the code
+/// buffer (which `make_jit` left out), then core1's hook to run it.
+#[cfg(feature = "async-jit")]
+#[inline(never)]
+fn setup_async(jit: &mut Jit<'static>, cpu: &mut Cpu, sys_hz: u32) {
+    // SAFETY: the code buffer's last ASYNC_STACK_WORDS, which the
+    // translator doesn't have, used by nothing else; JIT_SMP is used by
+    // nothing else with one hart.
+    unsafe {
+        let end = (&raw mut CODE) as usize + CODE_WORDS * 4;
+        let stack = ((end - ASYNC_STACK_WORDS * 4).next_multiple_of(16), end & !15);
+        core1::paint(stack.0, stack.1);
+        *addr_of_mut!(ASYNC_STACK) = stack;
+        *addr_of_mut!(HART1_SLICE_CYCLES) = u64::from(sys_hz / 1_000_000) * HART1_SLICE_US;
+        jit.enable_async(cpu, &smp::JIT_SMP);
+    }
+    jit.async_wake = Some(core1::notify_core1);
+    // a translation that evicts waits for core0 to leave translated code
+    jit.budget_cap = smp::BUDGET_CAP;
+    core1::set_hook(async_hook);
+}
+
+/// Whether core1 left blocks queued (`async_slice`).
+#[cfg(feature = "async-jit")]
+static ASYNC_MORE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// core1's hook with `setup_async`: translate for a slice, on its own
+/// stack. True if blocks are still queued.
+#[cfg(feature = "async-jit")]
+#[unsafe(link_section = ".data.core1")]
+fn async_hook() -> bool {
+    // SAFETY: set before the hook.
+    core1::call_on_stack(unsafe { ASYNC_STACK.1 }, async_slice);
+    ASYNC_MORE.load(Ordering::Relaxed)
+}
+
+/// Translate queued blocks for up to a slice (core1, on its own stack).
+#[cfg(feature = "async-jit")]
+#[inline(never)]
+#[unsafe(link_section = ".data.rvemu_hot")]
+extern "C" fn async_slice() {
+    // SAFETY: `setup_async` made these before setting the hook; the
+    // translator is shared under its own lock (rvjit `enable_async`).
+    let (jit, slice) = unsafe { ((*addr_of_mut!(JIT)).assume_init_mut(), *addr_of_mut!(HART1_SLICE_CYCLES)) };
+    let t0 = core1::now();
+    let more = jit.async_serve(|| {
+        core1::serve_park();
+        core1::now() - t0 < slice
+    });
+    ASYNC_MORE.store(more, Ordering::Relaxed);
 }
 
 /// The guest's devices, built straight into the static bus (a `with_*`

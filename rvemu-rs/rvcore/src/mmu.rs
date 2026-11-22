@@ -233,8 +233,8 @@ impl Cpu {
             let e = &mut self.tlb[self.mmu_idx][acc][slot];
             e.tag = vpage;
             e.addend = hp.wrapping_sub(vpage as usize);
-            if acc == ACC_W && !self.smp.is_null() {
-                // another hart may have marked the page as code since the
+            if acc == ACC_W && (self.code_pages_shared || !self.smp.is_null()) {
+                // another core may have marked the page as code since the
                 // check above (it then drops write entries, ours included,
                 // after its mark): look again after publishing the entry
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);

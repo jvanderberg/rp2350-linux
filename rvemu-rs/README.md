@@ -743,6 +743,29 @@ from 21.5 s to 8.3 s, a twice-as-fast translator to 15.8 s, a 1 MiB PSRAM
 backing store to 13.7 s, translated code at 60% of its size to 17.3 s; more
 or fewer regions, and a bigger jump cache, change nothing.
 
+### Translating on core1 (`PICO_FEATURES=async-jit`)
+
+With one guest hart, core1 can do the translating (rvjit's `async`
+feature, `Jit::enable_async`). A block missing from the cache is queued for
+core1 (newest first) and core0 interprets it meanwhile, up to its first
+branch, jump or SYSTEM instruction; the next time round the block is
+there. Core1 translates in 200 us slices between its I/O passes, on a
+4 KiB stack at the top of the code buffer: it marks the page and makes
+room under the translator's lock, emits with the lock released (only core1
+adds blocks, so the space stays its own), and inserts under the lock
+again, dropping the block if its page was written meanwhile. Its blocks
+chain lazily (no eager chaining). Core0 runs `run_one_smp`, as with two
+harts. The SRAM it needs comes out of the code buffer (319 KiB, 318 with
+`profile`).
+
+On the board, against the same branch without it: 200 fork+exec 18.0 s ->
+16.6 s, boot 17.4 s -> 16.3 s, `first_runs`, `lua` within noise. Core1
+keeps up: each block is interpreted about once (8.9 M of 61 M guest
+instructions in the fork loop). What it costs core0 is the interpreting
+(`Cpu::step`, ~180 host instructions per guest instruction) and the queue;
+a first version that also classified the whole block on core0 to find its
+end was no faster than translating inline.
+
 ## Native buffer engine (`rvaccel/`, `rvcore/pv-buffers`)
 
 `rvaccel` runs LZ4, ChaCha20-Poly1305, the SSH packet cipher, X25519,
