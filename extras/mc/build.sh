@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build mc, and xmc (mc in an X11 window; it needs ../demos/x11.h and the
-# terminal from ../tm for its output view). Each
+# terminal from ../tm for its terminal tabs). Each
 # source file is compiled on its own and then linked, which keeps tcc's
 # peak memory low enough for the RP2350 board.
 #
