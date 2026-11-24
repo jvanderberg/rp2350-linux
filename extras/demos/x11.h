@@ -43,6 +43,16 @@
  *             the drawing calls there (0: back to the frame); x_blit(c, ...)
  *             copies part of it into the frame. Draw something once, then
  *             reuse it for 28 bytes a frame.
+ *   masks     x_mask(w, h) makes a 1-bit image, all clear; x_mask_rects
+ *             sets rectangles of it. x_blit_masked copies only the pixels
+ *             a mask has set, for shapes that aren't rectangles. For a mask
+ *             used again and again, make a stencil of it once (x_stencil)
+ *             and copy with x_blit_stencil: the server does the costly part
+ *             of a masked copy once instead of every time.
+ *             x_fill_stippled fills a rectangle only where a small mask,
+ *             repeated, is set: a dither, for a see-through tint.
+ *             x_target_window() draws straight onto the window, over what
+ *             x_present() last showed, leaving the back buffer alone.
  *   input     x_event() returns key down and up (a real release, unlike a
  *             terminal; a held key repeats as up/down pairs), mouse buttons
  *             and motion, resize (draw again) and close. e.key is ASCII
@@ -52,6 +62,13 @@
  *             (call it after x_present() so a slow link can't build up a
  *             queue of old frames), x_wait(ms), x_flush(), x_fd() for your
  *             own poll(), x_close()
+ *   fences    x_fence() after x_present(), and x_fence_wait() before the
+ *             next one, instead of x_sync(): the program draws the next
+ *             frame while the last one travels, and still never more than
+ *             one frame ahead of the server
+ *
+ * Define X11_TIMING before including this to count the time spent sending
+ * in x_write_us (microseconds).
  *
  * Needs a TrueColor display (any current server, XQuartz included) that
  * lets this machine connect: on the machine with the screen, allow network
@@ -153,12 +170,31 @@ static void xi_lost(void)
     }
 }
 
+#ifdef X11_TIMING
+#include <time.h>
+static unsigned long long x_write_us;   /* time spent in write() */
+static unsigned long long xi_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000u + (unsigned long long)ts.tv_nsec / 1000u;
+}
+#endif
+
 static void xi_write(const void *buf, size_t n)
 {
     const unsigned char *p = buf;
 
     while (n > 0 && !xi_dead) {
+#ifdef X11_TIMING
+        unsigned long long t = xi_us();
         ssize_t w = write(xi_fd, p, n);
+
+        x_write_us += xi_us() - t;
+#else
+        ssize_t w = write(xi_fd, p, n);
+#endif
 
         if (w < 0 && errno == EINTR)
             continue;
@@ -256,10 +292,17 @@ static void xi_make_back(void)
     xi_put16((unsigned int)x_height);
 }
 
+static unsigned int xi_fence_seq;
+static int xi_fence_on;                 /* a fence's reply is still to come */
+
 static void xi_handle(const unsigned char *b)
 {
     int x = (short)xi_get16(b + 24), y = (short)xi_get16(b + 26);
 
+    if (xi_fence_on && (b[0] & 0x7f) <= 1 && xi_get16(b + 2) == xi_fence_seq) {
+        xi_fence_on = 0;                /* the fence's reply (or error) */
+        return;
+    }
     switch (b[0] & 0x7f) {
     case 0:
         fprintf(stderr, "x11: error %d from request %d\n", b[1], b[10]);
@@ -843,6 +886,10 @@ static inline void x_free_canvas(unsigned int c)
 /* Where the drawing calls go: a canvas, or 0 for the frame. */
 static inline void x_target(unsigned int c) { xi_target = c; }
 
+/* Draw straight onto the window, over the last frame x_present showed;
+ * the back buffer is left as it was. x_target(0) goes back to it. */
+static inline void x_target_window(void) { xi_target = xi_win; }
+
 /* Copy w x h from (sx, sy) of canvas c to (dx, dy) of the current target. */
 static inline void x_blit(unsigned int c, int sx, int sy, int w, int h, int dx, int dy)
 {
@@ -852,6 +899,177 @@ static inline void x_blit(unsigned int c, int sx, int sy, int w, int h, int dx, 
     xi_put32(c);
     xi_put32(xi_dst());
     xi_put32(xi_gc);
+    xi_put16((unsigned int)sx);
+    xi_put16((unsigned int)sy);
+    xi_put16((unsigned int)dx);
+    xi_put16((unsigned int)dy);
+    xi_put16((unsigned int)w);
+    xi_put16((unsigned int)h);
+}
+
+/* ---- masks: 1-bit images that say which pixels of a canvas to copy ---- */
+
+static unsigned int xi_gc1, xi_gc1_fg = 2;
+
+static void xi_mask_fg(unsigned int m, unsigned int fg)
+{
+    if (xi_gc1 == 0) {
+        xi_gc1 = xi_new_id();
+        xi_req(55, 0, 4 + 1);           /* CreateGC, for depth-1 drawables */
+        xi_put32(xi_gc1);
+        xi_put32(m);
+        xi_put32(0x10000);              /* graphics-exposures */
+        xi_put32(0);
+    }
+    if (fg != xi_gc1_fg) {
+        xi_req(56, 0, 3 + 1);           /* ChangeGC: foreground */
+        xi_put32(xi_gc1);
+        xi_put32(0x4);
+        xi_put32(fg);
+        xi_gc1_fg = fg;
+    }
+}
+
+/* A w x h mask, all clear (nothing copied). Free it with x_free_canvas. */
+static inline unsigned int x_mask(int w, int h)
+{
+    unsigned int m = xi_new_id();
+
+    xi_req(53, 1, 4);                   /* CreatePixmap, depth 1 */
+    xi_put32(m);
+    xi_put32(xi_win);
+    xi_put16((unsigned int)(w > 0 ? w : 1));
+    xi_put16((unsigned int)(h > 0 ? h : 1));
+    xi_mask_fg(m, 0);
+    xi_req(70, 0, 3 + 2);               /* PolyFillRectangle: clear it */
+    xi_put32(m);
+    xi_put32(xi_gc1);
+    xi_put32(0);
+    xi_put16((unsigned int)(w > 0 ? w : 1));
+    xi_put16((unsigned int)(h > 0 ? h : 1));
+    return m;
+}
+
+/* Set n rectangles (x, y, w, h each) of mask m: those pixels get copied. */
+static inline void x_mask_rects(unsigned int m, const short *r, int n)
+{
+    int most = (int)((sizeof xi_out - 12) / 8);
+
+    xi_mask_fg(m, 1);
+    while (n > 0) {
+        int k = n < most ? n : most;
+
+        xi_req(70, 0, 3 + (unsigned int)(k * 2));
+        xi_put32(m);
+        xi_put32(xi_gc1);
+        for (int i = 0; i < k * 4; i++)
+            xi_put16((unsigned int)r[i]);
+        r += k * 4;
+        n -= k;
+    }
+}
+
+/* x_blit, copying only the pixels set in mask m (which lines up with c). */
+static inline void x_blit_masked(unsigned int c, unsigned int m, int sx, int sy, int w, int h,
+                                 int dx, int dy)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    xi_req(56, 0, 3 + 3);               /* ChangeGC: clip origin and mask */
+    xi_put32(xi_gc);
+    xi_put32(0x20000 | 0x40000 | 0x80000);
+    xi_put32((unsigned int)(dx - sx));
+    xi_put32((unsigned int)(dy - sy));
+    xi_put32(m);
+    x_blit(c, sx, sy, w, h, dx, dy);
+    xi_change_gc(0x80000, 0);           /* clip mask: None */
+}
+
+/*
+ * A fence: x_fence marks the point reached, and x_fence_wait waits until
+ * the server has dealt with everything up to the last mark. Waiting for
+ * the previous frame's fence instead of x_sync keeps one frame in flight,
+ * so the board draws the next frame while the last one travels.
+ */
+static inline void x_fence_wait(void)
+{
+    unsigned char b[32];
+
+    x_flush();
+    while (xi_fence_on && !xi_dead) {
+        if (xi_message(b, NULL) < 0)
+            break;
+        xi_handle(b);
+    }
+    xi_fence_on = 0;
+}
+
+static inline void x_fence(void)
+{
+    x_fence_wait();                     /* only one at a time */
+    xi_req(43, 0, 1);                   /* GetInputFocus: any request with a reply */
+    xi_fence_seq = xi_seq & 0xffff;
+    xi_fence_on = 1;
+    x_flush();
+}
+
+/* Fill a rectangle in the current colour, but only where the mask m,
+ * repeated across it like wallpaper, is set: a dither, for tints. */
+static inline void x_fill_stippled(unsigned int m, int x, int y, int w, int h)
+{
+    xi_req(56, 0, 3 + 4);               /* ChangeGC: fill-style, stipple, ts origin */
+    xi_put32(xi_gc);
+    xi_put32(0x100 | 0x800 | 0x1000 | 0x2000);
+    xi_put32(2);                        /* FillStippled */
+    xi_put32(m);
+    xi_put32(0);
+    xi_put32(0);
+    xi_box(70, x, y, w, h, 0);
+    xi_change_gc(0x100, 0);             /* FillSolid */
+}
+
+/*
+ * A stencil: a mask set up once for repeated masked copies. Setting a mask
+ * makes the server turn the bitmap into a clip region, which is slow for
+ * big masks; a stencil does that once, and each x_blit_stencil only moves
+ * it. Free it with x_free_stencil (before freeing the mask).
+ */
+static inline unsigned int x_stencil(unsigned int m)
+{
+    unsigned int g = xi_new_id();
+
+    xi_req(55, 0, 4 + 2);               /* CreateGC */
+    xi_put32(g);
+    xi_put32(xi_win);
+    xi_put32(0x10000 | 0x80000);        /* graphics-exposures, clip-mask */
+    xi_put32(0);
+    xi_put32(m);
+    return g;
+}
+
+static inline void x_free_stencil(unsigned int g)
+{
+    if (g == 0)
+        return;
+    xi_req(60, 0, 2);                   /* FreeGC */
+    xi_put32(g);
+}
+
+/* x_blit through stencil g, made from the mask that lines up with c. */
+static inline void x_blit_stencil(unsigned int g, unsigned int c, int sx, int sy, int w, int h,
+                                  int dx, int dy)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    xi_req(56, 0, 3 + 2);               /* ChangeGC: clip origin */
+    xi_put32(g);
+    xi_put32(0x20000 | 0x40000);
+    xi_put32((unsigned int)(dx - sx));
+    xi_put32((unsigned int)(dy - sy));
+    xi_req(62, 0, 7);                   /* CopyArea */
+    xi_put32(c);
+    xi_put32(xi_dst());
+    xi_put32(g);
     xi_put16((unsigned int)sx);
     xi_put16((unsigned int)sy);
     xi_put16((unsigned int)dx);

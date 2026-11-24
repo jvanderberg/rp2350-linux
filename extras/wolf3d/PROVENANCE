@@ -1,0 +1,48 @@
+Wolf4SDL, https://github.com/KS-Presto/Wolf4SDL
+Commit dc8b250af35fb0ace68db5eb879490b50068c20e (2024-05-20), the last
+before that repository was archived; development continues at
+https://bitbucket.org/ks-presto/wolf4sdl.
+
+  Wolf4SDL by Moritz "Ripper" Kroll (http://www.chaos-software.de.vu - OFFLINE)
+  Original Wolfenstein 3D by id Software (http://www.idsoftware.com)
+  Modifications to r262 by Andy_Nonymous and others
+  (http://diehardwolfers.areyep.com/viewtopic.php?t=6693)
+
+License: Wolf4SDL's code from Wolfenstein 3D is offered under id Software's
+license or the GNU GPL version 2, at the user's choice (its README.TXT,
+"Licenses"). This port takes the GPL: LICENSE-GPL-2.0 is upstream's
+license-gpl.txt, unchanged.
+
+Taken: the engine's sources, id_*.c/h and wl_*.c/h with version.h,
+foreign.h, f_spear.h, the audio*.h and gfxv_*.h headers, wolfpal.inc and
+sodpal.inc. Files not listed below are unchanged.
+
+Left out: signon.c (the sign-on picture as a 64000-byte initializer, too big
+for tcc to compile on the board), the OPL2 emulators (mame/, dosbox/), the
+SDL_mixer sound code and the platform ports and project files.
+
+Replaced:
+- id_sd.c: a sound manager with the same interface that plays nothing (the
+  board has no sound output).
+
+Changed (each says how at the top):
+- id_ca.c, id_ca.h, id_pm.c: graphics chunks and VSWAP pages are read when
+  used instead of all at startup, which needed 1.2 MB the board doesn't have.
+  Other files read graphics chunks through CA_GrSeg instead of grsegs[]
+  (id_vh.c, wl_game.c, wl_inter.c, wl_main.c, wl_menu.c, wl_text.c).
+- id_vh.c, id_vh.h, id_vl.c, wl_draw.c, wl_scale.c, wl_play.c: the screen
+  goes to xwolf.c, which sends it to an X server; the 3D view and sprites
+  are drawn there from textures the server keeps, not into the 8-bit buffer.
+  320x200, fades in one step, flashes as a tint.
+- wl_def.h: packing only where a file format needs it (ARM wants the
+  state tables' function pointers aligned); itoa and ltoa read the length of
+  an uninitialized buffer, so numbers came out cut short ("100%" as "1%").
+- wl_state.c: a left shift of a negative number, which C leaves undefined,
+  is now a multiplication.
+- wl_main.c, wl_game.c: no SDL_syswm or SDL_mixer headers.
+- version.h: set up for the shareware data, version 1.4.
+
+Added (MIT): xwolf.c and SDL.h (the SDL calls the engine makes, on X11
+through ../demos/x11.h), build.sh, fetch-shareware.sh.
+
+Game data is not included: fetch-shareware.sh downloads the shareware.
