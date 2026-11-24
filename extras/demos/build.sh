@@ -20,7 +20,7 @@ build() {
     return $rc
 }
 
-targets=${*:-"stackfall rain pulse asteroids bogomips life maze"}
+targets=${*:-"stackfall rain pulse asteroids bogomips life maze xeyes xmaze"}
 status=0
 for t in $targets; do
     case $t in
@@ -31,6 +31,8 @@ for t in $targets; do
         bogomips)  build bogomips bogomips.c || status=1 ;;
         life)      build life life.c || status=1 ;;
         maze)      build maze maze.c || status=1 ;;
+        xeyes)     build xeyes xeyes.c || status=1 ;;
+        xmaze)     build xmaze xmaze.c || status=1 ;;
         *)         echo "unknown demo: $t"; status=1 ;;
     esac
 done
