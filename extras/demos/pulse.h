@@ -13,16 +13,21 @@
 #define MAXCPU  8               /* cores tracked individually */
 
 typedef struct {
-    int pid;
+    int pid, ppid;
     char name[24];
     char state;
+    int nice;
     int threads;
     unsigned long rss_kb;
-    unsigned long ticks;
+    unsigned long vsize_kb;
+    unsigned long ticks;        /* CPU time, user and system */
+    unsigned long start;        /* clock ticks after boot */
     int cpu_pm;                 /* permille of one core (can exceed 1000) */
 } Proc;
 
-enum { SORT_CPU, SORT_MEM, SORT_PID, SORT_NAME, SORT_COUNT };
+enum { SORT_CPU, SORT_MEM, SORT_PID, SORT_NAME, SORT_COUNT,
+       /* more, for xpulse's columns; pulse's s key cycles the first four */
+       SORT_PPID = SORT_COUNT, SORT_STATE, SORT_NICE, SORT_THR, SORT_VIRT, SORT_TIME };
 
 extern struct utsname uts;
 extern int ncpu;
