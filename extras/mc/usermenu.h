@@ -46,4 +46,29 @@
  * entry chosen. Returns 1 if a command ran (panels may need a rescan). */
 int usermenu_run(struct panel *p, struct panel *other);
 
+/* The same in steps, for a front end that shows the entries its own way
+ * (xmc puts them in its right-click menu): usermenu_open() reads the menu
+ * and finds the entries whose conditions hold, usermenu_exec() expands
+ * and runs one (asking for any %{...} text first), usermenu_close() frees
+ * it all. */
+struct usermenu_ctx {
+    struct panel *p, *other;
+    int shell_patterns;
+};
+struct uentry;
+struct usermenu {
+    int n;                      /* the entries that apply */
+    const char **labels;        /* each as written: hotkey, then title */
+    char *hotkeys;
+    int def;                    /* the entry to start on (from '=') */
+    /* private */
+    struct usermenu_ctx c;
+    char *text;
+    struct uentry *e;
+    int ne, *map;
+};
+int  usermenu_open(struct usermenu *m, struct panel *p, struct panel *other);
+int  usermenu_exec(struct usermenu *m, int i);
+void usermenu_close(struct usermenu *m);
+
 #endif /* USERMENU_H */

@@ -9,8 +9,8 @@ multiplexer and Wolfenstein 3D. They are built on the board with `cc`.
 | [`demos/`](demos/) | Terminal games and demos | `./build.sh`, then `./asteroids` |
 | [`wolf3d/`](wolf3d/README.md) | Wolfenstein 3D in an X11 window | see its README |
 | [`bbs/`](bbs/) | A telnet BBS with a MUD | `./bbsctl start` |
-| [`mc/`](mc/README.md) | A Midnight Commander lookalike | `./build.sh && ./mc` |
-| [`tm/`](tm/README.md) | A small tmux work-alike | `./build.sh && ./tm` |
+| [`mc/`](mc/README.md) | A Midnight Commander lookalike, and `xmc`, the same in an X11 window | `./build.sh && ./mc` |
+| [`tm/`](tm/README.md) | A small tmux work-alike, and `xterm`, a terminal in an X11 window | `./build.sh && ./tm` |
 | [`nnn/`](nnn/) | The nnn file manager | `./build.sh && ./nnn` |
 | [`noice/`](noice/) | The noice file browser | see below |
 | [`ws2812/`](ws2812/) | WS2812 LEDs driven by PIO | see below |

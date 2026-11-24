@@ -86,12 +86,6 @@ struct uentry {
     int visible, is_default;
 };
 
-/* Context for conditions and macros. */
-struct ctx {
-    struct panel *p, *other;
-    int shell_patterns;
-};
-
 /* ---- a growable string ------------------------------------------------ */
 
 struct sbuf {
@@ -184,7 +178,7 @@ static char *load_menu(const char *dir)
 
 /* ---- conditions -------------------------------------------------------- */
 
-static int match(const struct ctx *c, const char *pattern, const char *s)
+static int match(const struct usermenu_ctx *c, const char *pattern, const char *s)
 {
     regex_t re;
     int r;
@@ -216,7 +210,7 @@ static int type_is(struct panel *p, const char *types)
     return 0;
 }
 
-static int test(const struct ctx *c, char op, const char *arg)
+static int test(const struct usermenu_ctx *c, char op, const char *arg)
 {
     struct panel *p = op >= 'A' && op <= 'Z' ? c->other : c->p;
     struct entry *e = panel_current(p);
@@ -237,7 +231,7 @@ static int test(const struct ctx *c, char op, const char *arg)
 }
 
 /* Evaluate "f *.c & ! t d | x build.sh", left to right. */
-static int eval_condition(const struct ctx *c, const char *s)
+static int eval_condition(const struct usermenu_ctx *c, const char *s)
 {
     int value = -1, negate = 0;
     char join = '&';
@@ -285,7 +279,7 @@ static int eval_condition(const struct ctx *c, const char *s)
 }
 
 /* Split the menu text into entries, evaluating conditions as we go. */
-static int parse_menu(char *text, struct ctx *c, struct uentry **out)
+static int parse_menu(char *text, struct usermenu_ctx *c, struct uentry **out)
 {
     struct uentry *e = NULL;
     int n = 0, cap = 0, cond = 1, def = 0;
@@ -373,7 +367,7 @@ static void add_names(struct sbuf *b, struct panel *p, int marked_only)
 
 /* Expand the macros of `cmd`. Returns NULL if a %{prompt} was cancelled.
  * *unmark is set when %u was used. */
-static char *expand(const struct ctx *c, const char *cmd, int *unmark)
+static char *expand(const struct usermenu_ctx *c, const char *cmd, int *unmark)
 {
     struct sbuf b = { NULL, 0, 0 };
     struct entry *e;
@@ -455,74 +449,92 @@ static char *expand(const struct ctx *c, const char *cmd, int *unmark)
 
 /* ---- running ---------------------------------------------------------- */
 
+int usermenu_open(struct usermenu *m, struct panel *p, struct panel *other)
+{
+    int i;
+
+    memset(m, 0, sizeof *m);
+    m->c.p = p;
+    m->c.other = other;
+    m->c.shell_patterns = 1;
+    m->text = load_menu(p->path);
+    m->ne = parse_menu(m->text, &m->c, &m->e);
+    m->labels = xmalloc(sizeof *m->labels * (size_t)(m->ne + 1));
+    m->hotkeys = xmalloc((size_t)m->ne + 1);
+    m->map = xmalloc(sizeof *m->map * (size_t)(m->ne + 1));
+    for (i = 0; i < m->ne; i++)
+        if (m->e[i].visible) {
+            if (m->e[i].is_default)
+                m->def = m->n;
+            m->labels[m->n] = m->e[i].label;
+            m->hotkeys[m->n] = m->e[i].hotkey;
+            m->map[m->n++] = i;
+        }
+    return m->n;
+}
+
+int usermenu_exec(struct usermenu *m, int i)
+{
+    char *script;
+    int unmark = 0, ran = 0;
+
+    if (i < 0 || i >= m->n)
+        return 0;
+    script = expand(&m->c, m->e[m->map[i]].cmd, &unmark);
+    if (script != NULL && script[0] != '\0') {
+        run_script(m->c.p->path, script);
+        if (unmark)
+            panel_unmark_all(m->c.p);
+        ran = 1;
+    }
+    free(script);
+    return ran;
+}
+
+void usermenu_close(struct usermenu *m)
+{
+    int i;
+
+    for (i = 0; i < m->ne; i++) {
+        free(m->e[i].label);
+        free(m->e[i].cmd);
+    }
+    free(m->e);
+    free(m->labels);
+    free(m->hotkeys);
+    free(m->map);
+    free(m->text);
+    memset(m, 0, sizeof *m);
+}
+
 int usermenu_run(struct panel *p, struct panel *other)
 {
-    struct ctx c;
-    struct uentry *e;
-    char *text = load_menu(p->path), *script;
-    const char **labels;
-    char *hotkeys;
-    int *map, n, shown = 0, i, choice, unmark = 0, ran = 0;
+    struct usermenu m;
+    int ran = 0;
 
-    c.p = p;
-    c.other = other;
-    c.shell_patterns = 1;
-    n = parse_menu(text, &c, &e);
-
-    labels = xmalloc(sizeof *labels * (size_t)(n + 1));
-    hotkeys = xmalloc((size_t)n + 1);
-    map = xmalloc(sizeof *map * (size_t)(n + 1));
-    for (i = 0; i < n; i++)
-        if (e[i].visible) {
-            labels[shown] = e[i].label;
-            hotkeys[shown] = e[i].hotkey;
-            map[shown++] = i;
-        }
-
-    if (shown == 0) {
+    if (usermenu_open(&m, p, other) == 0) {
         dlg_message("User menu", 0, "No suitable entries found\n"
                     "in the user menu");
     } else {
         struct dialog d;
         struct widget *w;
-        int width = 0, h = shown;
+        int width = 0, h = m.n, i;
 
         /* dlg_list(), but starting on the '=' default entry */
-        for (i = 0; i < shown; i++)
-            if (utf8_len(labels[i]) > width)
-                width = utf8_len(labels[i]);
+        for (i = 0; i < m.n; i++)
+            if (utf8_len(m.labels[i]) > width)
+                width = utf8_len(m.labels[i]);
         width += 8;
         if (width < 24)
             width = 24;
         if (h > scr_rows - 6)
             h = scr_rows - 6;
         dlg_init(&d, "User menu", h + 4, width, DLG_MENU);
-        w = dlg_list_box(&d, 2, h, labels, hotkeys, shown);
-        for (i = 0; i < shown; i++)
-            if (e[map[i]].is_default)
-                w->pos = i;
-        choice = dlg_run(&d) == 0 ? w->pos : -1;
-
-        if (choice >= 0) {
-            script = expand(&c, e[map[choice]].cmd, &unmark);
-            if (script != NULL && script[0] != '\0') {
-                run_script(p->path, script);
-                if (unmark)
-                    panel_unmark_all(p);
-                ran = 1;
-            }
-            free(script);
-        }
+        w = dlg_list_box(&d, 2, h, m.labels, m.hotkeys, m.n);
+        w->pos = m.def;
+        if (dlg_run(&d) == 0)
+            ran = usermenu_exec(&m, w->pos);
     }
-
-    for (i = 0; i < n; i++) {
-        free(e[i].label);
-        free(e[i].cmd);
-    }
-    free(e);
-    free(labels);
-    free(hotkeys);
-    free(map);
-    free(text);
+    usermenu_close(&m);
     return ran;
 }

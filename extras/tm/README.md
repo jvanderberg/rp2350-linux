@@ -88,3 +88,20 @@ replacing any attached client, and `X` kills the session.
 
     ./build.sh             # tcc, one file at a time (fits the board)
     CC=cc ./build.sh       # any other compiler
+
+## xterm
+
+`./build.sh xterm` builds a terminal in an X11 window from the same
+emulator (`vt.c`), for an X server such as XQuartz on a Mac:
+
+    DISPLAY=HOST:0 ./xterm [-fs PIXELS] [-g COLSxROWS] [-T TITLE] [-hold]
+                           [-e COMMAND [ARGS...]]
+
+It runs your shell, or the command after `-e`, with
+`TERM=screen-256color`: vi, less, top and mc work in it. The wheel and
+Shift-PgUp/PgDn scroll back through history, unless the program asked
+for the mouse. The window can be resized, and only the cells that changed
+are sent to the X server.
+
+The terminal itself is `term.h`, a header for any X11 program that uses
+`../demos/x11.h`; `xmc` (in `../mc`) uses it for its terminal tabs.

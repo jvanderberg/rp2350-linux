@@ -38,6 +38,8 @@
  *             font, usually 6x13 pixels per character, unless x_font has
  *             found another by name and x_text_font chosen it.
  *             x_text_width, x_font_ascent and x_font_descent measure.
+ *             x_font_cell opens a fixed-width font cheaply, even a big
+ *             Unicode one, and x_text16 draws code points in it.
  *   batches   x_fill_rects, x_segments: many in one request; x_fill_poly
  *             for a convex polygon, x_polyline for connected lines.
  *             Arrays of shorts (see each function).
@@ -48,6 +50,8 @@
  *             the drawing calls there (0: back to the frame); x_blit(c, ...)
  *             copies part of it into the frame. Draw something once, then
  *             reuse it for 28 bytes a frame.
+ *             x_frame() is the frame itself, to copy from: to save what a
+ *             menu covers, or to scroll part of the frame.
  *   masks     x_mask(w, h) makes a 1-bit image, all clear; x_mask_rects
  *             sets rectangles of it. x_blit_masked copies only the pixels
  *             a mask has set, for shapes that aren't rectangles. For a mask
@@ -63,14 +67,15 @@
  *   input     x_event() returns key down and up (a real release, unlike a
  *             terminal; a held key repeats as up/down pairs), mouse buttons
  *             and motion, resize (draw again) and close. e.key is ASCII
- *             for printable keys, else an X_KEY_* code.
+ *             for printable keys, else an X_KEY_* code; e.mods says which
+ *             of Shift, Ctrl and Alt were held (X_MOD_*).
  *             x_pointer() asks where the mouse is, even outside the window.
  *   window    x_background(pixel), before x_window, for what the window
  *             shows where nothing is drawn yet; x_min_size(w, h) after it
  *   other     x_sync() waits until the server has drawn everything sent
  *             (call it after x_present() so a slow link can't build up a
- *             queue of old frames), x_wait(ms), x_flush(), x_fd() for your
- *             own poll(), x_close()
+ *             queue of old frames), x_wait(ms), x_flush(), x_fd() and
+ *             x_pending() for your own poll(), x_close()
  *   fences    x_fence() after x_present(), and x_fence_wait() before the
  *             next one, instead of x_sync(): the program draws the next
  *             frame while the last one travels, and still never more than
@@ -124,12 +129,21 @@ enum {
 #define X_KEY_CONTROL_L 0xffe3
 #define X_KEY_CONTROL_R 0xffe4
 #define X_KEY_DELETE    0xffff
+#define X_KEY_INSERT    0xff63
+#define X_KEY_KP_ENTER  0xff8d
+#define X_KEY_BACKTAB   0xfe20          /* Shift-Tab (ISO_Left_Tab) */
+
+/* x_event.mods: the modifier keys held */
+#define X_MOD_SHIFT     1
+#define X_MOD_CTRL      4
+#define X_MOD_ALT       8               /* Mod1: Alt, or Option on a Mac */
 
 struct x_event {
     int type;                           /* XE_* */
     int key;                            /* keys: ASCII or X_KEY_* */
     int button;                         /* buttons: 1 left, 2 middle, 3 right, 4/5 wheel */
     int x, y;                           /* keys, buttons, motion: mouse in the window */
+    int mods;                           /* keys, buttons: X_MOD_* held */
 };
 
 static int x_width, x_height;           /* the window's size now */
@@ -156,7 +170,7 @@ static int xi_qhead, xi_qlen;
 static unsigned int xi_get16(const unsigned char *p) { return p[0] | (unsigned int)p[1] << 8; }
 static unsigned int xi_get32(const unsigned char *p) { return xi_get16(p) | xi_get16(p + 2) << 16; }
 
-static void xi_push(int type, int key, int button, int x, int y)
+static void xi_push(int type, int key, int button, int x, int y, int mods)
 {
     struct x_event *e;
 
@@ -168,6 +182,7 @@ static void xi_push(int type, int key, int button, int x, int y)
     e->button = button;
     e->x = x;
     e->y = y;
+    e->mods = mods;
 }
 
 /* The connection is gone: say so once, then ignore everything. */
@@ -175,7 +190,7 @@ static void xi_lost(void)
 {
     if (!xi_dead) {
         xi_dead = 1;
-        xi_push(XE_CLOSE, 0, 0, 0, 0);
+        xi_push(XE_CLOSE, 0, 0, 0, 0, 0);
     }
 }
 
@@ -347,19 +362,19 @@ static void xi_handle(const unsigned char *b)
         fprintf(stderr, "x11: error %d from request %d\n", b[1], b[10]);
         break;
     case 2:
-        xi_push(XE_KEY_DOWN, xi_keysym(b[1], (int)xi_get16(b + 28)), 0, x, y);
+        xi_push(XE_KEY_DOWN, xi_keysym(b[1], (int)xi_get16(b + 28)), 0, x, y, (int)xi_get16(b + 28));
         break;
     case 3:
-        xi_push(XE_KEY_UP, xi_keysym(b[1], (int)xi_get16(b + 28)), 0, x, y);
+        xi_push(XE_KEY_UP, xi_keysym(b[1], (int)xi_get16(b + 28)), 0, x, y, (int)xi_get16(b + 28));
         break;
     case 4:
-        xi_push(XE_BUTTON_DOWN, 0, b[1], x, y);
+        xi_push(XE_BUTTON_DOWN, 0, b[1], x, y, (int)xi_get16(b + 28));
         break;
     case 5:
-        xi_push(XE_BUTTON_UP, 0, b[1], x, y);
+        xi_push(XE_BUTTON_UP, 0, b[1], x, y, (int)xi_get16(b + 28));
         break;
     case 6:
-        xi_push(XE_MOTION, 0, 0, x, y);
+        xi_push(XE_MOTION, 0, 0, x, y, (int)xi_get16(b + 28));
         break;
     case 12:                            /* Expose: show the back buffer again, */
         xi_expose = 1;                  /* in x_event, between frames, not */
@@ -373,14 +388,14 @@ static void xi_handle(const unsigned char *b)
             x_width = w;
             x_height = h;
             xi_make_back(ow, oh);
-            xi_push(XE_RESIZE, 0, 0, w, h);
+            xi_push(XE_RESIZE, 0, 0, w, h, 0);
         }
         break;
     }
     case 33:                            /* ClientMessage: the close button */
         if (b[1] == 32 && xi_get32(b + 8) == xi_wm_protocols &&
             xi_get32(b + 12) == xi_wm_delete)
-            xi_push(XE_CLOSE, 0, 0, 0, 0);
+            xi_push(XE_CLOSE, 0, 0, 0, 0, 0);
         break;
     }
 }
@@ -891,6 +906,66 @@ static inline int x_font(const char *pattern)
     return f;
 }
 
+/* A fixed-width font, for a grid of characters (a terminal), which may be
+ * a large Unicode one: QueryFont would send the metrics of every glyph,
+ * which can be hundreds of KB, so this measures one "M" instead
+ * (QueryTextExtents). All its characters are then that wide. */
+static inline int x_font_cell(const char *pattern)
+{
+    unsigned char b[32], *x = NULL;
+    unsigned int n = (unsigned int)strlen(pattern), found;
+    char name[256];
+    int f;
+
+    if (xi_nfonts >= X_FONTS || n > 255)
+        return 0;
+    xi_req(49, 0, 2 + (n + 3) / 4);     /* ListFonts: the first that matches */
+    xi_put16(1);
+    xi_put16(n);
+    for (unsigned int i = 0; i < n; i++)
+        xi_put8((unsigned char)pattern[i]);
+    for (; n & 3; n++)
+        xi_put8(0);
+    found = xi_roundtrip(b, &x) == 0 ? xi_get16(b + 8) : 0;
+    if (found == 0 || x == NULL) {
+        free(x);
+        return 0;
+    }
+    /* Open it by the name the server gave: a scalable font won't open
+     * from a pattern with wildcards. */
+    n = x[0];
+    memcpy(name, x + 1, n);
+    name[n] = 0;
+    free(x);
+    x = NULL;
+    f = xi_nfonts++;
+    xi_fonts[f].id = xi_new_id();
+    xi_req(45, 0, 3 + (n + 3) / 4);     /* OpenFont */
+    xi_put32(xi_fonts[f].id);
+    xi_put16(n);
+    xi_put16(0);
+    for (unsigned int i = 0; i < n; i++)
+        xi_put8((unsigned char)name[i]);
+    for (; n & 3; n++)
+        xi_put8(0);
+    xi_req(48, 1, 2 + 1);               /* QueryTextExtents of "M" (odd length) */
+    xi_put32(xi_fonts[f].id);
+    xi_put16('M');
+    xi_put16(0);
+    if (xi_roundtrip(b, &x) != 0 || (int)xi_get32(b + 16) <= 0) {
+        free(x);
+        xi_nfonts--;                    /* listed, but it won't open: none */
+        return 0;
+    }
+    xi_fonts[f].ascent = (short)xi_get16(b + 8);
+    xi_fonts[f].descent = (short)xi_get16(b + 10);
+    xi_fonts[f].defw = (int)xi_get32(b + 16);
+    free(x);
+    xi_fonts[f].minc = 1;               /* no table: every glyph is defw wide */
+    xi_fonts[f].maxc = 0;
+    return f;
+}
+
 /* Slot 0 is "fixed", opened by x_open; its metrics are read when needed. */
 static int xi_font_ready(int f)
 {
@@ -930,6 +1005,41 @@ static inline int x_text_width(int f, const char *s)
 
 static inline int x_font_ascent(int f) { return xi_fonts[xi_font_ready(f)].ascent; }
 static inline int x_font_descent(int f) { return xi_fonts[xi_font_ready(f)].descent; }
+
+/* The back buffer as a canvas to copy from: x_blit(x_frame(), ...) into a
+ * canvas saves part of the frame (to put back after a menu, say), and into
+ * the frame itself moves part of it (scrolling a list). It changes when the
+ * window is resized. */
+static inline unsigned int x_frame(void) { return xi_back; }
+
+/* Text as n Unicode code points (up to U+FFFF; others show as '?'), for
+ * a font that covers them, such as an iso10646 one. (x, y) is the left
+ * end of the baseline. */
+static inline void x_text16(int x, int y, const unsigned int *s, int n)
+{
+    while (n > 0) {
+        int k = n > 254 ? 254 : n;
+
+        xi_req(75, 0, 4 + (unsigned int)(2 + 2 * k + 3) / 4);  /* PolyText16 */
+        xi_put32(xi_dst());
+        xi_put32(xi_gc);
+        xi_put16((unsigned int)x);
+        xi_put16((unsigned int)y);
+        xi_put8((unsigned int)k);       /* one item: length, delta, chars */
+        xi_put8(0);
+        for (int i = 0; i < k; i++) {
+            unsigned int c = s[i] > 0xffff ? '?' : s[i];
+
+            xi_put8(c >> 8);            /* CHAR2B: high byte first */
+            xi_put8(c & 0xff);
+        }
+        for (int m = 2 + 2 * k; m & 3; m++)
+            xi_put8(0);
+        x += k * xi_fonts[xi_cur_font].defw;
+        s += k;
+        n -= k;
+    }
+}
 
 /* Copy w x h pixels (from x_rgb) to (x, y); stride is the row length in pixels.
  * Large images go in several requests, rows at a time. */
@@ -1370,5 +1480,11 @@ static inline int x_pointer(int *x, int *y)
 }
 
 static inline int x_fd(void) { return xi_fd; }
+
+/* Is anything waiting that x_event would return (or a repaint it would
+ * do)? Check it before blocking in your own poll() on x_fd(): x_sync and
+ * other round trips read events off the socket into a queue, where poll()
+ * can't see them. */
+static inline int x_pending(void) { return xi_qlen > 0 || xi_expose; }
 
 #endif /* DEMO_X11_H */

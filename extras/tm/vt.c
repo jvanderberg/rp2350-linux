@@ -42,7 +42,7 @@ static struct cell blank(const struct vt *vt)
 
     /* erase with the current background (xterm's "bce" behaviour) */
     c.ch = ' ';
-    c.attr = MKATTR(COL_DEFAULT, ATTR_BG(vt->attr), 0);
+    c.attr = MKATTR(COL_DEFAULT, CELL_BG(vt->attr), 0);
     return c;
 }
 
@@ -370,8 +370,8 @@ static int rgb_to_256(int r, int g, int b)
 
 static void sgr(struct vt *vt)
 {
-    uint32_t fg = ATTR_FG(vt->attr), bg = ATTR_BG(vt->attr);
-    uint32_t fl = ATTR_FL(vt->attr);
+    uint32_t fg = CELL_FG(vt->attr), bg = CELL_BG(vt->attr);
+    uint32_t fl = CELL_FL(vt->attr);
     int i;
 
     if (vt->nparams == 0) {

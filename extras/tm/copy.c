@@ -108,7 +108,7 @@ static int line_end(const struct cell *c, int cols)
 {
     int x = cols - 1;
 
-    while (x >= 0 && c[x].ch == ' ' && ATTR_BG(c[x].attr) == COL_DEFAULT)
+    while (x >= 0 && c[x].ch == ' ' && CELL_BG(c[x].attr) == COL_DEFAULT)
         x--;
     return x;
 }

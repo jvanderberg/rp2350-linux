@@ -122,7 +122,8 @@ The full description is in `usermenu.h`.
 | File | Purpose |
 | --- | --- |
 | `main.c` | screen layout, key bindings, commands, menus, help |
-| `panel.c/.h` | reading, sorting and drawing a directory panel; marks; quick search |
+| `panel.c/.h` | reading and sorting a directory panel; marks; quick search |
+| `panel_draw.c` | drawing a panel on the terminal (mc only) |
 | `dialog.c/.h` | dialog boxes: labels, input fields, buttons, progress gauge |
 | `menu.c/.h` | menu bar and pull-down menus |
 | `fileops.c/.h` | copy, move, delete and mkdir, with their dialogs |
@@ -133,6 +134,7 @@ The full description is in `usermenu.h`.
 | `keys.c/.h` | turns escape sequences (xterm, Linux console, vt100) and mouse reports into key codes |
 | `util.c/.h` | UTF-8, number and date formatting, path helpers |
 | `skin.h` | every colour, in one place |
+| `xmc.c` | xmc: panels, dialogs, menus, viewer and output view in an X11 window |
 
 The main loop redraws the whole screen into a back buffer after every key, and
 `screen.c` compares it with the previous frame and writes only the
@@ -145,6 +147,41 @@ Colours go out as xterm-256 indices chosen to match the classic VGA palette.
 The panel blue is a deep `#0000af`, whatever blue the terminal theme uses for
 ANSI colour 4. To change it, edit `SKIN_PALETTE` in `skin.h`, or set
 `MC_16COLORS=1` to use the terminal's own 16 colours.
+
+## xmc: mc in an X11 window
+
+`./build.sh xmc` builds `xmc`, which shares mc's panels, file operations,
+dialogs and user menu but draws them in an X11 window (for XQuartz on a
+Mac, say), in the style of `../demos/xpulse`:
+
+    DISPLAY=HOST:0 ./xmc [left-dir [right-dir]]
+
+- **Mouse:** click to select, double-click to open; Ctrl-click marks one,
+  Shift-click a range, and Ctrl- or Shift-drag the rows passed over. Drag
+  files to the other panel to copy them (Shift: move), onto a folder to put
+  them there, or onto the command line to type their names. Right-click
+  for a menu with everything F2–F8 do, plus the user menu's entries.
+- **Keys:** as in mc. C-n opens a shell, C-o the latest terminal tab,
+  Ctrl-Tab the next tab.
+- **Tabs.** The bar along the top holds files tabs and terminal tabs. `+`
+  opens another files tab where this one is; each then goes its own way.
+  The gear holds the settings (dot files). When the tabs no longer fit,
+  all but the current one shrink to their icons, and the one under the
+  pointer opens up to show its name; the wheel over the bar goes through
+  them. A tab's close button, or the middle button, closes it.
+- **Commands run in terminal tabs.** A typed command, a program opened with
+  a double-click, a user-menu command, F4 (the editor) and C-n (a shell)
+  each get a tab of their own: a terminal (`../tm/term.h`), where the keys
+  go to the program while it runs, so vi, top or mc work there. The tab
+  comes to the front when the program first writes something, soon after
+  it starts, so an X program or a command with nothing to say leaves the
+  panels where they are. A tab whose program ends well and leaves nothing
+  on its screen (an X program, vi when you quit) closes by itself; once
+  the program has ended, a key closes it. Closing a tab whose program is
+  still running hangs up on it.
+
+It needs `../demos/x11.h` and `../tm`'s terminal (`vt.c`, `sb.c`, `lz.c`,
+`util.c`, `term.h`), which `build.sh` compiles in.
 
 ## Differences from GNU mc
 

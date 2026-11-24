@@ -42,7 +42,7 @@ static void put_color(struct buf *out, uint32_t c, int base)
 
 static void put_attr(struct buf *out, uint32_t a)
 {
-    uint32_t fl = ATTR_FL(a);
+    uint32_t fl = CELL_FL(a);
 
     buf_str(out, "\x1b[0");
     if (fl & AT_BOLD)    buf_str(out, ";1");
@@ -53,8 +53,8 @@ static void put_attr(struct buf *out, uint32_t a)
     if (fl & AT_REVERSE) buf_str(out, ";7");
     if (fl & AT_HIDDEN)  buf_str(out, ";8");
     if (fl & AT_STRIKE)  buf_str(out, ";9");
-    put_color(out, ATTR_FG(a), 30);
-    put_color(out, ATTR_BG(a), 40);
+    put_color(out, CELL_FG(a), 30);
+    put_color(out, CELL_BG(a), 40);
     buf_str(out, "m");
 }
 

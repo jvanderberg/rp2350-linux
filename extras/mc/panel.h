@@ -96,4 +96,7 @@ int panel_search(struct panel *p, int from);
 
 int entry_is_dir(const struct entry *e);
 
+/* The colour mc shows the entry's name in (an FG_* value from skin.h). */
+int entry_color(const struct entry *e);
+
 #endif /* PANEL_H */

@@ -28,9 +28,9 @@
 
 #define MKATTR(fg, bg, fl) \
     ((uint32_t)(fg) | ((uint32_t)(bg) << 9) | ((uint32_t)(fl) << 18))
-#define ATTR_FG(a)  ((a) & 0x1FF)
-#define ATTR_BG(a)  (((a) >> 9) & 0x1FF)
-#define ATTR_FL(a)  (((a) >> 18) & 0xFF)
+#define CELL_FG(a)  ((a) & 0x1FF)
+#define CELL_BG(a)  (((a) >> 9) & 0x1FF)
+#define CELL_FL(a)  (((a) >> 18) & 0xFF)
 #define ATTR_DEFAULT MKATTR(COL_DEFAULT, COL_DEFAULT, 0)
 
 struct cell {
