@@ -1,12 +1,13 @@
 # extras
 
 Programs for the board that aren't part of the image: games and demos, a
-telnet BBS, two file managers, a Midnight Commander lookalike and a
-terminal multiplexer. They are built on the board with `cc`.
+telnet BBS, two file managers, a Midnight Commander lookalike, a terminal
+multiplexer and Wolfenstein 3D. They are built on the board with `cc`.
 
 | Directory | What it is | Build and run |
 |---|---|---|
 | [`demos/`](demos/) | Terminal games and demos | `./build.sh`, then `./asteroids` |
+| [`wolf3d/`](wolf3d/README.md) | Wolfenstein 3D in an X11 window | see its README |
 | [`bbs/`](bbs/) | A telnet BBS with a MUD | `./bbsctl start` |
 | [`mc/`](mc/README.md) | A Midnight Commander lookalike | `./build.sh && ./mc` |
 | [`tm/`](tm/README.md) | A small tmux work-alike | `./build.sh && ./tm` |
@@ -82,6 +83,9 @@ The same program as `ws2812` in `/usr/share/examples/pio`:
 
 `demos/`, `bbs/`, `mc/` and `tm/` are under the repository's MIT license.
 
+- `wolf3d/` is a port of Wolf4SDL, under the GNU GPL version 2 (see its
+  `PROVENANCE` and `LICENSE-GPL-2.0`); its own additions, `xwolf.c`,
+  `SDL.h` and the scripts, are MIT. The game data is not included.
 - `nnn/` and `noice/` are ports of upstream nnn and noice (BSD-2-Clause,
   see their `LICENSE` files), with small shims so they build with tcc.
   `noice/include` holds ncurses headers (MIT-X11).
