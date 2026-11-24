@@ -31,8 +31,9 @@ $ tar cf - -C extras . | ssh root@ADDRESS 'mkdir -p /mnt/sd/extras && tar xf - -
 ## demos
 
 `asteroids`, `stackfall` (falling blocks), `life`, `rain` (digital rain),
-`pulse` (CPU, memory, network and processes), `bogomips`, `mandel` and a
-small `httpd`. `./build.sh` builds the first six, or only the ones named
+`pulse` (CPU, memory, network and processes), `bogomips`, `maze` (a
+first-person 3D maze; `./maze -demo` explores it by itself), `mandel` and a
+small `httpd`. `./build.sh` builds the first seven, or only the ones named
 (`./build.sh life rain`). Build the others with `cc`:
 
 ```
