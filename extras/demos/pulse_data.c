@@ -367,6 +367,24 @@ static int cmp_proc(const void *a, const void *b)
     case SORT_NAME:
         r = strcmp(p->name, q->name);
         break;
+    case SORT_PPID:
+        r = p->ppid - q->ppid;
+        break;
+    case SORT_STATE:
+        r = p->state - q->state;
+        break;
+    case SORT_NICE:
+        r = p->nice - q->nice;
+        break;
+    case SORT_THR:
+        r = q->threads - p->threads;
+        break;
+    case SORT_VIRT:
+        r = (q->vsize_kb > p->vsize_kb) - (q->vsize_kb < p->vsize_kb);
+        break;
+    case SORT_TIME:
+        r = (q->ticks > p->ticks) - (q->ticks < p->ticks);
+        break;
     }
     if (r == 0)
         r = p->pid - q->pid;
@@ -403,9 +421,9 @@ static void sample_procs(void)
     while ((e = readdir(dir)) != NULL && nprocs < MAXPROC) {
         char path[64], buf[512];
         char *lp, *rp, state = '?';
-        unsigned long ut = 0, st = 0;
+        unsigned long ut = 0, st = 0, start = 0, vsize = 0;
         long rss = 0;
-        int thr = 0;
+        int thr = 0, ppid = 0, nice = 0;
         size_t nl;
         Proc *p;
 
@@ -419,9 +437,9 @@ static void sample_procs(void)
         if (lp == NULL || rp == NULL || rp < lp)
             continue;
         if (sscanf(rp + 2,
-                   "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu "
-                   "%*d %*d %*d %*d %d %*d %*u %*u %ld",
-                   &state, &ut, &st, &thr, &rss) != 5)
+                   "%c %d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu "
+                   "%*d %*d %*d %d %d %*d %lu %lu %ld",
+                   &state, &ppid, &ut, &st, &nice, &thr, &start, &vsize, &rss) != 9)
             continue;
 
         p = &procs[nprocs];
@@ -432,7 +450,11 @@ static void sample_procs(void)
         memcpy(p->name, lp + 1, nl);
         p->name[nl] = 0;
         p->state = state;
+        p->ppid = ppid;
+        p->nice = nice;
         p->threads = thr;
+        p->start = start;
+        p->vsize_kb = vsize / 1024;
         p->rss_kb = rss > 0 ? (unsigned long)rss * (unsigned long)page_kb : 0;
         p->ticks = ut + st;
         p->cpu_pm = 0;

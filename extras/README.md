@@ -34,7 +34,7 @@ $ tar cf - -C extras . | ssh root@ADDRESS 'mkdir -p /mnt/sd/extras && tar xf - -
 `asteroids`, `stackfall` (falling blocks), `life`, `rain` (digital rain),
 `pulse` (CPU, memory, network and processes), `bogomips`, `maze` (a
 first-person 3D maze; `./maze -demo` explores it by itself), `mandel` and a
-small `httpd`. `./build.sh` builds the first seven and the two X11 programs
+small `httpd`. `./build.sh` builds the first seven and the three X11 programs
 below, or only the ones named (`./build.sh life rain`). Build the others with
 `cc`:
 
@@ -43,12 +43,14 @@ below, or only the ones named (`./build.sh life rain`). Build the others with
 # cc -o httpd httpd.c
 ```
 
-`xeyes` and `xmaze` open a window on an X server instead of using the
-terminal, such as XQuartz on a Mac. `xmaze` is the maze drawn as X shapes
+`xeyes`, `xmaze` and `xpulse` open a window on an X server instead of using
+the terminal, such as XQuartz on a Mac. `xmaze` is the maze drawn as X shapes
 rather than pixels, about 1 KB a frame, so it stays fast over the board's
-network link and sharp at any window size; it takes `-demo` too. Both use
-`x11.h`, which speaks the X11 protocol itself, so no Xlib is needed; it is
-the window counterpart of `term.h`. On the machine with the screen, allow
+network link and sharp at any window size; it takes `-demo` too. `xpulse` is
+`pulse` in a window, with graphs, a process table sorted by clicking a
+column, and a right-click menu to signal a process; an update sends only
+what changed, 1-4 KB. All three use `x11.h`, which speaks the X11 protocol
+itself, so no Xlib is needed; it is the window counterpart of `term.h`. On the machine with the screen, allow
 network clients (XQuartz: Settings > Security) and run
 `xhost +BOARD-ADDRESS`, then on the board:
 

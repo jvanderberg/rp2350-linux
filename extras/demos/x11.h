@@ -26,16 +26,21 @@
  *
  * Drawing goes to a back buffer the size of the window and appears only at
  * x_present(), so frames never flicker; when the window is uncovered the
- * back buffer is copied again without asking the program.
+ * back buffer is copied again (in x_event, between frames) without asking
+ * the program. When the window is resized it keeps its picture, and new
+ * parts show the background (x_background) until the program draws again.
  *
  *   colours   x_rgb(r, g, b) makes a pixel value; x_color() sets the colour
  *             for the drawing calls below. x_line_width() sets line width.
  *   shapes    x_fill_rect, x_rect, x_line, x_fill_ellipse, x_ellipse
  *             (ellipses by bounding box, like rectangles)
  *   text      x_text(x, y, s): y is the baseline; the server's "fixed"
- *             font, usually 6x13 pixels per character
+ *             font, usually 6x13 pixels per character, unless x_font has
+ *             found another by name and x_text_font chosen it.
+ *             x_text_width, x_font_ascent and x_font_descent measure.
  *   batches   x_fill_rects, x_segments: many in one request; x_fill_poly
- *             for a convex polygon. Arrays of shorts (see each function).
+ *             for a convex polygon, x_polyline for connected lines.
+ *             Arrays of shorts (see each function).
  *   images    x_image(x, y, w, h, pixels, stride): 32-bit pixels made by
  *             x_rgb, stride in pixels. Costly over a slow link: 256 KB for
  *             a 320x200 frame, where shapes cost a few bytes each.
@@ -51,6 +56,8 @@
  *             of a masked copy once instead of every time.
  *             x_fill_stippled fills a rectangle only where a small mask,
  *             repeated, is set: a dither, for a see-through tint.
+ *             x_fill_poly_tiled fills any polygon with a canvas repeated:
+ *             a gradient under a graph, in one request.
  *             x_target_window() draws straight onto the window, over what
  *             x_present() last showed, leaving the back buffer alone.
  *   input     x_event() returns key down and up (a real release, unlike a
@@ -58,6 +65,8 @@
  *             and motion, resize (draw again) and close. e.key is ASCII
  *             for printable keys, else an X_KEY_* code.
  *             x_pointer() asks where the mouse is, even outside the window.
+ *   window    x_background(pixel), before x_window, for what the window
+ *             shows where nothing is drawn yet; x_min_size(w, h) after it
  *   other     x_sync() waits until the server has drawn everything sent
  *             (call it after x_present() so a slow link can't build up a
  *             queue of old frames), x_wait(ms), x_flush(), x_fd() for your
@@ -278,18 +287,48 @@ static void xi_copy_back(void)
     xi_put16((unsigned int)x_height);
 }
 
-static void xi_make_back(void)
+static unsigned int xi_bg;              /* the window's background (x_background) */
+static int xi_expose;                   /* the window needs the back buffer again */
+
+/* A back buffer for the window's size now. The old picture is copied into
+ * it, on a background for the new part, so that until the program draws
+ * again the window shows what it did, not whatever the new pixmap held. */
+static void xi_make_back(int old_w, int old_h)
 {
-    if (xi_back != 0) {
-        xi_req(54, 0, 2);               /* FreePixmap */
-        xi_put32(xi_back);
-    }
+    unsigned int old = xi_back;
+
     xi_back = xi_new_id();
     xi_req(53, (int)xi_depth, 4);       /* CreatePixmap */
     xi_put32(xi_back);
     xi_put32(xi_win);
     xi_put16((unsigned int)x_width);
     xi_put16((unsigned int)x_height);
+    if (old == 0)
+        return;
+    xi_req(56, 0, 3 + 1);               /* ChangeGC: foreground */
+    xi_put32(xi_gc);
+    xi_put32(0x4);
+    xi_put32(xi_bg);
+    xi_req(70, 0, 3 + 2);               /* PolyFillRectangle */
+    xi_put32(xi_back);
+    xi_put32(xi_gc);
+    xi_put32(0);
+    xi_put16((unsigned int)x_width);
+    xi_put16((unsigned int)x_height);
+    xi_req(62, 0, 7);                   /* CopyArea: the old picture */
+    xi_put32(old);
+    xi_put32(xi_back);
+    xi_put32(xi_gc);
+    xi_put32(0);
+    xi_put32(0);
+    xi_put16((unsigned int)(old_w < x_width ? old_w : x_width));
+    xi_put16((unsigned int)(old_h < x_height ? old_h : x_height));
+    xi_req(56, 0, 3 + 1);               /* ChangeGC: the program's colour back */
+    xi_put32(xi_gc);
+    xi_put32(0x4);
+    xi_put32(xi_color);
+    xi_req(54, 0, 2);                   /* FreePixmap */
+    xi_put32(old);
 }
 
 static unsigned int xi_fence_seq;
@@ -322,19 +361,18 @@ static void xi_handle(const unsigned char *b)
     case 6:
         xi_push(XE_MOTION, 0, 0, x, y);
         break;
-    case 12:                            /* Expose: show the back buffer again */
-        if (xi_get16(b + 16) == 0 && xi_back != 0) {
-            xi_copy_back();
-            x_flush();
-        }
-        break;
+    case 12:                            /* Expose: show the back buffer again, */
+        xi_expose = 1;                  /* in x_event, between frames, not */
+        break;                          /* now, perhaps halfway through one */
     case 22: {                          /* ConfigureNotify */
         int w = (int)xi_get16(b + 20), h = (int)xi_get16(b + 22);
 
         if (w != x_width || h != x_height) {
+            int ow = x_width, oh = x_height;
+
             x_width = w;
             x_height = h;
-            xi_make_back();
+            xi_make_back(ow, oh);
             xi_push(XE_RESIZE, 0, 0, w, h);
         }
         break;
@@ -638,7 +676,7 @@ static inline unsigned int x_window(const char *title, int w, int h)
     x_width = w;
     x_height = h;
     xi_win = xi_new_id();
-    xi_req(1, 0, 8 + 2);                /* CreateWindow, depth from the parent */
+    xi_req(1, 0, 8 + 3);                /* CreateWindow, depth from the parent */
     xi_put32(xi_win);
     xi_put32(xi_root);
     xi_put16(0);
@@ -648,8 +686,9 @@ static inline unsigned int x_window(const char *title, int w, int h)
     xi_put16(0);                        /* border */
     xi_put16(1);                        /* InputOutput */
     xi_put32(0);                        /* visual from the parent */
-    xi_put32(0x2 | 0x800);              /* background-pixel, event-mask */
-    xi_put32(x_rgb(0, 0, 0));
+    xi_put32(0x2 | 0x10 | 0x800);       /* background-pixel, bit-gravity, event-mask */
+    xi_put32(xi_bg);
+    xi_put32(1);                        /* NorthWest: a resize keeps the picture */
     xi_put32(0x1 | 0x2 | 0x4 | 0x8 | 0x40 | 0x8000 | 0x20000);
     /* keys, buttons, motion, exposure, structure */
 
@@ -684,7 +723,7 @@ static inline unsigned int x_window(const char *title, int w, int h)
     xi_put32(0);
     xi_color = x_rgb(255, 255, 255);
 
-    xi_make_back();
+    xi_make_back(0, 0);
     xi_req(8, 0, 2);                    /* MapWindow */
     xi_put32(xi_win);
     x_flush();
@@ -768,6 +807,129 @@ static inline void x_text(int x, int y, const char *s)
     for (n += 2; n & 3; n++)
         xi_put8(0);
 }
+
+/* ---- fonts ----
+ * x_text starts out in font 0, the server's "fixed". x_font finds another
+ * by XLFD pattern, such as
+ *     "-adobe-helvetica-bold-r-normal--24-*-*-*-p-*-iso8859-1",
+ * and gives back its number for x_text_font; 0 if the server has none that
+ * match, so the program still runs, in "fixed". x_text_width measures a
+ * string, x_font_ascent and x_font_descent give the font's height above
+ * and below the baseline. Up to X_FONTS fonts. */
+#define X_FONTS 8
+static struct {
+    unsigned int id;
+    int ascent, descent, minc, maxc, defw;
+    short *w;                           /* widths of minc..maxc, or NULL */
+} xi_fonts[X_FONTS];
+static int xi_nfonts = 1, xi_cur_font;
+
+/* Read a font's metrics (QueryFont) into slot f. */
+static void xi_font_metrics(int f)
+{
+    unsigned char b[32], *x = NULL;
+
+    xi_req(47, 0, 2);                   /* QueryFont */
+    xi_put32(xi_fonts[f].id);
+    if (xi_roundtrip(b, &x) != 0 || x == NULL) {
+        xi_fonts[f].ascent = 11;
+        xi_fonts[f].descent = 2;
+        xi_fonts[f].defw = 6;
+        free(x);
+        return;
+    }
+    /* x is the reply from byte 32 on: max-bounds' width is at 28 of the
+     * reply, so in b; the rest of the fixed part follows in x. */
+    xi_fonts[f].defw = (short)xi_get16(b + 28);
+    xi_fonts[f].minc = (int)xi_get16(x + 8);
+    xi_fonts[f].maxc = (int)xi_get16(x + 10);
+    xi_fonts[f].ascent = (short)xi_get16(x + 20);
+    xi_fonts[f].descent = (short)xi_get16(x + 22);
+    {
+        unsigned int nprops = xi_get16(x + 14), m = xi_get32(x + 24);
+        const unsigned char *ci = x + 28 + 8 * nprops;
+
+        if (m > 0 && m == (unsigned int)(xi_fonts[f].maxc - xi_fonts[f].minc + 1) &&
+            (xi_fonts[f].w = malloc(m * sizeof *xi_fonts[f].w)) != NULL)
+            for (unsigned int i = 0; i < m; i++)
+                xi_fonts[f].w[i] = (short)xi_get16(ci + 12 * i + 4);
+    }
+    free(x);
+}
+
+static inline int x_font(const char *pattern)
+{
+    unsigned char b[32], *x = NULL;
+    unsigned int n = (unsigned int)strlen(pattern), found;
+    int f;
+
+    if (xi_nfonts >= X_FONTS || n > 255)
+        return 0;
+    xi_req(49, 0, 2 + (n + 3) / 4);     /* ListFonts: is there one? */
+    xi_put16(1);
+    xi_put16(n);
+    for (unsigned int i = 0; i < n; i++)
+        xi_put8((unsigned char)pattern[i]);
+    for (; n & 3; n++)
+        xi_put8(0);
+    found = xi_roundtrip(b, &x) == 0 ? xi_get16(b + 8) : 0;
+    free(x);
+    if (found == 0)
+        return 0;
+    f = xi_nfonts++;
+    xi_fonts[f].id = xi_new_id();
+    n = (unsigned int)strlen(pattern);
+    xi_req(45, 0, 3 + (n + 3) / 4);     /* OpenFont, the first that matches */
+    xi_put32(xi_fonts[f].id);
+    xi_put16(n);
+    xi_put16(0);
+    for (unsigned int i = 0; i < n; i++)
+        xi_put8((unsigned char)pattern[i]);
+    for (; n & 3; n++)
+        xi_put8(0);
+    xi_font_metrics(f);
+    return f;
+}
+
+/* Slot 0 is "fixed", opened by x_open; its metrics are read when needed. */
+static int xi_font_ready(int f)
+{
+    if (f < 0 || f >= xi_nfonts)
+        f = 0;
+    if (f == 0 && xi_fonts[0].id == 0) {
+        xi_fonts[0].id = xi_font;
+        xi_font_metrics(0);
+    }
+    return f;
+}
+
+static inline void x_text_font(int f)
+{
+    f = xi_font_ready(f);
+    if (f != xi_cur_font) {
+        xi_change_gc(0x4000, xi_fonts[f].id);
+        xi_cur_font = f;
+    }
+}
+
+static inline int x_text_width(int f, const char *s)
+{
+    int w = 0;
+
+    f = xi_font_ready(f);
+    for (; *s; s++) {
+        int c = (unsigned char)*s;
+
+        if (xi_fonts[f].w != NULL && c >= xi_fonts[f].minc && c <= xi_fonts[f].maxc)
+            w += xi_fonts[f].w[c - xi_fonts[f].minc];
+        else
+            w += xi_fonts[f].defw;
+    }
+    return w;
+}
+
+static inline int x_font_ascent(int f) { return xi_fonts[xi_font_ready(f)].ascent; }
+static inline int x_font_descent(int f) { return xi_fonts[xi_font_ready(f)].descent; }
 
 /* Copy w x h pixels (from x_rgb) to (x, y); stride is the row length in pixels.
  * Large images go in several requests, rows at a time. */
@@ -1015,6 +1177,61 @@ static inline void x_fence(void)
 
 /* Fill a rectangle in the current colour, but only where the mask m,
  * repeated across it like wallpaper, is set: a dither, for tints. */
+/* A polygon (not necessarily convex, but not crossing itself) filled with
+ * canvas c repeated, its top left at (ox, oy): a gradient, say. */
+static inline void x_fill_poly_tiled(unsigned int c, int ox, int oy, const short *pts, int n)
+{
+    if (n < 3 || n > 2000)
+        return;
+    xi_req(56, 0, 3 + 4);               /* ChangeGC: fill-style, tile, ts origin */
+    xi_put32(xi_gc);
+    xi_put32(0x100 | 0x400 | 0x1000 | 0x2000);
+    xi_put32(1);                        /* FillTiled */
+    xi_put32(c);
+    xi_put32((unsigned int)ox);
+    xi_put32((unsigned int)oy);
+    xi_req(69, 0, 4 + (unsigned int)n);  /* FillPoly */
+    xi_put32(xi_dst());
+    xi_put32(xi_gc);
+    xi_put8(1);                         /* Nonconvex */
+    xi_put8(0);
+    xi_put16(0);
+    for (int i = 0; i < 2 * n; i++)
+        xi_put16((unsigned int)pts[i]);
+    xi_change_gc(0x100, 0);             /* FillSolid */
+}
+
+/* Connected lines through n points, in the current colour and width. */
+static inline void x_polyline(const short *pts, int n)
+{
+    if (n < 2 || n > 2000)
+        return;
+    xi_req(65, 0, 3 + (unsigned int)n);  /* PolyLine, coordinates from the origin */
+    xi_put32(xi_dst());
+    xi_put32(xi_gc);
+    for (int i = 0; i < 2 * n; i++)
+        xi_put16((unsigned int)pts[i]);
+}
+
+/* The window's background: what the server fills new parts of the window
+ * with when it grows, until the program draws them. Call before x_window
+ * (it can't change after). */
+static inline void x_background(unsigned int pixel) { xi_bg = pixel; }
+
+/* The smallest size the window manager should let the window be made. */
+static inline void x_min_size(int w, int h)
+{
+    xi_req(18, 0, 6 + 18);              /* ChangeProperty WM_NORMAL_HINTS */
+    xi_put32(xi_win);
+    xi_put32(40);                       /* WM_NORMAL_HINTS */
+    xi_put32(41);                       /* WM_SIZE_HINTS */
+    xi_put32(32);                       /* format 32, 3 unused */
+    xi_put32(18);
+    xi_put32(16);                       /* flags: PMinSize */
+    for (int i = 1; i < 18; i++)
+        xi_put32(i == 5 ? (unsigned int)w : i == 6 ? (unsigned int)h : 0);
+}
+
 static inline void x_fill_stippled(unsigned int m, int x, int y, int w, int h)
 {
     xi_req(56, 0, 3 + 4);               /* ChangeGC: fill-style, stipple, ts origin */
@@ -1110,6 +1327,11 @@ static inline int x_event(struct x_event *e)
         if (xi_message(b, NULL) >= 0)
             xi_handle(b);
     }
+    if (xi_expose && xi_back != 0) {
+        xi_expose = 0;
+        xi_copy_back();
+        x_flush();
+    }
     if (xi_qlen == 0)
         return 0;
     *e = xi_queue[xi_qhead];
@@ -1124,7 +1346,7 @@ static inline void x_wait(int ms)
     struct pollfd p;
 
     x_flush();
-    if (xi_qlen > 0 || xi_dead)
+    if (xi_qlen > 0 || xi_dead || xi_expose)
         return;
     p.fd = xi_fd;
     p.events = POLLIN;
